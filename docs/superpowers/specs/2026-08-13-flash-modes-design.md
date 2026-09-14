@@ -296,8 +296,19 @@ was never an intended request. Legacy ran `init.d/86-factory-reset` before
 dispatch cannot express that, and silently dropping one of two requested
 destructive actions is worse than refusing the pair.
 
-The error takes the §8.1 failure path. Both triggers stay set, so the operator
-can clear one and retry.
+Both triggers are cleared *before* the error is raised; only then does it take
+the §8.1 failure path. Clearing first is not optional. This is the one fatal
+path that runs before any mode has started, so the §2.2 invariant does not
+cover it, and on a release image §8.1 halts forever rather than rebooting —
+leaving the triggers set would mean every power cycle hits the same refusal and
+the device never boots again. With both cleared, a power cycle boots normally
+and the operator re-queues whichever action they meant. The refusal is on kmsg
+and in the ODS status.
+
+Mode 2's second trigger, the `/etc/enforce_flash_mode` flag file (§5.4), ships
+inside the initramfs and cannot be cleared. It does not reopen the problem:
+clearing `factory-reset` is enough to remove the conflict, and the next boot
+runs mode 2 alone.
 
 Note also that the queued `factory-reset` key does not survive modes 2 and 3. On
 U-Boot the environment lives at the `UBOOT_ENV1_START`/`UBOOT_ENV2_START` byte
@@ -615,7 +626,8 @@ Behaviour changes, as opposed to bug fixes:
   mounted `rootCurrent`;
 - a queued factory reset combined with a flash mode is now an error. Legacy ran
   both (86 then 87); single-mode dispatch cannot, and refuses the pair rather
-  than dropping one silently (§3.3, §10.6);
+  than dropping one silently. Both triggers are cleared before the error, so a
+  power cycle boots normally (§3.3, §10.6);
 - modes 2 and 3 may persist a log where legacy did not (§8.3, §10.5).
 
 ## 10. Decisions required from reviewers
@@ -675,8 +687,14 @@ gives one handler and cannot express that.
 **Decided: reject the combination with an error.** A factory reset acts on the
 booted device and a mode-1 clone on another one; requesting both was never
 intended, and silently performing only one of two destructive requests is the
-worse failure. Both triggers stay set so the operator can clear one and retry
-(§3.3, §9).
+worse failure.
+
+The error clears both triggers first (§3.3) — without that, a release image
+halts forever and every power cycle repeats the refusal. If even a one-time
+halt is unwanted on an in-field device, the alternative is to clear both, log
+the refusal and continue to Normal boot, which is the handling unknown
+`flash-mode` values already get in §8.2. Say so if you prefer that; the
+refusal is equally visible either way.
 
 ### 10.7 Keep writing the U-Boot environment to both offsets?
 
