@@ -47,10 +47,8 @@ No change. ODS already sends numeric modes 1–4 in the trigger
 (`Serialize_repr`), and the result schema (status codes 0–4, optional
 `error`/`context`, `paths`, `data_wiped`) is unchanged — ODS PR #207 parses
 it. The wipe-failure note travels in the existing free-text `error` field.
-ODS branches on no status value except an unrecognised one, so the status a
-wipe failure reports only changes what the cloud sees.
 The only observable delta is intended: a mode-2/3/4 trigger now performs a
-reset (status 0/2) instead of failing with status 1.
+reset (status 0, 2 or 4) instead of failing with status 1.
 
 ## 2. Component Changes
 
@@ -121,7 +119,8 @@ Existing precedence (Error > Warning > Success) extended by the wipe note:
 | failed | ok | Error (2) | wipe note in `error` |
 | failed | retried reformat, ok | Error (2) | wipe note in `error`, retry note in `context` |
 | ok / mode 1 | retried reformat, ok | Warning (4) | retry note in `context` |
-| failed | mkfs failed twice / restore partial failure | Error (2) | wipe note joined into `error` ahead of the existing message; `context` unchanged |
+| failed | mkfs failed twice / restore partial failure | Error (2) | wipe note joined into `error` ahead of the existing message; retry and restore notes in `context` as today |
+| ok / mode 1 | mkfs failed twice / restore partial failure | Error (2) | existing `error` message; retry and restore notes in `context` (unchanged) |
 
 A failed wipe reports Error, not Warning: the device is usable, but the
 operation the caller asked for did not happen. This follows the existing rule
