@@ -6,7 +6,8 @@ to the Rust initramfs.
 
 **This spec has a blocking section: [§10 Decisions required from
 reviewers](#10-decisions-required-from-reviewers). Implementation must not start
-before reviewers have answered those six items.**
+before every item there is decided. §10.2 and §10.6 are decided; §10.1, §10.3,
+§10.4, §10.5 and §10.7 are still open.**
 
 ## 1. Overview
 
@@ -24,8 +25,9 @@ Mode 1 behaves like a factory reset with respect to the new disk: it resets the
 bootloader environment, reformats `etc` and `data` to enforce the first-boot
 condition, and gives the copied partitions fresh UUIDs.
 
-Implementation order is **1 → 3 → 2**. Mode 2 is last because its interactive
-`scp` wait is the hardest part to port and to test.
+Implementation order is **1 → 2 → 3**. Mode 2 comes before mode 3 because it
+is the mode used in the development cycle, even though its interactive `scp`
+wait is the hardest part to port and to test.
 
 ### 1.1 Fidelity policy
 
@@ -77,9 +79,21 @@ Flash-mode detection happens right after the bootloader environment is opened,
 and `init_setup` is skipped when a flash mode is active.
 
 Current `run_init` order is: mount core partitions → open boot env → `init_setup`
-(extra-bootargs sync, then resize-data) → `BootMode::detect` → dispatch. Running
-`init_setup` before a flash mode would resize a data partition that is about to
-be cloned over or overwritten, and an extra-bootargs reboot would delay the
+(extra-bootargs sync, then resize-data) → `BootMode::detect` → dispatch.
+
+`init_setup` acts on the running disk. Running it before a flash mode is wrong
+for a different reason per mode:
+
+- modes 2 and 3 overwrite the running disk, so resizing its data partition is
+  work that the flash discards seconds later;
+- mode 1 writes a different disk, so the running data partition survives. The
+  resize is not discarded, it is simply pointless here: the clone gets its
+  partition table from the rewritten dump, which resets the data partition to
+  its shipped size (§4.2), so any growth on the source is not carried over.
+  Mode 1 then creates and formats the destination data partition itself
+  (§4.1 step 9).
+
+In all three modes an extra-bootargs reboot would additionally delay the
 flash.
 
 Relative to the legacy scripts this is partly a match and partly a deviation:
@@ -95,8 +109,12 @@ Relative to the legacy scripts this is partly a match and partly a deviation:
   writing anything (§4.1 step 5, §5.1). Nothing in any mode needs `/sysroot` —
   no mode reaches `switch_root`, and `grubenv.in` and `uboot-env.bin` live in the
   initramfs at `/etc/omnect/`;
-- **deviates** — the extra-bootargs sync step has no legacy counterpart and is
-  skipped for flash modes.
+- **matches** — the extra-bootargs sync is skipped for flash modes. Legacy has
+  the same effect by placement: its sync lives in `setup_etc_from_factory` in
+  `common-sh`, reached from `fs-mount` (89), so a flash mode at 87 ends in
+  poweroff or reboot before it is ever called. Both sides also gate the sync on
+  the first boot. The Rust flow has to skip it explicitly only because
+  `init_setup` sits ahead of dispatch rather than behind it.
 
 ### 2.4 Naming
 
@@ -181,7 +199,6 @@ image is usrmerged — `/bin -> usr/bin` and `/sbin -> usr/sbin` — so the
 | `e2image` | `/usr/sbin/e2image` | `e2fsprogs` | 1 |
 | `mkfs.ext4` | `/usr/sbin/mkfs.ext4` | `e2fsprogs-mke2fs` | 1 |
 | `tune2fs` | `/usr/sbin/tune2fs` | `e2fsprogs-tune2fs` | 1 |
-| `uuidgen` | `/usr/bin/uuidgen` | `util-linux-uuidgen` | 1 |
 | `dd` | `/usr/bin/dd` | `coreutils` | 1, 2 |
 | `bmaptool` | `/usr/bin/bmaptool` | `bmaptool` | 2, 3 |
 | `curl` | `/usr/bin/curl` | `curl` | 3 |
@@ -193,11 +210,20 @@ image is usrmerged — `/bin -> usr/bin` and `/sbin -> usr/sbin` — so the
 `MACHINE_FEATURES` — consistent with the recipe gating and with §6 applying only
 on EFI machines.
 
-Four operations the legacy scripts shell out for are done in-process instead,
-because `nix` is already a dependency with the required features enabled:
+The remaining tools stay external because no pure-Rust equivalent exists at a
+dependency weight an initramfs can carry: `sfdisk` (partition tables),
+`e2image`, `mkfs.ext4` and `tune2fs` (ext4), `bmaptool` (block maps),
+`efibootmgr` (EFI variables), `curl`, `dhcpcd` and `dropbear`. `dd` could be
+replaced by plain file I/O, but `coreutils` ships in the image regardless, so
+that would save a process spawn and no package.
+
+Five operations the legacy scripts shell out for are done in-process instead.
+Four use `nix`, which is already a dependency with the required features
+enabled; `uuidgen` needs the new `uuid` crate:
 
 | Legacy | In-process |
 |---|---|
+| `uuidgen` | `uuid::Uuid::new_v4` |
 | `mkfifo` | `nix::unistd::mkfifo` |
 | `chown omnect:omnect` | `nix::unistd::chown`, with the uid/gid looked up via the `user` feature |
 | `sync` | `nix::unistd::sync` |
@@ -262,17 +288,16 @@ pub enum BootMode {
 }
 ```
 
-Detection precedence: flash mode is checked before factory reset, so a flash wins
-when both triggers are set. This is a deviation from legacy, which ran
-`init.d/86-factory-reset` before `init.d/87-flash_mode_*` and would therefore have
-run both. It follows from single-mode dispatch — `BootMode` selects exactly one
-handler — and it is the right outcome for modes 2 and 3, where the reset would be
-undone moments later by the whole-disk overwrite.
+Detection: both triggers set at once is rejected as an error rather than
+resolved by precedence (§10.6). The two operate on different disks — a factory
+reset on the booted device, a mode-1 clone on another one — and the combination
+was never an intended request. Legacy ran `init.d/86-factory-reset` before
+`init.d/87-flash_mode_*` and so performed both, but single-mode `BootMode`
+dispatch cannot express that, and silently dropping one of two requested
+destructive actions is worse than refusing the pair.
 
-For mode 1 the legacy behaviour was meaningful: the source disk survives the
-clone, so resetting it first left the operator with a reset source disk *and* a
-fresh clone. Losing that is a real behaviour change, recorded in §9 and raised for
-reviewers in §10.6.
+The error takes the §8.1 failure path. Both triggers stay set, so the operator
+can clear one and retry.
 
 Note also that the queued `factory-reset` key does not survive modes 2 and 3. On
 U-Boot the environment lives at the `UBOOT_ENV1_START`/`UBOOT_ENV2_START` byte
@@ -312,6 +337,9 @@ flash-mode-3 = ["flash-mode"]            # URL download
 each mode feature pulls it in. `flash-mode-2` and `flash-mode-3` additionally
 gate `net.rs` and `bmap.rs`.
 
+One new dependency, pulled in by `flash-mode-1` only:
+`uuid = { version = "1.11", default-features = false, features = ["v4"] }`.
+
 `default = ["core", "flash-mode-1"]`, mirroring the legacy recipe, which installs
 `flash-mode-1` unconditionally and gates 2 and 3 on `DISTRO_FEATURES`. This also
 resolves the current mismatch where the project `CLAUDE.md` feature table lists
@@ -327,7 +355,9 @@ resolves the current mismatch where the project `CLAUDE.md` feature table lists
    also `UBOOT_ENV1_START`, `UBOOT_ENV2_START`, `UBOOT_ENV_SIZE`.
 3. Wait for the destination block device, bounded (§7).
 4. Reject an empty destination, a destination that is not a block device, and a
-   destination equal to the source.
+   destination equal to the source. The last check compares the resolved
+   destination against the resolved booted device (`/dev/omnect/rootblk`), so a
+   symlink or an alias spelling of the running disk is caught too.
 5. `sync`, then unmount `/sysroot` completely — the boot partition first, then the
    rootfs. Both are mounted by `mount_core_partitions` on both bootloaders. The
    boot unmount is needed so the `dd` of the boot partition reads a consistent
@@ -351,8 +381,12 @@ resolves the current mismatch where the project `CLAUDE.md` feature table lists
     - GRUB: mount the destination boot partition, copy
       `/etc/omnect/grubenv.in` to `EFI/BOOT/grubenv`, unmount;
     - U-Boot: write `/etc/omnect/uboot-env.bin` at both `UBOOT_ENV1_START` and
-      `UBOOT_ENV2_START`. This deliberately gives the destination a redundant
-      U-Boot environment even when the source image had only one.
+      `UBOOT_ENV2_START`, as legacy does. Legacy comments this as enforcing a
+      redundant environment even when the initial wic had only one, which is not
+      what it achieves: U-Boot reads a second copy only when its own build
+      configures a redundant environment, and writing bytes to the offset does
+      not change that configuration. Where the build does configure one, the
+      second write is required. See §10.7.
 14. EFI handling on the destination (§6).
 15. `sync`.
 
@@ -465,13 +499,14 @@ Applies on machines whose `MACHINE_FEATURES` contains `efi`. Ported from
    disk's for modes 2 and 3.
 3. Create an `omnect_os` entry pointing at `\EFI\BOOT\bootx64.efi` on partition 1
    of the target disk.
-4. Create a second entry with the same loader and the label `"omnect_os "`,
-   differing only by a trailing space.
-5. Write `efibootmgr -v` output to `EFI/BOOT/efibootmgr_entry` on the boot
+4. Write `efibootmgr -v` output to `EFI/BOOT/efibootmgr_entry` on the boot
    partition.
-6. Unmount.
+5. Unmount.
 
-Items 1 and 4 are in §10.
+The legacy duplicate entry — a second entry with the same loader and the label
+`"omnect_os "`, differing only by a trailing space — is not ported (§10.2).
+
+Item 1 is in §10.3.
 
 ## 7. Bounded waits
 
@@ -575,18 +610,20 @@ Also not ported:
 Behaviour changes, as opposed to bug fixes:
 
 - unbounded waits become bounded (§7);
-- the extra-bootargs sync step is skipped for flash modes (§2.3);
 - every mode unmounts `/sysroot` fully before writing, because the Rust flow mounts
   it before dispatch and legacy did not (§2.3). Without this, mode 1 would image a
   mounted `rootCurrent`;
-- a queued factory reset no longer runs before a flash. Legacy ran both (86 then
-  87); single-mode dispatch runs only the flash (§2.3, §10.6);
+- a queued factory reset combined with a flash mode is now an error. Legacy ran
+  both (86 then 87); single-mode dispatch cannot, and refuses the pair rather
+  than dropping one silently (§3.3, §10.6);
 - modes 2 and 3 may persist a log where legacy did not (§8.3, §10.5).
 
 ## 10. Decisions required from reviewers
 
 **Blocking.** Each item states the default, which is the conservative choice.
-Reviewers must confirm or overturn each one before implementation starts.
+Reviewers must confirm or overturn each one before implementation starts. Items
+already decided in review are marked **Decided** and the rest of the spec
+follows that decision.
 
 ### 10.1 Keep `non_bmap_dd_handling`?
 
@@ -603,7 +640,8 @@ partition-alignment problem rather than fixing one.
 differing only by a trailing space in the label, commented as "for debug
 purposes, when booting after flash-mode-{1,2} fails".
 
-**Default: keep.**
+**Decided: drop it.** EFI updates since then have made it unnecessary; the port
+creates one entry and the result is to be confirmed by test (§6).
 
 ### 10.3 Keep deleting every existing EFI boot entry?
 
@@ -632,16 +670,28 @@ only, exactly like legacy.
 
 Legacy ran `init.d/86-factory-reset` before `init.d/87-flash_mode_1`, so both
 happened: the source disk was reset, then cloned. Single-mode `BootMode` dispatch
-gives one handler, so the flash wins and the reset is dropped (§2.3, §9).
+gives one handler and cannot express that.
 
-For modes 2 and 3 this loses nothing — the reset would be overwritten seconds
-later. For mode 1 it does: the source disk survives the clone, and an operator who
-queued both reasonably expects a reset source disk as well as a fresh clone.
+**Decided: reject the combination with an error.** A factory reset acts on the
+booted device and a mode-1 clone on another one; requesting both was never
+intended, and silently performing only one of two destructive requests is the
+worse failure. Both triggers stay set so the operator can clear one and retry
+(§3.3, §9).
 
-**Default: the flash wins, the reset is dropped.** Overturning this for mode 1
-means running the factory-reset sequence first and then continuing into the clone
-instead of into Normal boot — a structural change to dispatch, so it needs to be
-decided before implementation, not after.
+### 10.7 Keep writing the U-Boot environment to both offsets?
+
+Mode 1 step 13 copies `uboot-env.bin` to `UBOOT_ENV1_START` and
+`UBOOT_ENV2_START`. The legacy comment claims this enforces a redundant
+environment even when the initial wic had only one. It does not: U-Boot uses a
+second copy only when its build configures a redundant environment. Where the
+build does configure one, writing only the first offset would leave the second
+holding whatever the clone inherited, so the second write is needed there.
+
+**Default: keep both writes, drop the claim.** The legacy script already
+requires all three `UBOOT_ENV*` values to be defined, so a U-Boot build reaching
+mode 1 always has a second offset configured, and the two writes are consistent
+with it. Overturning this means deciding what a build without a redundant
+environment should do — which needs an example of such a build first.
 
 ## 11. Testing
 
@@ -681,7 +731,10 @@ Implemented separately, listed here so nothing is lost:
   today, and keep the `omnect_user` class inherited for mode 2;
 - retire `init.d/87-flash_mode_{1,2,3}` and the `sed` substitutions in
   `omnect-os-initramfs-scripts.bb` once the Rust path ships;
-- **no package changes needed.** Verified against `buildhistory` for a built
+- `util-linux-uuidgen` can be dropped from the initramfs once the port ships:
+  `uuidgen` is called from `flash-mode-1` and nowhere else, and the Rust port
+  generates the UUID itself (§2.8);
+- **no other package changes needed.** Verified against `buildhistory` for a built
   `omnect-os-initramfs`: every tool the three modes need is already installed
   (§2.8). In particular `e2image` ships in the base `e2fsprogs` package at
   `/usr/sbin/e2image`, which `PACKAGE_INSTALL` already pulls in, so the fact that
