@@ -179,13 +179,17 @@ is untouched.
 ### 4.1 Proposed follow-ups (out of scope here)
 
 - **Power-loss resume:** set a "wipe in progress" marker in the boot env
-  before the destructive phase and clear it once reformat succeeded. A boot
-  that finds the marker set reformats `etc` and `data` instead of mounting
-  them — the data is already gone, so there is nothing to lose, and the
-  device comes up clean instead of stuck. It cannot loop, because the
-  reformat clears the marker and a failing reformat lands in the existing
-  double-mkfs path. Costs a new boot env key, so it needs a meta-omnect
-  change as well.
+  before the destructive phase and clear it once the reformat succeeded. A
+  boot that finds the marker set reformats `etc` and `data` instead of
+  mounting them, and does not repeat the wipe — the blocks it reached are
+  already overwritten, and repeating a wipe that runs for minutes delays the
+  boot without buying privacy. The backup lives in initramfs RAM, so in this
+  case the `preserve` paths are lost either way. A failing reformat ends
+  where it ends today: mkfs retried once, Error status, failure signal in the
+  boot env, then the fatal path of the following Normal boot. The init never
+  reboots itself there, so the marker cannot produce a boot cycle; it turns a
+  guaranteed mount failure into one reformat attempt per boot. Costs a new
+  boot env key, so it needs a meta-omnect change as well.
 - **Storage-type guidance in the meta-omnect README:** which mode suits which
   storage. Mode 2 suits rotating disks; on flash with wear leveling it adds a
   full write cycle and still cannot reach blocks the controller has remapped
