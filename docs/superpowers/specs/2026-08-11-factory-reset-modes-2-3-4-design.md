@@ -188,8 +188,25 @@ is untouched.
   where it ends today: mkfs retried once, Error status, failure signal in the
   boot env, then the fatal path of the following Normal boot. The init never
   reboots itself there, so the marker cannot produce a boot cycle; it turns a
-  guaranteed mount failure into one reformat attempt per boot. Costs a new
-  boot env key, so it needs a meta-omnect change as well.
+  guaranteed mount failure into one reformat attempt per boot.
+
+  A marker alone is not enough for the reported outcome. The preserve keys
+  come from the trigger, which is cleared as the first step, and they resolve
+  against `etc/omnect/factory-reset.json` and `etc/omnect/factory-reset.d`,
+  which sit on the partition being wiped — after a power loss the recovery
+  boot cannot reconstruct what was to be restored. So the marker also has to
+  record whether the backup held anything, and the recovery boot reports
+  Success only when it did not, Error otherwise: a reset that comes up clean
+  but silently dropped the preserved paths must not be reported as success.
+  `backup_all` returns only the paths that existed, so that flag is about
+  what was really backed up, not about a preserve list whose paths were all
+  absent.
+
+  The status reaches the cloud only if the device gets there — after `etc` is
+  reformatted the network configuration is gone, which is the case the boot
+  env record covers.
+
+  Costs new boot env keys, so it needs a meta-omnect change as well.
 - **Storage-type guidance in the meta-omnect README:** which mode suits which
   storage. Mode 2 suits rotating disks; on flash with wear leveling it adds a
   full write cycle and still cannot reach blocks the controller has remapped
