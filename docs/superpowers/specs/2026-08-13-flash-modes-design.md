@@ -6,8 +6,8 @@ to the Rust initramfs.
 
 **This spec has a blocking section: [§10 Decisions required from
 reviewers](#10-decisions-required-from-reviewers). Implementation must not start
-before every item there is decided. §10.2 and §10.6 are decided; §10.1, §10.3,
-§10.4, §10.5 and §10.7 are still open.**
+before every item there is decided. §10.2, §10.6 and §10.7 are decided; §10.1,
+§10.3, §10.4, §10.5 and §10.8 are still open.**
 
 ## 1. Overview
 
@@ -21,9 +21,9 @@ at most once — the trigger is cleared before the work starts.
 | 2 | Flashes a `wic.xz` pushed in over `scp` onto the running disk | yes | opt-in |
 | 3 | Flashes a `wic.xz` downloaded from a URL onto the running disk | yes | opt-in |
 
-Mode 1 behaves like a factory reset with respect to the new disk: it resets the
-bootloader environment, reformats `etc` and `data` to enforce the first-boot
-condition, and gives the copied partitions fresh UUIDs.
+On the destination disk mode 1 writes the default bootloader environment,
+reformats `etc` and `data` to enforce the first-boot condition, and gives the
+copied partitions fresh UUIDs. None of that touches the running disk.
 
 Implementation order is **1 → 2 → 3**. Mode 2 comes before mode 3 because it
 is the mode used in the development cycle, even though its interactive `scp`
@@ -32,11 +32,13 @@ wait is the hardest part to port and to test.
 ### 1.1 Fidelity policy
 
 Observable behaviour is preserved: the same environment keys, the same terminal
-actions, the same platform workarounds. Two exceptions, both deliberate and both
+actions, the same platform workarounds. Three exceptions, all deliberate and all
 recorded in [§9](#9-intentional-deviations-from-the-legacy-scripts):
 
 - two legacy bugs are fixed;
-- unbounded waits become bounded.
+- machine-driven unbounded waits become bounded; whether the mode 2 `scp` wait
+  joins them is open (§10.8);
+- `dd` is replaced by in-process file I/O.
 
 Everything else that looks odd is carried over, because it was added for observed
 field failures. The items where that judgment is worth re-examining are collected
@@ -186,6 +188,12 @@ The legacy recipe computes the sum with `bc` because bitbake does not evaluate
 shell arithmetic; `build.rs` sums the two values itself and needs only the two
 Yocto variables.
 
+Mode 1 adds one more, new on both sides (§10.7):
+
+| Yocto variable | Constant | Note |
+|---|---|---|
+| `OMNECT_UBOOT_ENV_REDUNDANT` | `UBOOT_ENV_REDUNDANT` | `bool`, required on U-Boot like the three `UBOOT_ENV*` values |
+
 ### 2.8 External tools and in-process equivalents
 
 Paths verified against `buildhistory` for a built `omnect-os-initramfs`
@@ -199,7 +207,6 @@ image is usrmerged — `/bin -> usr/bin` and `/sbin -> usr/sbin` — so the
 | `e2image` | `/usr/sbin/e2image` | `e2fsprogs` | 1 |
 | `mkfs.ext4` | `/usr/sbin/mkfs.ext4` | `e2fsprogs-mke2fs` | 1 |
 | `tune2fs` | `/usr/sbin/tune2fs` | `e2fsprogs-tune2fs` | 1 |
-| `dd` | `/usr/bin/dd` | `coreutils` | 1, 2 |
 | `bmaptool` | `/usr/bin/bmaptool` | `bmaptool` | 2, 3 |
 | `curl` | `/usr/bin/curl` | `curl` | 3 |
 | `dhcpcd` | `/usr/sbin/dhcpcd` | `dhcpcd` | 2, 3 |
@@ -213,21 +220,27 @@ on EFI machines.
 The remaining tools stay external because no pure-Rust equivalent exists at a
 dependency weight an initramfs can carry: `sfdisk` (partition tables),
 `e2image`, `mkfs.ext4` and `tune2fs` (ext4), `bmaptool` (block maps),
-`efibootmgr` (EFI variables), `curl`, `dhcpcd` and `dropbear`. `dd` could be
-replaced by plain file I/O, but `coreutils` ships in the image regardless, so
-that would save a process spawn and no package.
+`efibootmgr` (EFI variables), `curl`, `dhcpcd` and `dropbear`.
 
-Five operations the legacy scripts shell out for are done in-process instead.
+Six operations the legacy scripts shell out for are done in-process instead.
 Four use `nix`, which is already a dependency with the required features
-enabled; `uuidgen` needs the new `uuid` crate:
+enabled; `uuidgen` needs the new `uuid` crate; `dd` needs nothing:
 
 | Legacy | In-process |
 |---|---|
 | `uuidgen` | `uuid::Uuid::new_v4` |
+| `dd` | `std::io` read/write at an offset, with `COPY_BUFFER_SIZE` as the buffer |
 | `mkfifo` | `nix::unistd::mkfifo` |
 | `chown omnect:omnect` | `nix::unistd::chown`, with the uid/gid looked up via the `user` feature |
 | `sync` | `nix::unistd::sync` |
 | `reboot -f` / `poweroff -f` | `nix::sys::reboot::reboot` with `RB_AUTOBOOT` / `RB_POWER_OFF` |
+
+Every `dd` call in the three modes is a plain read and write at a byte offset —
+the bootloader area copy, the `boot`, `factory` and `cert` partition copies, the
+`uboot-env.bin` writes and the zeroing in mode 2 — so `File::seek` plus a
+buffered copy covers all of them, followed by the explicit `sync` the legacy
+scripts get from `dd` returning. Whether `coreutils` can leave the image depends
+on the other init paths that still call it, so this spec does not claim it.
 
 The reboot call follows the existing pattern in `handle_fatal_error`: it returns
 `Result<Infallible>`, so the `Ok` arm is uninhabited and only the error path is
@@ -239,9 +252,10 @@ reachable.
 
 Two more `rerun-if-env-changed` lines and two more generated constants for mode 2
 (§2.7): `DD_ZERO_SIZE`, summed from `OMNECT_PART_OFFSET_BOOT` and
-`OMNECT_PART_SIZE_BOOT`, and `DIRECT_FLASHING`. The existing `read_u64_env` helper
-covers the first; the second needs a small boolean reader. The doc-comment table
-at the top of `build.rs` gains both rows.
+`OMNECT_PART_SIZE_BOOT`, and `DIRECT_FLASHING`. Mode 1 adds `UBOOT_ENV_REDUNDANT`
+(§10.7). The existing `read_u64_env` helper covers the first; the other two need
+a small boolean reader. The doc-comment table at the top of `build.rs` gains all
+three rows.
 
 ### 3.1 `src/bootloader/mod.rs`
 
@@ -356,6 +370,9 @@ One new dependency, pulled in by `flash-mode-1` only:
 resolves the current mismatch where the project `CLAUDE.md` feature table lists
 `flash-mode-1/2/3` but `Cargo.toml` defines none of them.
 
+Reviewers want mode 1 gated as well. That changes what ships, so it is recipe
+work tracked in §12 rather than part of the port.
+
 ## 4. Mode 1 — clone to another disk
 
 ### 4.1 Sequence
@@ -363,7 +380,8 @@ resolves the current mismatch where the project `CLAUDE.md` feature table lists
 1. Read `flash-mode-devpath`, resolve symlinks. Clear `flash-mode` and
    `flash-mode-devpath`.
 2. Validate the required build-time constants: `DATA_SIZE` always; on U-Boot
-   also `UBOOT_ENV1_START`, `UBOOT_ENV2_START`, `UBOOT_ENV_SIZE`.
+   also `UBOOT_ENV1_START`, `UBOOT_ENV2_START`, `UBOOT_ENV_SIZE` and
+   `UBOOT_ENV_REDUNDANT`.
 3. Wait for the destination block device, bounded (§7).
 4. Reject an empty destination, a destination that is not a block device, and a
    destination equal to the source. The last check compares the resolved
@@ -371,10 +389,10 @@ resolves the current mismatch where the project `CLAUDE.md` feature table lists
    symlink or an alias spelling of the running disk is caught too.
 5. `sync`, then unmount `/sysroot` completely — the boot partition first, then the
    rootfs. Both are mounted by `mount_core_partitions` on both bootloaders. The
-   boot unmount is needed so the `dd` of the boot partition reads a consistent
-   image; the rootfs unmount is needed so step 12 does not run `e2image` against a
-   filesystem the kernel currently has mounted, with live superblock and journal
-   state.
+   boot unmount is needed so the raw copy of the boot partition reads a
+   consistent image; the rootfs unmount is needed so step 12 does not run
+   `e2image` against a filesystem the kernel currently has mounted, with live
+   superblock and journal state.
 6. Read the source partition-table dump, rewrite it (§4.2), apply it to the
    destination.
 7. Verify every expected destination partition now exists as a block device.
@@ -391,13 +409,13 @@ resolves the current mismatch where the project `CLAUDE.md` feature table lists
 13. Write the default bootloader environment to the destination:
     - GRUB: mount the destination boot partition, copy
       `/etc/omnect/grubenv.in` to `EFI/BOOT/grubenv`, unmount;
-    - U-Boot: write `/etc/omnect/uboot-env.bin` at both `UBOOT_ENV1_START` and
-      `UBOOT_ENV2_START`, as legacy does. Legacy comments this as enforcing a
-      redundant environment even when the initial wic had only one, which is not
-      what it achieves: U-Boot reads a second copy only when its own build
-      configures a redundant environment, and writing bytes to the offset does
-      not change that configuration. Where the build does configure one, the
-      second write is required. See §10.7.
+    - U-Boot: write `/etc/omnect/uboot-env.bin` at `UBOOT_ENV1_START`, and at
+      `UBOOT_ENV2_START` only when `UBOOT_ENV_REDUNDANT` is set. U-Boot reads a
+      second copy only when its own build configures a redundant environment;
+      where it does, the second write is required, otherwise the offset would
+      keep whatever the clone inherited. Legacy writes both unconditionally and
+      comments it as enforcing redundancy, which writing bytes to an offset
+      cannot do. See §10.7.
 14. EFI handling on the destination (§6).
 15. `sync`.
 
@@ -529,14 +547,18 @@ timeout the mode fails into the normal fatal-error path (§8).
 | Mode 1 destination block device | 30 s, off-by-one bug | 30 s | unchanged, bug fixed |
 | Interface up | unbounded | 60 s | machine-driven, should be immediate |
 | DHCP IPv4 address | unbounded | 120 s | covers a slow DHCP server |
-| Mode 2 `wic.bmap` arrival | unbounded | 30 min | waits for a person to start the `scp` |
+| Mode 2 `wic.bmap` arrival | unbounded | 30 min, open (§10.8) | waits for a person to start the `scp` |
 
 The values are proposals — reviewers should say if any is wrong for their
 machines. Each becomes a named constant.
 
-Because `flash-mode` is already cleared, a power cycle recovers a stuck device in
-both the legacy and the ported behaviour. Bounding the waits turns a silent hang
-into a diagnosable failure and satisfies the project's no-magic-numbers rule.
+Because `flash-mode` is already cleared, a power cycle leaves the device in
+Normal boot in both the legacy and the ported behaviour, and the operator
+re-triggers the mode. Bounding a machine-driven wait turns a silent hang into a
+diagnosable failure and satisfies the project's no-magic-numbers rule. The
+`wic.bmap` row is not machine-driven — legacy polls forever, so an operator who
+starts the `scp` late still gets a flash, while a bound refuses one. That row is
+therefore open (§10.8).
 
 ## 8. Error handling, terminal actions and logging
 
@@ -620,7 +642,9 @@ Also not ported:
 
 Behaviour changes, as opposed to bug fixes:
 
-- unbounded waits become bounded (§7);
+- unbounded waits become bounded (§7), except that the mode 2 `wic.bmap` wait is
+  still open (§10.8);
+- `dd` is replaced by in-process file I/O (§2.8);
 - every mode unmounts `/sysroot` fully before writing, because the Rust flow mounts
   it before dispatch and legacy did not (§2.3). Without this, mode 1 would image a
   mounted `rootCurrent`;
@@ -701,15 +725,34 @@ refusal is equally visible either way.
 Mode 1 step 13 copies `uboot-env.bin` to `UBOOT_ENV1_START` and
 `UBOOT_ENV2_START`. The legacy comment claims this enforces a redundant
 environment even when the initial wic had only one. It does not: U-Boot uses a
-second copy only when its build configures a redundant environment. Where the
-build does configure one, writing only the first offset would leave the second
-holding whatever the clone inherited, so the second write is needed there.
+second copy only when its build configures a redundant environment.
 
-**Default: keep both writes, drop the claim.** The legacy script already
-requires all three `UBOOT_ENV*` values to be defined, so a U-Boot build reaching
-mode 1 always has a second offset configured, and the two writes are consistent
-with it. Overturning this means deciding what a build without a redundant
-environment should do — which needs an example of such a build first.
+**Decided: gate the second write on a build-time flag.** A new Yocto variable
+`OMNECT_UBOOT_ENV_REDUNDANT` becomes the single source of truth for both the
+U-Boot `.cfg` and the `omnect-os-init` build environment, and `build.rs` turns
+it into the `UBOOT_ENV_REDUNDANT` constant (§2.7). The existing
+`OMNECT_PART_OFFSET_UBOOT_ENV2` cannot serve as that flag: it describes the
+partition layout, not what U-Boot was built to read.
+
+A missing value is a build error, like the three `UBOOT_ENV*` values, not a
+silent `false`. Every U-Boot machine enables a redundant environment today, so
+defaulting to `false` would drop the second write on every image whose recipe
+has not been updated yet.
+
+### 10.8 Bound the mode 2 `wic.bmap` wait?
+
+The other three waits in §7 are machine-driven, so a bound is meaningful. This
+one waits for a person to start the `scp`, and legacy polls forever: an operator
+who starts the copy after the bound still gets a flash today, but would get the
+§8.1 failure path after the port. Three options:
+
+- leave this wait unbounded, as the stated exception to §1.1;
+- keep a bound but reboot on timeout instead of halting — `flash-mode` is already
+  cleared, so the device returns to Normal boot and stays usable;
+- keep the bound and the §8.1 failure path.
+
+**Default: keep the bound and the failure path**, which is what §7 and §8.1
+describe today.
 
 ## 11. Testing
 
@@ -743,8 +786,14 @@ Implemented separately, listed here so nothing is lost:
 - pass `OMNECT_PART_OFFSET_BOOT`, `OMNECT_PART_SIZE_BOOT` and
   `OMNECT_FLASH_MODE_2_DIRECT_FLASHING` into the `omnect-os-init` build
   environment, the same way the existing five constants are passed;
+- add `OMNECT_UBOOT_ENV_REDUNDANT` (§10.7), consumed both by the U-Boot
+  `redundant-env.cfg` handling and by the `omnect-os-init` build environment;
 - map `DISTRO_FEATURES` `flash-mode-2` and `flash-mode-3` onto the corresponding
   Cargo features;
+- gate mode 1 the same way: map `DISTRO_FEATURES` `flash-mode-1` onto the Cargo
+  feature and drop `flash-mode-1` from `default`, so a machine that wants disk
+  cloning has to ask for it. This changes what ships, so it is recipe work rather
+  than part of the port;
 - keep `FLASH_MODE_X_PACKAGES` plus `dropbear` and `curl` gated as they are
   today, and keep the `omnect_user` class inherited for mode 2;
 - retire `init.d/87-flash_mode_{1,2,3}` and the `sed` substitutions in
