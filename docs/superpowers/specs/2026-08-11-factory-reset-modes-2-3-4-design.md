@@ -1,4 +1,4 @@
-# Factory Reset Modes 2, 3, 4 — Design
+# Factory Reset Modes 2 and 3 — Design
 
 **Date:** 2026-08-11
 **Status:** In review (PR #23)
@@ -6,13 +6,14 @@
 ## 1. Overview
 
 Factory reset mode 1 (backup / reformat / restore) is implemented. This design
-adds the wipe modes from the legacy bash script:
+adds the remaining wipe modes from the legacy bash script:
 
 | Mode | Meaning                            | Implementation (this design)          |
 | ---- | ---------------------------------- | ------------------------------------- |
 | 2    | overwrite `etc` and `data` with random data (slow, better privacy) | native Rust write loop over the whole device |
 | 3    | discard all blocks of `etc` and `data` (fast, needs hardware discard support) | `BLKDISCARD` ioctl |
-| 4    | custom wipe hook                   | run `/opt/factory_reset/custom-wipe`  |
+
+Legacy mode 4 (custom wipe hook) is dropped, see 1.1.
 
 The wipe runs between backup/unmount and reformat. A wipe failure never
 aborts the reset: reformat + restore still run, so the device stays usable.
@@ -36,35 +37,40 @@ These must be listed in the PR description:
   reports an error (legacy `fstrim` had the same hardware requirement).
   Discard remains a hint on some disks — the "no total privacy guarantee"
   note in the meta-omnect README stays true.
-- **Mode 4:** unchanged contract. Same hook path, no arguments, partitions
-  unmounted at call time — existing customer bbappends keep working.
+- **Mode 4 is dropped.** The legacy script ran a customer-supplied hook at
+  `/opt/factory_reset/custom-wipe`. The mode is removed instead of ported: it
+  hands the wipe — the one step the caller asked for — to code we do not
+  build or test, and with modes 2 and 3 covering rotating disks and flash
+  there is no case left that needs it. A mode-4 trigger is rejected as
+  `Invalid` (status 1). Removal has to land in the same release in every
+  place that knows the mode, see section 4.
 - **No dependency changes in the initramfs image:** no `fstrim`/`blkdiscard`
   binary needed; `dd` no longer used for the wipe.
 
 ### 1.2 Userland (ODS) contract
 
-No change. ODS already sends numeric modes 1–4 in the trigger
-(`Serialize_repr`), and the result schema (status codes 0–4, optional
-`error`/`context`, `paths`, `data_wiped`) is unchanged — ODS PR #207 parses
-it. The wipe-failure note travels in the existing free-text `error` field.
-The only observable delta is intended: a mode-2/3/4 trigger now performs a
-reset (status 0, 2 or 4) instead of failing with status 1.
+The result schema is unchanged (status codes 0–4, optional `error`/`context`,
+`paths`, `data_wiped` — ODS PR #207 parses it), and the wipe-failure note
+travels in the existing free-text `error` field.
+
+The accepted trigger modes narrow from 1–4 to 1–3. Both observable deltas are
+intended: a mode-2/3 trigger now performs a reset (status 0, 2 or 4) instead
+of failing with status 1, and a mode-4 trigger is rejected as `Invalid`
+(status 1). ODS and omnect-ui drop `Mode4` from their mode type, so the value
+can no longer be sent from the cloud or the local UI — see section 4.
 
 ## 2. Component Changes
 
 ### 2.1 `src/mode/factory_reset/config.rs`
 
-- `ResetMode` gains `Mode2 = 2`, `Mode3 = 3`, `Mode4 = 4`.
-- `TryFrom<u32>` accepts 1–4; everything else stays rejected (status
-  `Invalid`). Mode stays number-only: the omnect-os CI branch
-  (`feature_rust_init`) already sends numbers.
+- `ResetMode` gains `Mode2 = 2` and `Mode3 = 3`.
+- `TryFrom<u32>` accepts 1–3; everything else stays rejected (status
+  `Invalid`). Mode stays number-only: the trigger already carries the mode as
+  a number in the on-device tests.
 
 ### 2.2 New: `src/mode/factory_reset/wipe.rs`
 
 ```rust
-/// Path of the customer-provided mode-4 hook, installed into the initramfs
-/// image by a Yocto bbappend.
-const CUSTOM_WIPE_PATH: &str = "/opt/factory_reset/custom-wipe";
 /// Chunk size for the mode-2 random overwrite.
 const WIPE_CHUNK_SIZE: usize = 1024 * 1024;
 ```
@@ -76,8 +82,6 @@ const WIPE_CHUNK_SIZE: usize = 1024 * 1024;
 - `wipe_discard(device: &Path) -> Result<()>` — mode 3. `BLKGETSIZE64` +
   `BLKDISCARD` ioctls, defined via `nix` ioctl macros (nix 0.29 is already a
   dependency; no new crates).
-- `run_custom_wipe() -> Result<()>` — mode 4. `Command::new(CUSTOM_WIPE_PATH)`
-  with no arguments. Missing binary, spawn error, or non-zero exit → error.
 - Testability split: the mode-2 overwrite loop takes an open file + length so
   it is unit-testable against a temp file; `wipe_random` is the thin
   block-device wrapper (size query + call).
@@ -90,7 +94,7 @@ Flow change in the reset sequence:
 
 ```
 mount → preserve list → backup → unmount
-  → wipe (mode 2/3/4; mode 1: no wipe step)   ← destructive phase starts here
+  → wipe (mode 2/3; mode 1: no wipe step)     ← destructive phase starts here
   → reformat + mount with retry (existing)
   → restore → unmount
 ```
@@ -98,8 +102,8 @@ mount → preserve list → backup → unmount
 - The wipe is dispatched on `config.mode` and wipes the `etc` and `data`
   devices (same `layout.partitions` lookups as reformat). A failure on one
   device does not skip the other; failures are collected.
-- The destructive boundary moves: for modes 2–4 any failure at or after the
-  wipe reports `data_wiped: true` (a half-written random overwrite destroys
+- The destructive boundary moves: for modes 2 and 3 any failure at or after
+  the wipe reports `data_wiped: true` (a half-written random overwrite destroys
   data even if reformat never runs). Mode 1 keeps today's boundary
   (first reformat).
 - Wipe failures never abort: they become a wipe note (e.g.
@@ -138,12 +142,10 @@ is untouched.
 
 ## 3. Testing
 
-- **Config:** modes 2/3/4 accepted; 0, 5, and string `"2"` rejected.
+- **Config:** modes 2 and 3 accepted; 0, 4, 5, and string `"2"` rejected.
 - **`wipe.rs`:**
   - overwrite loop against a temp file: full length overwritten, content is
     not the previous content, no short-write truncation.
-  - custom wipe with temp scripts: exit 0 → Ok; exit 1 → Err; missing file →
-    Err.
   - `BLKDISCARD`/`BLKGETSIZE64` wrappers stay thin and untested (need a real
     block device); their call sites are covered through the ops trait mock.
 - **`mod.rs`:** mode 1 never calls wipe; wipe failure alone → Error status
@@ -151,23 +153,26 @@ is untouched.
   retry note still in `context`; wipe failure + restore partial failure →
   Error with both notes joined; etc-wipe failure still wipes data
   (continue-on-failure).
-- On-device verification runs via the user's private Concourse team with the
-  omnect-os `feature_rust_init` CI branch.
+- On-device verification runs in a private Concourse team, on the OS build
+  branch that carries the Rust init.
 
 ## 4. CI and documentation follow-ups (other repos)
 
-- omnect-os CI covers only mode 1 today; nothing breaks. Optional follow-up
-  on the `feature_rust_init` branch: add mode-2 and mode-3 test runs. Mode 4
-  is testable too — CI installs a test hook at the mode-4 path directly, no
-  customer bbappend needed, and the hook can cover exit 0, a non-zero exit,
-  output on stdout/stderr, and a missing binary.
+- On-device tests trigger only mode 1 today; nothing breaks. Optional
+  follow-up: add mode-2 and mode-3 test runs.
 - **meta-omnect README (required, not optional):** the mode table still
   describes the legacy tools ("use dd to write random data", "recursive
   remove files with rm; notify disk with fstrim"). Both are replaced here, so
   the table becomes wrong. Rewrite it to describe behaviour ("2 = overwrite
   with random data (slow)", "3 = discard all blocks (fast, needs hardware
-  discard support)") in the migration PR omnect/meta-omnect#636, which
-  removes the legacy scripts but does not touch the README today.
+  discard support)"), and drop the mode-4 row together with the custom-wipe
+  paragraph and its bbappend instructions, in the migration PR
+  omnect/meta-omnect#636, which removes the legacy scripts but does not touch
+  the README today.
+- **Mode-4 removal (required, same release):** `Mode4` has to go from the
+  mode type in omnect/omnect-device-service and omnect/omnect-ui as well.
+  Removing it only here would leave both able to send a 4 that comes back as
+  `Invalid`, which reads as a broken reset rather than a removed mode.
 - PR description in this repo documents all behaviour changes vs the legacy
   script (section 1.1).
 
