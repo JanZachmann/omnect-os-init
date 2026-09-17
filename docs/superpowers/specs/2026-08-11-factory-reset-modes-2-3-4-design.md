@@ -207,6 +207,17 @@ is untouched.
   env record covers.
 
   Costs new boot env keys, so it needs a meta-omnect change as well.
+- **Report an outcome that no status file carried:** when the destructive
+  phase leaves a partition unmountable, the init records
+  `omnect_factory_reset_last_error` in the boot env, but nothing reads or
+  clears it. ODS takes the factory-reset result from the status file in
+  `/run`, which the failing boot never reached, and a later boot that comes
+  up carries no result at all — so the failure never reaches the cloud. Fix:
+  on a boot where no reset ran, the init turns a set key into the
+  factory-reset result and clears it. That keeps one input for ODS, needs no
+  new boot env privileges for it, and it is the mechanism the outcome rule
+  above needs, because the recovery boot decides the outcome after the reset
+  is over.
 - **Post-reset hook:** a hook called after a successful reset, so a customer
   application can pick up a signal on the following boot — for example a file
   written into the fresh `data`. Raised in review of the mode-4 removal, but
