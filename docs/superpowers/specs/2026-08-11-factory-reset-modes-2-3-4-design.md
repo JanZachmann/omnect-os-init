@@ -207,6 +207,14 @@ is untouched.
   env record covers.
 
   Costs new boot env keys, so it needs a meta-omnect change as well.
+- **Post-reset hook:** a hook called after a successful reset, so a customer
+  application can pick up a signal on the following boot — for example a file
+  written into the fresh `data`. Raised in review of the mode-4 removal, but
+  a different feature: the removed hook took over the wipe itself, this one
+  only runs once the reset succeeded. Open: when exactly it runs, what it may
+  touch on a freshly reformatted `etc` and `data`, and whether a non-zero
+  exit changes the reported status. No customer has asked for it, so it stays
+  an idea.
 - **Storage-type guidance in the meta-omnect README:** which mode suits which
   storage. Mode 2 suits rotating disks; on flash with wear leveling it adds a
   full write cycle and still cannot reach blocks the controller has remapped
