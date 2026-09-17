@@ -754,6 +754,13 @@ who starts the copy after the bound still gets a flash today, but would get the
 **Default: keep the bound and the failure path**, which is what §7 and §8.1
 describe today.
 
+One reviewer argues for the unbounded variant: the bound exists only to keep the
+"no unbounded code path" rule, production images never reach this mode, and on a
+development image a shell after half an hour says nothing the missing data has
+not already said. Dropping the bound also removes the `bmaptool` watchdog in
+§5.4, which exists for the same rule and whose timeout kills a flash in progress
+— worse than waiting, because it leaves the disk half-written.
+
 ## 11. Testing
 
 Decision logic is pure and unit-tested; command execution is a thin layer that is
