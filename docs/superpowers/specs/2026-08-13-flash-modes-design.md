@@ -6,8 +6,8 @@ to the Rust initramfs.
 
 **This spec has a blocking section: [§10 Decisions required from
 reviewers](#10-decisions-required-from-reviewers). Implementation must not start
-before every item there is decided. §10.2, §10.6 and §10.7 are decided; §10.1,
-§10.3, §10.4, §10.5 and §10.8 are still open.**
+before every item there is decided. §10.2, §10.6, §10.7 and §10.8 are decided;
+§10.1, §10.3, §10.4 and §10.5 are still open.**
 
 ## 1. Overview
 
@@ -36,8 +36,8 @@ actions, the same platform workarounds. Three exceptions, all deliberate and all
 recorded in [§9](#9-intentional-deviations-from-the-legacy-scripts):
 
 - two legacy bugs are fixed;
-- machine-driven unbounded waits become bounded; whether the mode 2 `scp` wait
-  joins them is open (§10.8);
+- machine-driven unbounded waits become bounded; the wait for the operator's
+  `scp` stays unbounded (§10.8);
 - `dd` is replaced by in-process file I/O.
 
 Everything else that looks odd is carried over, because it was added for observed
@@ -188,11 +188,9 @@ The legacy recipe computes the sum with `bc` because bitbake does not evaluate
 shell arithmetic; `build.rs` sums the two values itself and needs only the two
 Yocto variables.
 
-Mode 1 adds one more, new on both sides (§10.7):
-
-| Yocto variable | Constant | Note |
-|---|---|---|
-| `OMNECT_UBOOT_ENV_REDUNDANT` | `UBOOT_ENV_REDUNDANT` | `bool`, required on U-Boot like the three `UBOOT_ENV*` values |
+`UBOOT_ENV2_START` stays `Option<u64>` rather than required: it is set per
+machine and absent where no second environment bank is reserved, which is
+exactly the condition for skipping the second write (§10.7).
 
 ### 2.8 External tools and in-process equivalents
 
@@ -239,8 +237,7 @@ Every `dd` call in the three modes is a plain read and write at a byte offset �
 the bootloader area copy, the `boot`, `factory` and `cert` partition copies, the
 `uboot-env.bin` writes and the zeroing in mode 2 — so `File::seek` plus a
 buffered copy covers all of them, followed by the explicit `sync` the legacy
-scripts get from `dd` returning. Whether `coreutils` can leave the image depends
-on the other init paths that still call it, so this spec does not claim it.
+scripts get from `dd` returning.
 
 The reboot call follows the existing pattern in `handle_fatal_error`: it returns
 `Result<Infallible>`, so the `Ok` arm is uninhabited and only the error path is
@@ -252,10 +249,9 @@ reachable.
 
 Two more `rerun-if-env-changed` lines and two more generated constants for mode 2
 (§2.7): `DD_ZERO_SIZE`, summed from `OMNECT_PART_OFFSET_BOOT` and
-`OMNECT_PART_SIZE_BOOT`, and `DIRECT_FLASHING`. Mode 1 adds `UBOOT_ENV_REDUNDANT`
-(§10.7). The existing `read_u64_env` helper covers the first; the other two need
-a small boolean reader. The doc-comment table at the top of `build.rs` gains all
-three rows.
+`OMNECT_PART_SIZE_BOOT`, and `DIRECT_FLASHING`. The existing `read_u64_env`
+helper covers the first; the second needs a small boolean reader. The
+doc-comment table at the top of `build.rs` gains both rows.
 
 ### 3.1 `src/bootloader/mod.rs`
 
@@ -380,8 +376,8 @@ work tracked in §12 rather than part of the port.
 1. Read `flash-mode-devpath`, resolve symlinks. Clear `flash-mode` and
    `flash-mode-devpath`.
 2. Validate the required build-time constants: `DATA_SIZE` always; on U-Boot
-   also `UBOOT_ENV1_START`, `UBOOT_ENV2_START`, `UBOOT_ENV_SIZE` and
-   `UBOOT_ENV_REDUNDANT`.
+   also `UBOOT_ENV1_START` and `UBOOT_ENV_SIZE`. `UBOOT_ENV2_START` is optional
+   (§10.7).
 3. Wait for the destination block device, bounded (§7).
 4. Reject an empty destination, a destination that is not a block device, and a
    destination equal to the source. The last check compares the resolved
@@ -410,12 +406,10 @@ work tracked in §12 rather than part of the port.
     - GRUB: mount the destination boot partition, copy
       `/etc/omnect/grubenv.in` to `EFI/BOOT/grubenv`, unmount;
     - U-Boot: write `/etc/omnect/uboot-env.bin` at `UBOOT_ENV1_START`, and at
-      `UBOOT_ENV2_START` only when `UBOOT_ENV_REDUNDANT` is set. U-Boot reads a
-      second copy only when its own build configures a redundant environment;
-      where it does, the second write is required, otherwise the offset would
-      keep whatever the clone inherited. Legacy writes both unconditionally and
-      comments it as enforcing redundancy, which writing bytes to an offset
-      cannot do. See §10.7.
+      `UBOOT_ENV2_START` when that offset is defined. Where a machine reserves a
+      second bank, skipping the write would leave it holding whatever the clone
+      inherited. The legacy comment reads the two writes as enforcing a redundant
+      environment, which writing bytes to an offset cannot do. See §10.7.
 14. EFI handling on the destination (§6).
 15. `sync`.
 
@@ -493,8 +487,8 @@ flag file shipped by `omnect-os-initramfs-test`. Both are kept.
 4. Log the two commands the operator must run, with the acquired IP address:
    `scp <bmap-file> omnect@<ip>:wic.bmap` and
    `scp <wic-image> omnect@<ip>:wic.xz`.
-5. Wait for `/home/omnect/wic.bmap` to appear, bounded but with a generous
-   timeout — this waits for a person (§7).
+5. Wait for `/home/omnect/wic.bmap` to appear, unbounded — this waits for a
+   person (§7).
 6. Flash, according to `DIRECT_FLASHING`:
    - **`false`** — verify pass first: `bmaptool copy --bmap wic.bmap wic.xz wic`,
      which consumes the FIFO and materializes the mapped, decompressed image as a
@@ -505,13 +499,9 @@ flag file shipped by `omnect-os-initramfs-test`. Both are kept.
      the FIFO onto the disk. No verification.
 7. EFI handling (§6), `sync`, log (§8), `reboot`.
 
-One wait in mode 2 cannot be bounded by a timeout constant: once `bmaptool`
-starts, it blocks reading the FIFO until the operator's `scp` feeds it. Bounding
-that means running `bmaptool` as a child with a watchdog that kills it if no data
-arrives, using the same `wic.bmap` timeout from §7. Without the watchdog, mode 2
-keeps one unbounded hang path even though every wait we own is bounded. The
-watchdog is part of this design; it is called out here because it is the only
-place where bounding a wait needs more than a timeout on our own loop.
+Once `bmaptool` starts it blocks reading the FIFO until the operator's `scp`
+feeds it, and that wait stays unbounded too: a timeout there would kill a flash
+in progress and leave the disk half-written (§10.8).
 
 The zeroing step is the legacy `non_bmap_dd_handling`. Its comment records
 post-flash boot failures observed on both GRUB (mismatched `bootx64.efi`
@@ -547,7 +537,7 @@ timeout the mode fails into the normal fatal-error path (§8).
 | Mode 1 destination block device | 30 s, off-by-one bug | 30 s | unchanged, bug fixed |
 | Interface up | unbounded | 60 s | machine-driven, should be immediate |
 | DHCP IPv4 address | unbounded | 120 s | covers a slow DHCP server |
-| Mode 2 `wic.bmap` arrival | unbounded | 30 min, open (§10.8) | waits for a person to start the `scp` |
+| Mode 2 `wic.bmap` arrival | unbounded | unbounded | waits for a person to start the `scp` (§10.8) |
 
 The values are proposals — reviewers should say if any is wrong for their
 machines. Each becomes a named constant.
@@ -555,10 +545,9 @@ machines. Each becomes a named constant.
 Because `flash-mode` is already cleared, a power cycle leaves the device in
 Normal boot in both the legacy and the ported behaviour, and the operator
 re-triggers the mode. Bounding a machine-driven wait turns a silent hang into a
-diagnosable failure and satisfies the project's no-magic-numbers rule. The
-`wic.bmap` row is not machine-driven — legacy polls forever, so an operator who
-starts the `scp` late still gets a flash, while a bound refuses one. That row is
-therefore open (§10.8).
+diagnosable failure. The `scp` wait is not machine-driven: a bound there refuses
+a flash that legacy would still perform, and buys nothing an operator does not
+already know from the missing data (§10.8).
 
 ## 8. Error handling, terminal actions and logging
 
@@ -642,8 +631,8 @@ Also not ported:
 
 Behaviour changes, as opposed to bug fixes:
 
-- unbounded waits become bounded (§7), except that the mode 2 `wic.bmap` wait is
-  still open (§10.8);
+- machine-driven unbounded waits become bounded (§7); the wait for the
+  operator's `scp` keeps polling as legacy does (§10.8);
 - `dd` is replaced by in-process file I/O (§2.8);
 - every mode unmounts `/sysroot` fully before writing, because the Rust flow mounts
   it before dispatch and legacy did not (§2.3). Without this, mode 1 would image a
@@ -727,39 +716,24 @@ Mode 1 step 13 copies `uboot-env.bin` to `UBOOT_ENV1_START` and
 environment even when the initial wic had only one. It does not: U-Boot uses a
 second copy only when its build configures a redundant environment.
 
-**Decided: gate the second write on a build-time flag.** A new Yocto variable
-`OMNECT_UBOOT_ENV_REDUNDANT` becomes the single source of truth for both the
-U-Boot `.cfg` and the `omnect-os-init` build environment, and `build.rs` turns
-it into the `UBOOT_ENV_REDUNDANT` constant (§2.7). The existing
-`OMNECT_PART_OFFSET_UBOOT_ENV2` cannot serve as that flag: it describes the
-partition layout, not what U-Boot was built to read.
-
-A missing value is a build error, like the three `UBOOT_ENV*` values, not a
-silent `false`. Every U-Boot machine enables a redundant environment today, so
-defaulting to `false` would drop the second write on every image whose recipe
-has not been updated yet.
+**Decided: write the second copy when `UBOOT_ENV2_START` is defined.** The
+offset has no default and is set per machine, so its absence already expresses
+"this machine reserves no second bank" and no new variable is needed. Where the
+U-Boot build ignores a reserved bank the extra write is wasted, not harmful.
+`UBOOT_ENV2_START` therefore drops out of the required constants (§2.7, §4.1).
 
 ### 10.8 Bound the mode 2 `wic.bmap` wait?
 
 The other three waits in §7 are machine-driven, so a bound is meaningful. This
 one waits for a person to start the `scp`, and legacy polls forever: an operator
 who starts the copy after the bound still gets a flash today, but would get the
-§8.1 failure path after the port. Three options:
+§8.1 failure path after the port.
 
-- leave this wait unbounded, as the stated exception to §1.1;
-- keep a bound but reboot on timeout instead of halting — `flash-mode` is already
-  cleared, so the device returns to Normal boot and stays usable;
-- keep the bound and the §8.1 failure path.
-
-**Default: keep the bound and the failure path**, which is what §7 and §8.1
-describe today.
-
-One reviewer argues for the unbounded variant: the bound exists only to keep the
-"no unbounded code path" rule, production images never reach this mode, and on a
-development image a shell after half an hour says nothing the missing data has
-not already said. Dropping the bound also removes the `bmaptool` watchdog in
-§5.4, which exists for the same rule and whose timeout kills a flash in progress
-— worse than waiting, because it leaves the disk half-written.
+**Decided: leave it unbounded.** The bound existed only to keep the "no
+unbounded code path" rule. Production images never reach this mode, and on a
+development image a shell after the bound says nothing the missing data has not
+already said. The same decision removes the `bmaptool` watchdog, whose timeout
+would kill a flash in progress and leave the disk half-written (§5.4).
 
 ## 11. Testing
 
@@ -793,8 +767,6 @@ Implemented separately, listed here so nothing is lost:
 - pass `OMNECT_PART_OFFSET_BOOT`, `OMNECT_PART_SIZE_BOOT` and
   `OMNECT_FLASH_MODE_2_DIRECT_FLASHING` into the `omnect-os-init` build
   environment, the same way the existing five constants are passed;
-- add `OMNECT_UBOOT_ENV_REDUNDANT` (§10.7), consumed both by the U-Boot
-  `redundant-env.cfg` handling and by the `omnect-os-init` build environment;
 - map `DISTRO_FEATURES` `flash-mode-2` and `flash-mode-3` onto the corresponding
   Cargo features;
 - gate mode 1 the same way: map `DISTRO_FEATURES` `flash-mode-1` onto the Cargo
