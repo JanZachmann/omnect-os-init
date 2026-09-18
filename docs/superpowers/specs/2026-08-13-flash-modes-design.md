@@ -176,10 +176,10 @@ Mode 2 adds two through the same mechanism:
 
 | Yocto variable | Constant | Note |
 |---|---|---|
-| `OMNECT_PART_OFFSET_BOOT` + `OMNECT_PART_SIZE_BOOT` | `DD_ZERO_SIZE` | `Option<u64>`, sum in KB |
+| `OMNECT_PART_OFFSET_BOOT` + `OMNECT_PART_SIZE_BOOT` | `ZERO_HEAD_SIZE` | `Option<u64>`, sum in KB |
 | `OMNECT_FLASH_MODE_2_DIRECT_FLASHING` | `DIRECT_FLASHING` | `bool`, `1` → `true`, anything else → `false` |
 
-`DD_ZERO_SIZE` is `Option<u64>` and absent on builds that do not set it, exactly
+`ZERO_HEAD_SIZE` is `Option<u64>` and absent on builds that do not set it, exactly
 like the existing five; mode 2 treats it as a missing required constant.
 `DIRECT_FLASHING` is a plain `bool` defaulting to `false` when the variable is
 absent or is not `1`, matching the legacy
@@ -248,7 +248,7 @@ reachable.
 ### 3.0 `build.rs`
 
 Two more `rerun-if-env-changed` lines and two more generated constants for mode 2
-(§2.7): `DD_ZERO_SIZE`, summed from `OMNECT_PART_OFFSET_BOOT` and
+(§2.7): `ZERO_HEAD_SIZE`, summed from `OMNECT_PART_OFFSET_BOOT` and
 `OMNECT_PART_SIZE_BOOT`, and `DIRECT_FLASHING`. The existing `read_u64_env`
 helper covers the first; the second needs a small boolean reader. The
 doc-comment table at the top of `build.rs` gains both rows.
@@ -322,7 +322,7 @@ runs mode 2 alone.
 
 Note also that the queued `factory-reset` key does not survive modes 2 and 3. On
 U-Boot the environment lives at the `UBOOT_ENV1_START`/`UBOOT_ENV2_START` byte
-offsets, and mode 2's own zeroing of the first `DD_ZERO_SIZE` KB reaches through
+offsets, and mode 2's own zeroing of the first `ZERO_HEAD_SIZE` KB reaches through
 that region; on GRUB, `grubenv` sits on the boot partition, which the flash
 overwrites. The reset request is destroyed, not deferred.
 
@@ -492,10 +492,10 @@ flag file shipped by `omnect-os-initramfs-test`. Both are kept.
 6. Flash, according to `DIRECT_FLASHING`:
    - **`false`** — verify pass first: `bmaptool copy --bmap wic.bmap wic.xz wic`,
      which consumes the FIFO and materializes the mapped, decompressed image as a
-     file in the initramfs tmpfs. Then zero the first `DD_ZERO_SIZE` KB of the
+     file in the initramfs tmpfs. Then zero the first `ZERO_HEAD_SIZE` KB of the
      disk, then flash from the materialized file. The RAM cost of the verify pass
      is the size of the mapped image; that cost is why the direct path exists.
-   - **`true`** — zero the first `DD_ZERO_SIZE` KB, then `bmaptool` straight from
+   - **`true`** — zero the first `ZERO_HEAD_SIZE` KB, then `bmaptool` straight from
      the FIFO onto the disk. No verification.
 7. EFI handling (§6), `sync`, log (§8), `reboot`.
 
@@ -652,7 +652,7 @@ follows that decision.
 
 ### 10.1 Keep `non_bmap_dd_handling`?
 
-Zeroing the first `DD_ZERO_SIZE` KB of the disk before flashing in mode 2. The
+Zeroing the first `ZERO_HEAD_SIZE` KB of the disk before flashing in mode 2. The
 legacy comment records post-flash boot failures observed on both GRUB and U-Boot,
 but the root cause was never established, so this may be masking a `bmaptool` or
 partition-alignment problem rather than fixing one.
