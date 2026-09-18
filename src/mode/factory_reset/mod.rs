@@ -189,7 +189,13 @@ fn wipe_partitions(
         };
         if let Err(e) = wiped {
             warn!("factory reset: wipe of {partition} failed; continuing: {e}");
-            notes.push(format!("{partition}: {e}"));
+            // The note lands in the factory-reset result, so the outer
+            // "Factory reset error" wrapper would only repeat the obvious.
+            let reason = match e {
+                InitramfsError::FactoryReset(inner) => inner.to_string(),
+                other => other.to_string(),
+            };
+            notes.push(format!("{partition}: {reason}"));
         }
     }
 

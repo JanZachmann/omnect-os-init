@@ -138,9 +138,12 @@ mod tests {
 
             let wiped = std::fs::read(file.path()).unwrap();
             assert_eq!(wiped.len(), len, "length must not change (len={len})");
+            // Block by block, so a gap anywhere in the range fails the test.
             assert!(
-                wiped[len - TAIL_LEN..].iter().any(|b| *b != FILLER),
-                "the end must be overwritten too (len={len})"
+                wiped
+                    .chunks(TAIL_LEN)
+                    .all(|block| block.iter().any(|b| *b != FILLER)),
+                "every block must be overwritten (len={len})"
             );
         }
     }
