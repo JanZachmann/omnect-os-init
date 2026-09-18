@@ -89,6 +89,7 @@ impl InitramfsError {
                 | FactoryResetError::BackupFailed { .. }
                 | FactoryResetError::RestoreFailed { .. }
                 | FactoryResetError::ReformatFailed { .. }
+                | FactoryResetError::WipeFailed { .. }
                 | FactoryResetError::MountError(_)
                 | FactoryResetError::Io(_),
             ) => RecoveryClass::ContinueDegraded,
@@ -270,6 +271,9 @@ pub enum FactoryResetError {
 
     #[error("Reformat failed for {}: {reason}", device.display())]
     ReformatFailed { device: PathBuf, reason: String },
+
+    #[error("Wipe failed for {}: {reason}", device.display())]
+    WipeFailed { device: PathBuf, reason: String },
 
     #[error("Mount error: {0}")]
     MountError(String),

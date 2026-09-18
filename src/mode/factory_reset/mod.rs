@@ -1,6 +1,7 @@
 pub mod backup_restore;
 pub mod config;
 pub mod reformat;
+pub mod wipe;
 
 use std::path::{Path, PathBuf};
 
@@ -20,8 +21,9 @@ use crate::{
 
 use crate::mode::factory_reset::{
     backup_restore::{backup_all, restore_all},
-    config::{FactoryResetConfig, build_preserve_list},
+    config::{FactoryResetConfig, ResetMode, build_preserve_list},
     reformat::reformat_ext4,
+    wipe::{wipe_discard, wipe_random},
 };
 
 const FACTORY_RESET_BACKUP_DIR: &str = "/tmp/factory_reset/backup";
@@ -91,9 +93,9 @@ fn persist_exhausted_signal(
 }
 
 /// Inner reset sequence. Returns `Err` only for failures before the
-/// destructive phase begins (mount, config, backup); failures at or after
-/// the first `reformat_ext4` call are resolved to a status internally
-/// instead, so they're never mistaken for a safe pre-reformat abort.
+/// destructive phase begins (mount, config, backup); failures at or after the
+/// wipe are resolved to a status internally instead, so they're never mistaken
+/// for a safe abort.
 fn run_reset(
     layout: &PartitionLayout,
     rootfs: &Path,
@@ -123,7 +125,9 @@ fn run_reset(
         FactoryResetError::MountError("etc partition not found in layout".to_string())
     })?;
 
-    match run_destructive_phase(
+    let wipe_note = wipe_partitions(config.mode, data_dev, etc_dev, &mut RealWipeOps);
+
+    let (status, signal) = match run_destructive_phase(
         layout,
         rootfs,
         &mut mounts,
@@ -136,8 +140,75 @@ fn run_reset(
             backup_dir: &backup_dir,
         },
     ) {
-        Ok(pair) => Ok(pair),
-        Err(e) => Ok((destructive_phase_failure_status(e, preserve_list), None)),
+        Ok(pair) => pair,
+        Err(e) => (destructive_phase_failure_status(e, preserve_list), None),
+    };
+
+    Ok((apply_wipe_note(status, wipe_note), signal))
+}
+
+/// Injectable abstraction over the wipe side effects, so the mode dispatch and
+/// the continue-on-failure control flow are unit-testable without block devices.
+trait WipeOps {
+    fn wipe_random(&mut self, device: &Path) -> Result<()>;
+    fn wipe_discard(&mut self, device: &Path) -> Result<()>;
+}
+
+struct RealWipeOps;
+
+impl WipeOps for RealWipeOps {
+    fn wipe_random(&mut self, device: &Path) -> Result<()> {
+        wipe_random(device)
+    }
+
+    fn wipe_discard(&mut self, device: &Path) -> Result<()> {
+        wipe_discard(device)
+    }
+}
+
+/// Wipe `etc` and `data` for modes 2 and 3; mode 1 reformats without a wipe.
+///
+/// Never fails the reset: a failure on one device does not skip the other, and
+/// reformat + restore still run, so the device stays usable. The collected
+/// notes end up in the status `error` field, see `apply_wipe_note`.
+fn wipe_partitions(
+    mode: ResetMode,
+    data_dev: &Path,
+    etc_dev: &Path,
+    ops: &mut dyn WipeOps,
+) -> Option<String> {
+    let mut notes: Vec<String> = Vec::new();
+    for (partition, device) in [
+        (PartitionName::Etc, etc_dev),
+        (PartitionName::Data, data_dev),
+    ] {
+        let wiped = match mode {
+            ResetMode::Mode1 => return None,
+            ResetMode::Mode2 => ops.wipe_random(device),
+            ResetMode::Mode3 => ops.wipe_discard(device),
+        };
+        if let Err(e) = wiped {
+            warn!("factory reset: wipe of {partition} failed; continuing: {e}");
+            notes.push(format!("{partition}: {e}"));
+        }
+    }
+
+    (!notes.is_empty()).then(|| notes.join(CONTEXT_SEPARATOR))
+}
+
+/// Fold a wipe failure into the status the reformat/restore path produced.
+///
+/// The caller asked for the data to be wiped and it was not, so the outcome is
+/// Error even when the rest of the reset succeeded. The note goes into `error`
+/// ahead of an existing message; `context` keeps the retry and restore notes.
+fn apply_wipe_note(status: FactoryResetStatus, wipe_note: Option<String>) -> FactoryResetStatus {
+    let Some(note) = wipe_note else {
+        return status;
+    };
+    FactoryResetStatus {
+        status: FactoryResetStatusCode::Error,
+        error: join_context(Some(note), status.error),
+        ..status
     }
 }
 
@@ -174,8 +245,8 @@ impl ReformatRetryOps for RealReformatOps<'_> {
     }
 }
 
-fn join_context(retry_note: Option<String>, restore_context: Option<String>) -> Option<String> {
-    match (retry_note, restore_context) {
+fn join_context(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
         (Some(a), Some(b)) => Some(format!("{a}{CONTEXT_SEPARATOR}{b}")),
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
@@ -199,9 +270,10 @@ fn mkfs_failed_note(reformat_failed: &[PartitionName]) -> String {
     format!("{}: mkfs failed twice", names.join(","))
 }
 
-/// Reformat + restore — everything from here on is destructive: `data` and/or
-/// `etc` may already be wiped and the tmpfs backup discarded. Callers must
-/// treat any `Err` from this function as data-loss, not a safe no-op abort.
+/// Reformat + restore. `data` and/or `etc` may already be wiped — by the wipe
+/// step for modes 2 and 3, and by the first reformat here — and the tmpfs
+/// backup discarded. Callers must treat any `Err` from this function as
+/// data-loss, not a safe no-op abort.
 fn run_destructive_phase(
     layout: &PartitionLayout,
     rootfs: &Path,
@@ -981,6 +1053,176 @@ mod tests {
             let error = status.error.expect("error");
             assert!(error.contains("mkfs failed twice"), "{error}");
             assert!(error.contains("cp failed"), "{error}");
+        }
+    }
+
+    #[cfg(feature = "factory-reset")]
+    mod wipe_tests {
+        use super::*;
+        use crate::error::FactoryResetError;
+
+        const DATA_DEV: &str = "/dev/sda7";
+        const ETC_DEV: &str = "/dev/sda6";
+
+        // Records every wiped device with the wipe kind, and fails for the
+        // devices listed in `fail`.
+        struct ScriptedWipeOps {
+            calls: Vec<(&'static str, PathBuf)>,
+            fail: Vec<PathBuf>,
+        }
+
+        impl ScriptedWipeOps {
+            fn failing_on(devices: &[&str]) -> Self {
+                Self {
+                    calls: vec![],
+                    fail: devices.iter().map(PathBuf::from).collect(),
+                }
+            }
+
+            fn record(&mut self, kind: &'static str, device: &Path) -> Result<()> {
+                self.calls.push((kind, device.to_path_buf()));
+                if self.fail.iter().any(|d| d == device) {
+                    return Err(FactoryResetError::WipeFailed {
+                        device: device.to_path_buf(),
+                        reason: "no discard support".into(),
+                    }
+                    .into());
+                }
+                Ok(())
+            }
+        }
+
+        impl WipeOps for ScriptedWipeOps {
+            fn wipe_random(&mut self, device: &Path) -> Result<()> {
+                self.record("random", device)
+            }
+
+            fn wipe_discard(&mut self, device: &Path) -> Result<()> {
+                self.record("discard", device)
+            }
+        }
+
+        fn wipe(mode: ResetMode, ops: &mut ScriptedWipeOps) -> Option<String> {
+            wipe_partitions(mode, Path::new(DATA_DEV), Path::new(ETC_DEV), ops)
+        }
+
+        #[test]
+        fn mode1_does_not_wipe() {
+            let mut ops = ScriptedWipeOps::failing_on(&[]);
+            assert_eq!(wipe(ResetMode::Mode1, &mut ops), None);
+            assert!(ops.calls.is_empty());
+        }
+
+        #[test]
+        fn mode2_overwrites_both_partitions_with_random_data() {
+            let mut ops = ScriptedWipeOps::failing_on(&[]);
+            assert_eq!(wipe(ResetMode::Mode2, &mut ops), None);
+            assert_eq!(
+                ops.calls,
+                vec![
+                    ("random", PathBuf::from(ETC_DEV)),
+                    ("random", PathBuf::from(DATA_DEV)),
+                ]
+            );
+        }
+
+        #[test]
+        fn mode3_discards_both_partitions() {
+            let mut ops = ScriptedWipeOps::failing_on(&[]);
+            assert_eq!(wipe(ResetMode::Mode3, &mut ops), None);
+            assert_eq!(
+                ops.calls,
+                vec![
+                    ("discard", PathBuf::from(ETC_DEV)),
+                    ("discard", PathBuf::from(DATA_DEV)),
+                ]
+            );
+        }
+
+        #[test]
+        fn etc_wipe_failure_still_wipes_data() {
+            let mut ops = ScriptedWipeOps::failing_on(&[ETC_DEV]);
+            let note = wipe(ResetMode::Mode3, &mut ops).expect("failure must produce a note");
+            assert_eq!(
+                ops.calls,
+                vec![
+                    ("discard", PathBuf::from(ETC_DEV)),
+                    ("discard", PathBuf::from(DATA_DEV)),
+                ]
+            );
+            assert!(note.starts_with("etc: "), "{note}");
+            assert!(note.contains(ETC_DEV), "{note}");
+            assert!(!note.contains(DATA_DEV), "{note}");
+        }
+
+        #[test]
+        fn both_wipe_failures_are_joined() {
+            let mut ops = ScriptedWipeOps::failing_on(&[ETC_DEV, DATA_DEV]);
+            let note = wipe(ResetMode::Mode2, &mut ops).expect("failure must produce a note");
+            assert_eq!(note.split(CONTEXT_SEPARATOR).count(), 2, "{note}");
+            assert!(note.contains("etc: ") && note.contains("data: "), "{note}");
+        }
+
+        #[test]
+        fn success_becomes_error_carrying_the_wipe_note() {
+            let status = restored_status(&[], &[], RestoreResult::Success, &["/p".to_string()]);
+            let status = apply_wipe_note(status, Some("data: wipe failed".into()));
+            assert_eq!(status.status, FactoryResetStatusCode::Error);
+            assert_eq!(status.error.as_deref(), Some("data: wipe failed"));
+            assert_eq!(status.context, None);
+            assert!(status.data_wiped);
+        }
+
+        #[test]
+        fn reformat_retry_keeps_its_context_note() {
+            let status = restored_status(
+                &[PartitionName::Etc],
+                &[],
+                RestoreResult::Success,
+                &["/p".to_string()],
+            );
+            let status = apply_wipe_note(status, Some("data: wipe failed".into()));
+            assert_eq!(status.status, FactoryResetStatusCode::Error);
+            assert_eq!(status.error.as_deref(), Some("data: wipe failed"));
+            assert_eq!(
+                status.context.as_deref(),
+                retry_note(&[PartitionName::Etc]).as_deref()
+            );
+        }
+
+        #[test]
+        fn restore_partial_failure_joins_both_errors() {
+            let status = restored_status(
+                &[],
+                &[],
+                RestoreResult::PartialFailure {
+                    context: "1 of 2 paths restored".into(),
+                    error: "cp failed".into(),
+                },
+                &["/p".to_string()],
+            );
+            let status = apply_wipe_note(status, Some("data: wipe failed".into()));
+            assert_eq!(status.status, FactoryResetStatusCode::Error);
+            let error = status.error.expect("error");
+            assert_eq!(
+                error,
+                format!("data: wipe failed{CONTEXT_SEPARATOR}cp failed")
+            );
+            assert_eq!(status.context.as_deref(), Some("1 of 2 paths restored"));
+        }
+
+        #[test]
+        fn no_wipe_failure_leaves_the_status_untouched() {
+            let status = restored_status(
+                &[PartitionName::Etc],
+                &[],
+                RestoreResult::Success,
+                &["/p".to_string()],
+            );
+            let untouched = apply_wipe_note(status.clone(), None);
+            assert_eq!(untouched.status, status.status);
+            assert_eq!(untouched.error, status.error);
+            assert_eq!(untouched.context, status.context);
         }
     }
 

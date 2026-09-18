@@ -11,23 +11,29 @@ const PRESERVE_LIST_MANDATORY: &str = "/etc/omnect/factory-reset.d/";
 const KEY_APPLICATIONS: &str = "applications";
 const KEY_PATHS: &str = "paths";
 
-/// Validated factory-reset mode. Any value other than `Mode1` is rejected at
-/// deserialize time, so an unsupported trigger never reaches the reset sequence.
-/// The discriminant is the on-wire mode number.
+/// Validated factory-reset mode. A value outside the supported range is
+/// rejected at deserialize time, so an unsupported trigger never reaches the
+/// reset sequence. The discriminant is the on-wire mode number.
+///
+/// `Mode1` reformats only. `Mode2` overwrites `etc` and `data` with random
+/// data before the reformat, `Mode3` discards all their blocks.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "u32")]
 pub enum ResetMode {
     Mode1 = 1,
+    Mode2 = 2,
+    Mode3 = 3,
 }
 
 impl TryFrom<u32> for ResetMode {
     type Error = String;
     fn try_from(value: u32) -> std::result::Result<Self, Self::Error> {
-        if value == ResetMode::Mode1 as u32 {
-            Ok(ResetMode::Mode1)
-        } else {
-            Err(format!("factory reset mode {value} is not supported"))
+        match value {
+            v if v == ResetMode::Mode1 as u32 => Ok(ResetMode::Mode1),
+            v if v == ResetMode::Mode2 as u32 => Ok(ResetMode::Mode2),
+            v if v == ResetMode::Mode3 as u32 => Ok(ResetMode::Mode3),
+            _ => Err(format!("factory reset mode {value} is not supported")),
         }
     }
 }
@@ -200,8 +206,10 @@ mod tests {
 
     #[test]
     fn parse_rejects_unsupported_mode() {
-        assert!(FactoryResetConfig::parse(r#"{"mode":2,"preserve":[]}"#).is_err());
         assert!(FactoryResetConfig::parse(r#"{"mode":0,"preserve":[]}"#).is_err());
+        assert!(FactoryResetConfig::parse(r#"{"mode":4,"preserve":[]}"#).is_err());
+        assert!(FactoryResetConfig::parse(r#"{"mode":5,"preserve":[]}"#).is_err());
+        assert!(FactoryResetConfig::parse(r#"{"mode":"2","preserve":[]}"#).is_err());
     }
 
     #[test]
@@ -212,9 +220,20 @@ mod tests {
     }
 
     #[test]
-    fn reset_mode_try_from_rejects_non_one() {
-        assert!(ResetMode::try_from(2u32).is_err());
+    fn parse_accepts_wipe_modes() {
+        let cfg = FactoryResetConfig::parse(r#"{"mode":2,"preserve":[]}"#).unwrap();
+        assert_eq!(cfg.mode, ResetMode::Mode2);
+        let cfg = FactoryResetConfig::parse(r#"{"mode":3,"preserve":[]}"#).unwrap();
+        assert_eq!(cfg.mode, ResetMode::Mode3);
+    }
+
+    #[test]
+    fn reset_mode_try_from_accepts_one_to_three_only() {
+        assert!(ResetMode::try_from(0u32).is_err());
         assert!(ResetMode::try_from(1u32).is_ok());
+        assert!(ResetMode::try_from(2u32).is_ok());
+        assert!(ResetMode::try_from(3u32).is_ok());
+        assert!(ResetMode::try_from(4u32).is_err());
     }
 
     #[test]

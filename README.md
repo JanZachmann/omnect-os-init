@@ -18,7 +18,7 @@ Implemented functionality:
 - **ODS integration**: Runtime files for `omnect-device-service`
 - **fs-links**: Symlink creation from `etc/omnect/fs-link.json` and `etc/omnect/fs-link.d/`
 - **switch\_root**: MS_MOVE + chroot + exec systemd (`pivot_root(2)` is not used; ramfs does not support it)
-- **Factory reset (mode 1)**: Selective-preserve backup → reformat `data`/`etc` → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
+- **Factory reset (modes 1-3)**: Selective-preserve backup → wipe `data`/`etc` (modes 2 and 3 only) → reformat → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
 
 Not yet implemented (planned):
 
@@ -77,7 +77,8 @@ flowchart TD
         FCLEAR["clear factory-reset\nbootloader var (best-effort)"] --> FMOUNT["mount factory(ro) + etc(rw) + data(rw)\n+ overlays"]
         FMOUNT --> FBACKUP["build_preserve_list()\nbackup_all() → /tmp/factory_reset/backup"]
         FBACKUP --> FUMOUNT1["umount"]
-        FUMOUNT1 --> FFORMAT["reformat_and_mount_with_retry()\nmkfs data/etc (1 retry each, warn on fail)\nthen mount once — the deciding step"]
+        FUMOUNT1 --> FWIPE["wipe_partitions()\nmode 2: random overwrite · mode 3: discard\nmode 1: skipped · failure never aborts"]
+        FWIPE --> FFORMAT["reformat_and_mount_with_retry()\nmkfs data/etc (1 retry each, warn on fail)\nthen mount once — the deciding step"]
         FFORMAT -->|"mount ok"| FRESTORE["restore_all()"]
         FFORMAT -->|"mount fails on data/etc"| FSIGNAL["record failure signal\n→ bootloader env (in run())"]
         FRESTORE --> FUMOUNT2["umount"]
@@ -158,11 +159,20 @@ including degraded boot.
 
 Enabled by the `factory-reset` feature. `BootMode::detect()` reads the `factory-reset`
 bootloader env key; a present, valid-JSON value dispatches to `mode::factory_reset::run()`
-instead of `mode::normal::run()`. The reset sequence (mount → backup → reformat → mount →
-restore) always completes with a `FactoryResetStatus` recorded in the ODS status JSON —
+instead of `mode::normal::run()`. The reset sequence (mount → backup → wipe → reformat →
+mount → restore) always completes with a `FactoryResetStatus` recorded in the ODS status JSON —
 success or error — and then falls through into the same `mode::normal::run()` path a
 normal boot takes (`MREM` onward), so a failed or unsupported reset never blocks the
 device from booting: `FactoryResetError` is classified as `ContinueDegraded`.
+
+**Factory reset — wipe modes (`FWIPE`)**
+
+The wipe runs once the backup is in initramfs RAM and before the reformat. Mode 2 writes
+data from `/dev/urandom`, mode 3 uses the `BLKDISCARD` ioctl, which the hardware has to
+support. A failure never aborts the reset — the other partition is still wiped and
+reformat + restore still run, so the device stays usable — but the result is reported as
+`Error` with a note in the status `error` field, because the wipe the caller asked for did
+not happen.
 
 **Factory reset — reformat/mount retry (`FFORMAT`)**
 
@@ -223,7 +233,7 @@ cargo build --release --features "grub,persistent-var-log"
 | `release-image` | Release error handling: loop on fatal error; continue in degraded boot | Implemented |
 | `resize-data` | Data partition auto-resize on first boot | Implemented |
 | `test-utils` | Expose `MockBootEnv` for integration tests (never enabled in production) | Test only |
-| `factory-reset` | Factory reset support (mode 1: selective-preserve backup → reformat → restore) | Implemented |
+| `factory-reset` | Factory reset support (modes 1-3: selective-preserve backup → wipe → reformat → restore) | Implemented |
 | `flash-mode-1` | Disk cloning | Planned |
 | `flash-mode-2` | Network flashing | Planned |
 | `flash-mode-3` | HTTP/HTTPS flashing | Planned |
@@ -240,6 +250,12 @@ cargo test --features grub,gpt,test-utils
 cargo test --features grub,dos,test-utils
 cargo test --features uboot,gpt,test-utils
 cargo test --features uboot,dos,test-utils
+
+# With factory-reset feature
+cargo test --features grub,gpt,factory-reset,test-utils
+cargo test --features grub,dos,factory-reset,test-utils
+cargo test --features uboot,gpt,factory-reset,test-utils
+cargo test --features uboot,dos,factory-reset,test-utils
 
 # With resize-data feature
 cargo test --features grub,gpt,resize-data,test-utils
@@ -259,6 +275,21 @@ cargo test --features uboot,gpt,resize-data,release-image,test-utils
 
 # Verbose output
 cargo test --features grub,gpt,test-utils -- --nocapture
+```
+
+The rpi3 machine is 32-bit ARM, where `usize` is 4 bytes and a cast from a
+64-bit byte count silently truncates. The test run above is host-only and
+cannot see that, so compile and lint for a 32-bit target as well (`cargo check`
+and `cargo clippy` need no cross-linker):
+
+```bash
+rustup target add armv7-unknown-linux-gnueabihf
+cargo clippy --target armv7-unknown-linux-gnueabihf --tests \
+  --features uboot,dos,factory-reset,test-utils -- -D warnings
+
+# Narrowing casts, reviewed by hand — not part of the gate, it also flags safe ones
+cargo clippy --target armv7-unknown-linux-gnueabihf \
+  --features uboot,dos,factory-reset -- -W clippy::cast_possible_truncation
 ```
 
 ## License

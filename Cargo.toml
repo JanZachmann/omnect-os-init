@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 log = { version = "0.4", default-features = false, features = ["std"] }
-nix = { version = "0.29", default-features = false, features = ["fs", "mount", "process", "reboot", "user"] }
+nix = { version = "0.29", default-features = false, features = ["fs", "ioctl", "mount", "process", "reboot", "user"] }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 thiserror = { version = "2.0", default-features = false }

@@ -102,27 +102,26 @@ fn factory_reset_warning_status_serializes_as_four() {
 
 #[test]
 fn detect_unsupported_mode_falls_back_to_normal() {
-    let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, r#"{"mode":2,"preserve":[]}"#);
-    let mode = BootMode::detect(Some(&mock)).unwrap();
-    assert!(
-        matches!(mode, BootMode::Normal),
-        "unsupported mode 2 must fall back to Normal"
-    );
-
-    let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, r#"{"mode":0,"preserve":[]}"#);
-    let mode = BootMode::detect(Some(&mock)).unwrap();
-    assert!(
-        matches!(mode, BootMode::Normal),
-        "unsupported mode 0 must fall back to Normal"
-    );
+    for mode_value in ["0", "4", "5"] {
+        let trigger = format!(r#"{{"mode":{mode_value},"preserve":[]}}"#);
+        let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, &trigger);
+        let mode = BootMode::detect(Some(&mock)).unwrap();
+        assert!(
+            matches!(mode, BootMode::Normal),
+            "unsupported mode {mode_value} must fall back to Normal"
+        );
+    }
 }
 
 #[test]
 fn detect_supported_mode_selects_factory_reset() {
-    let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
-    let mode = BootMode::detect(Some(&mock)).unwrap();
-    assert!(
-        matches!(mode, BootMode::FactoryReset(_)),
-        "supported mode 1 must select FactoryReset"
-    );
+    for mode_value in ["1", "2", "3"] {
+        let trigger = format!(r#"{{"mode":{mode_value},"preserve":[]}}"#);
+        let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, &trigger);
+        let mode = BootMode::detect(Some(&mock)).unwrap();
+        assert!(
+            matches!(mode, BootMode::FactoryReset(_)),
+            "supported mode {mode_value} must select FactoryReset"
+        );
+    }
 }
