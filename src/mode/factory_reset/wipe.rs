@@ -13,16 +13,16 @@ const WIPE_PROGRESS_INTERVAL: u64 = 1024 * 1024 * 1024;
 
 const URANDOM_PATH: &str = "/dev/urandom";
 
-// Block-device ioctls from <linux/fs.h>. `BLKGETSIZE64` is declared with
-// `size_t`, so the request code is derived from the target's `size_t` rather
-// than from the `u64` the kernel writes back. `BLKDISCARD` is declared `_IO`
-// but takes a pointer to [start, length], which needs the `_bad` variant.
-nix::ioctl_read_bad!(
-    blkgetsize64,
-    nix::request_code_read!(0x12, 114, std::mem::size_of::<nix::libc::size_t>()),
-    u64
+// BLKDISCARD from <linux/fs.h>. It is declared `_IO` but takes a pointer to
+// [start, length], which needs the `_bad` variant.
+const BLK_IOC_MAGIC: u8 = 0x12;
+const BLKDISCARD_NR: u8 = 119;
+
+nix::ioctl_write_ptr_bad!(
+    blkdiscard,
+    nix::request_code_none!(BLK_IOC_MAGIC, BLKDISCARD_NR),
+    [u64; 2]
 );
-nix::ioctl_write_ptr_bad!(blkdiscard, nix::request_code_none!(0x12, 119), [u64; 2]);
 
 /// Overwrite `device` with random data — factory-reset mode 2.
 pub fn wipe_random(device: &Path) -> Result<()> {
@@ -70,15 +70,17 @@ fn open_device(device: &Path) -> Result<File> {
     })
 }
 
+/// Size of a block device: seeking to its end reports it, which keeps this
+/// testable against a temp file.
 fn device_size(device: &Path, file: &File) -> Result<u64> {
-    let mut size: u64 = 0;
-    // SAFETY: `size` is a valid u64 the ioctl writes the device size into.
-    unsafe { blkgetsize64(file.as_raw_fd(), &mut size) }.map_err(|e| {
-        FactoryResetError::WipeFailed {
+    let mut handle = file;
+    let size = handle
+        .seek(SeekFrom::End(0))
+        .and_then(|size| handle.seek(SeekFrom::Start(0)).map(|_| size))
+        .map_err(|e| FactoryResetError::WipeFailed {
             device: device.to_path_buf(),
-            reason: format!("BLKGETSIZE64 failed: {e}"),
-        }
-    })?;
+            reason: format!("cannot determine size: {e}"),
+        })?;
     Ok(size)
 }
 
@@ -119,7 +121,7 @@ mod tests {
     use super::*;
 
     const FILLER: u8 = 0xAA;
-    const TAIL_LEN: usize = 4096;
+    const BLOCK_LEN: usize = 4096;
 
     fn filled(len: usize) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -131,7 +133,7 @@ mod tests {
     fn overwrite_replaces_every_byte_and_keeps_the_length() {
         // Below one chunk, above one chunk, and an exact multiple of it — the
         // last chunk is clamped to the remaining length in every case.
-        for len in [TAIL_LEN, WIPE_CHUNK_SIZE + TAIL_LEN, 2 * WIPE_CHUNK_SIZE] {
+        for len in [BLOCK_LEN, WIPE_CHUNK_SIZE + BLOCK_LEN, 2 * WIPE_CHUNK_SIZE] {
             let mut file = filled(len);
 
             overwrite_with_random(file.as_file_mut(), len as u64).unwrap();
@@ -141,7 +143,7 @@ mod tests {
             // Block by block, so a gap anywhere in the range fails the test.
             assert!(
                 wiped
-                    .chunks(TAIL_LEN)
+                    .chunks(BLOCK_LEN)
                     .all(|block| block.iter().any(|b| *b != FILLER)),
                 "every block must be overwritten (len={len})"
             );
@@ -150,10 +152,10 @@ mod tests {
 
     #[test]
     fn overwrite_of_zero_length_is_a_noop() {
-        let mut file = filled(TAIL_LEN);
+        let mut file = filled(BLOCK_LEN);
 
         overwrite_with_random(file.as_file_mut(), 0).unwrap();
 
-        assert_eq!(std::fs::read(file.path()).unwrap(), vec![FILLER; TAIL_LEN]);
+        assert_eq!(std::fs::read(file.path()).unwrap(), vec![FILLER; BLOCK_LEN]);
     }
 }
