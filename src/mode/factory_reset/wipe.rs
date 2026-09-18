@@ -30,9 +30,11 @@ pub fn wipe_random(device: &Path) -> Result<()> {
     let len = device_size(device, &file)?;
 
     log::info!("wiping {} with random data ({len} bytes)", device.display());
-    overwrite_with_random(&mut file, len).map_err(|e| FactoryResetError::WipeFailed {
-        device: device.to_path_buf(),
-        reason: format!("random overwrite failed: {e}"),
+    overwrite_with_random(&mut file, len, WIPE_PROGRESS_INTERVAL).map_err(|e| {
+        FactoryResetError::WipeFailed {
+            device: device.to_path_buf(),
+            reason: format!("random overwrite failed: {e}"),
+        }
     })?;
 
     log::info!("wiped {} with random data", device.display());
@@ -84,16 +86,21 @@ fn device_size(device: &Path, file: &File) -> Result<u64> {
     Ok(size)
 }
 
-/// Overwrite the first `len` bytes of `target` with data from `/dev/urandom`.
+/// Overwrite the first `len` bytes of `target` with data from `/dev/urandom`,
+/// syncing and logging every `progress_interval` bytes.
 ///
 /// Split from `wipe_random` so the loop can be tested against a temp file.
 /// The last chunk is clamped to the remaining length — a write past the end of
 /// a block device fails.
-fn overwrite_with_random(target: &mut File, len: u64) -> std::io::Result<()> {
+fn overwrite_with_random(
+    target: &mut File,
+    len: u64,
+    progress_interval: u64,
+) -> std::io::Result<()> {
     let mut urandom = File::open(URANDOM_PATH)?;
     let mut buf = vec![0u8; WIPE_CHUNK_SIZE];
     let mut written: u64 = 0;
-    let mut next_step = WIPE_PROGRESS_INTERVAL;
+    let mut next_step = progress_interval;
 
     target.seek(SeekFrom::Start(0))?;
     while written < len {
@@ -110,7 +117,7 @@ fn overwrite_with_random(target: &mut File, len: u64) -> std::io::Result<()> {
             // of at most one interval of already overwritten blocks.
             target.sync_all()?;
             log::info!("wipe progress: {written}/{len} bytes");
-            next_step = next_step.saturating_add(WIPE_PROGRESS_INTERVAL);
+            next_step = next_step.saturating_add(progress_interval);
         }
     }
     target.sync_all()
@@ -129,6 +136,14 @@ mod tests {
         file
     }
 
+    fn all_replaced(path: &Path, len: usize) -> bool {
+        let wiped = std::fs::read(path).unwrap();
+        wiped.len() == len
+            && wiped
+                .chunks(BLOCK_LEN)
+                .all(|block| block.iter().any(|b| *b != FILLER))
+    }
+
     #[test]
     fn overwrite_replaces_every_byte_and_keeps_the_length() {
         // Below one chunk, above one chunk, and an exact multiple of it — the
@@ -136,17 +151,9 @@ mod tests {
         for len in [BLOCK_LEN, WIPE_CHUNK_SIZE + BLOCK_LEN, 2 * WIPE_CHUNK_SIZE] {
             let mut file = filled(len);
 
-            overwrite_with_random(file.as_file_mut(), len as u64).unwrap();
+            overwrite_with_random(file.as_file_mut(), len as u64, WIPE_PROGRESS_INTERVAL).unwrap();
 
-            let wiped = std::fs::read(file.path()).unwrap();
-            assert_eq!(wiped.len(), len, "length must not change (len={len})");
-            // Block by block, so a gap anywhere in the range fails the test.
-            assert!(
-                wiped
-                    .chunks(BLOCK_LEN)
-                    .all(|block| block.iter().any(|b| *b != FILLER)),
-                "every block must be overwritten (len={len})"
-            );
+            assert!(all_replaced(file.path(), len), "len={len}");
         }
     }
 
@@ -154,8 +161,54 @@ mod tests {
     fn overwrite_of_zero_length_is_a_noop() {
         let mut file = filled(BLOCK_LEN);
 
-        overwrite_with_random(file.as_file_mut(), 0).unwrap();
+        overwrite_with_random(file.as_file_mut(), 0, WIPE_PROGRESS_INTERVAL).unwrap();
 
         assert_eq!(std::fs::read(file.path()).unwrap(), vec![FILLER; BLOCK_LEN]);
+    }
+
+    #[test]
+    fn overwrite_syncs_repeatedly_without_losing_data() {
+        // an interval below the chunk size makes every chunk cross it, which is
+        // the arithmetic the 1 GiB default never exercises in a test
+        let len = 3 * WIPE_CHUNK_SIZE;
+        let mut file = filled(len);
+
+        overwrite_with_random(file.as_file_mut(), len as u64, BLOCK_LEN as u64).unwrap();
+
+        assert!(all_replaced(file.path(), len));
+    }
+
+    #[test]
+    fn device_size_reports_the_length_and_rewinds() {
+        let len = WIPE_CHUNK_SIZE + BLOCK_LEN;
+        let file = filled(len);
+        let handle = File::open(file.path()).unwrap();
+
+        let size = device_size(file.path(), &handle).unwrap();
+
+        assert_eq!(size, len as u64);
+        // the caller writes from the start, so the cursor must not stay at the end
+        assert_eq!((&handle).stream_position().unwrap(), 0);
+    }
+
+    #[test]
+    fn wipe_random_replaces_the_whole_file() {
+        // the size now comes from a seek, so the entry point runs on a temp file
+        let len = WIPE_CHUNK_SIZE + BLOCK_LEN;
+        let file = filled(len);
+
+        wipe_random(file.path()).unwrap();
+
+        assert!(all_replaced(file.path(), len));
+    }
+
+    #[test]
+    fn wipe_random_reports_a_device_it_cannot_open() {
+        let err = wipe_random(Path::new("/does/not/exist")).unwrap_err();
+
+        assert!(
+            err.to_string().contains("cannot open device"),
+            "unexpected error: {err}"
+        );
     }
 }
