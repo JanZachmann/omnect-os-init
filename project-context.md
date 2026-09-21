@@ -34,12 +34,20 @@ src/
 ├── mode/
 │   ├── mod.rs               # BootMode enum, FactoryResetTrigger, BootContext, detect()
 │   ├── normal.rs            # Normal boot handler (post-mount overlays → switch_root)
-│   └── factory_reset/       # Factory reset (feature = factory-reset)
-│       ├── mod.rs           # Reset sequence, status assembly, trigger rejection
-│       ├── config.rs        # Trigger parsing, preserve list from etc/omnect
-│       ├── backup_restore.rs # Preserve-list backup to tmpfs and restore
-│       ├── reformat.rs      # mkfs.ext4 + tune2fs
-│       └── wipe.rs          # Mode 2 random overwrite, mode 3 BLKDISCARD
+│   ├── factory_reset/       # Factory reset (feature = factory-reset)
+│   │   ├── mod.rs           # Reset sequence, status assembly, trigger rejection
+│   │   ├── config.rs        # Trigger parsing, preserve list from etc/omnect
+│   │   ├── backup_restore.rs # Preserve-list backup to tmpfs and restore
+│   │   ├── reformat.rs      # mkfs.ext4 + tune2fs
+│   │   └── wipe.rs          # Mode 2 random overwrite, mode 3 BLKDISCARD
+│   └── flash/               # Flash modes (feature = flash-mode)
+│       ├── mod.rs           # Dispatch, terminal action, log capture and persistence
+│       ├── config.rs        # Environment read, validation -> FlashConfig
+│       ├── efi.rs           # efibootmgr handling (feature = flash-mode-1)
+│       ├── clone.rs         # Mode 1 orchestration (feature = flash-mode-1)
+│       ├── sfdisk.rs        # Partition-table dump parsing and rewriting (feature = flash-mode-1)
+│       ├── rawio.rs         # In-process replacement for every `dd` call (feature = flash-mode-1)
+│       └── unmount.rs       # /sysroot teardown and /proc/mounts sweep (feature = flash-mode-1)
 ├── partition/
 │   ├── mod.rs               # Public API
 │   ├── device.rs            # Root device detection (GRUB: blkid/fsuuid, U-Boot: root=)
@@ -59,10 +67,15 @@ src/
 - **Build:** `cargo build` / `cargo build --release`
 - **Check:** `cargo check`
 - **Format:** `cargo fmt -- --check`
-- **Lint:** `cargo clippy --tests --features <grub|uboot> -- -D warnings -W clippy::items_after_statements -W clippy::items_after_test_module`
+- **Lint:** `cargo clippy --tests --features <grub|uboot>,test-utils -- -D warnings -W clippy::items_after_statements -W clippy::items_after_test_module`.
+  `test-utils` must be included here too: every `[[test]]` target in
+  `Cargo.toml` has `required-features = ["test-utils", ...]`, so without it
+  `--tests` compiles only `device_detection.rs` and `fsck_status.rs` — none of
+  `tests/factory_reset.rs`, `tests/degraded_boot.rs` or `tests/flash_modes.rs`
+  are linted.
 - **Test:** `test-utils` must be included; the `degraded_boot` and `factory_reset`
-  integration tests require it. The `factory-reset` combinations are listed in the README,
-  which is the complete list. Base combinations:
+  integration tests require it. The `factory-reset` and `flash-mode-1` combinations
+  are listed in the README, which is the complete list. Base combinations:
   ```
   cargo test --features grub,gpt,test-utils
   cargo test --features grub,dos,test-utils
@@ -79,6 +92,17 @@ src/
   cargo test --features grub,gpt,resize-data,release-image,test-utils
   cargo test --features uboot,gpt,resize-data,release-image,test-utils
   ```
+  `flash-mode-1` sits in the default feature set, so every base combination
+  above already builds and tests it; the README also lists it explicitly
+  against every bootloader × partition-table pair, plus the one combination
+  that adds `factory-reset` to compile the conflicting-trigger refusal path.
+  The flash-free build needs `--no-default-features`, since `--features` is
+  additive and cannot turn a default feature back off:
+  ```
+  cargo test --no-default-features --features grub,gpt,factory-reset,test-utils
+  ```
+  `flash-mode` alone, without a mode feature, is not a supported configuration
+  and no combination here or in the README covers it.
 - **Audit:** `cargo audit`
 
 ## 4. Feature Flags
@@ -93,6 +117,8 @@ src/
 | `release-image` | Release behaviour: loop on fatal error; continue booting in degraded mode |
 | `resize-data` | Expand data partition + filesystem to fill disk on first boot |
 | `factory-reset` | Factory reset, modes 1-3: backup → wipe (2 and 3) → reformat → restore |
+| `flash-mode` | Shared flash layer: trigger detection, dispatch, log capture. Never selected directly — each mode feature pulls it in |
+| `flash-mode-1` | Clone the running disk onto another block device. Part of the default feature set |
 | `test-utils` | Expose `MockBootEnv` for integration tests — never enabled in production builds |
 
 ## 5. Runtime Constraints
@@ -134,8 +160,14 @@ Data partition resize (feature = `resize-data`) is handled as a preflight step i
 is carried even when its value is unusable, as `FactoryResetTrigger::Rejected`, so the
 value is cleared and the failure reported instead of the boot continuing in silence.
 
-The following variants are planned:
-- `FlashMode(FlashKind)` — enables in-field OS flashing
+`Flash(FlashConfig)` is implemented for mode 1 (feature `flash-mode`, pulled in by
+`flash-mode-1`): it clones the running disk onto another block device and powers off
+on success. A queued factory reset together with a flash mode is refused as an error;
+both triggers are cleared before the refusal is raised.
+
+The following are planned:
+- Flash modes 2 and 3 — network push and HTTP/HTTPS download onto the running disk,
+  sharing `Flash(FlashConfig)` with mode 1
 
 When implementing a new variant:
 1. Add the variant to `BootMode` and update `BootMode::detect()` to read the relevant bootloader env key. If the key is absent or the bootloader is unavailable, `detect()` must return `Normal` (degraded boot). A key that is present but unusable belongs to its own mode, which clears it and reports the failure — see `FactoryResetTrigger`.

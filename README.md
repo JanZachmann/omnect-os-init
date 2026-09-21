@@ -19,10 +19,11 @@ Implemented functionality:
 - **fs-links**: Symlink creation from `etc/omnect/fs-link.json` and `etc/omnect/fs-link.d/`
 - **switch\_root**: MS_MOVE + chroot + exec systemd (`pivot_root(2)` is not used; ramfs does not support it)
 - **Factory reset (modes 1-3)**: Selective-preserve backup → wipe `data`/`etc` (modes 2 and 3 only) → reformat → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
+- **Flash mode 1**: Clones the running disk onto another block device given by the `flash-mode-devpath` bootloader env key, triggered by `flash-mode`; powers off on success so the clone can be moved to its own device (feature `flash-mode-1`, part of the default feature set)
 
 Not yet implemented (planned):
 
-- Flash modes (disk clone, network, HTTP/HTTPS)
+- Flash modes 2 and 3 (network push, HTTP/HTTPS download)
 
 ## Startup Flow
 
@@ -242,12 +243,15 @@ cargo build --release --features "grub,persistent-var-log"
 | `resize-data` | Data partition auto-resize on first boot | Implemented |
 | `test-utils` | Expose `MockBootEnv` for integration tests (never enabled in production) | Test only |
 | `factory-reset` | Factory reset support (modes 1-3: selective-preserve backup → wipe → reformat → restore) | Implemented |
-| `flash-mode-1` | Disk cloning | Planned |
+| `flash-mode` | Shared flash layer: trigger detection, dispatch, log capture. Pulled in by a mode feature, never selected on its own | Implemented |
+| `flash-mode-1` | Disk cloning (part of the default feature set) | Implemented |
 | `flash-mode-2` | Network flashing | Planned |
 | `flash-mode-3` | HTTP/HTTPS flashing | Planned |
 
 > **Note:** `grub` and `uboot` are mutually exclusive. Exactly one must be set at build time.
 > The Yocto recipe selects the correct feature via `CARGO_FEATURES` based on `MACHINE_FEATURES`.
+> `flash-mode-1` is in the default feature set, so it is already enabled in the
+> `cargo build` examples above; add `--no-default-features` to build without it.
 
 ## Testing
 
@@ -281,9 +285,29 @@ cargo test --features uboot,dos,release-image,test-utils
 cargo test --features grub,gpt,resize-data,release-image,test-utils
 cargo test --features uboot,gpt,resize-data,release-image,test-utils
 
+# Flash mode 1 (already covered above too: flash-mode-1 is in the default
+# feature set, so every "base" combination already includes it — these list
+# it explicitly against every bootloader × partition-table pair, plus the
+# one combination that also needs factory-reset to compile the
+# conflicting-trigger refusal path)
+cargo test --features grub,gpt,flash-mode-1,test-utils
+cargo test --features grub,dos,flash-mode-1,test-utils
+cargo test --features uboot,gpt,flash-mode-1,test-utils
+cargo test --features uboot,dos,flash-mode-1,test-utils
+cargo test --features uboot,gpt,flash-mode-1,factory-reset,test-utils
+
+# Without any flash feature: flash-mode-1 is in the default set, so
+# --no-default-features is required to exclude it; --features alone is
+# additive and cannot turn a default feature off
+cargo test --no-default-features --features grub,gpt,factory-reset,test-utils
+
 # Verbose output
 cargo test --features grub,gpt,test-utils -- --nocapture
 ```
+
+`flash-mode` alone, without `flash-mode-1` (or a future `flash-mode-2`/`-3`),
+is not a supported configuration — no combination above builds it that way,
+and no gate covers it.
 
 The rpi3 machine is 32-bit ARM, where `usize` is 4 bytes and a cast from a
 64-bit byte count silently truncates. The test run above is host-only and
