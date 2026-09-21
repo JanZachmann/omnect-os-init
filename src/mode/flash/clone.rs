@@ -373,9 +373,10 @@ fn write_boot_env(_constants: &Constants, destination: &Path) -> Result<(), Flas
 /// Put the default U-Boot environment in every bank the machine reserves.
 #[cfg(feature = "uboot")]
 fn write_boot_env(constants: &Constants, destination: &Path) -> Result<(), FlashError> {
-    let size = constants
+    let size_kb = constants
         .uboot_env_size
         .ok_or(FlashError::MissingBuildConstant(CONST_UBOOT_ENV_SIZE))?;
+    let size = kb_to_bytes(size_kb, CONST_UBOOT_ENV_SIZE)?;
     let first = constants
         .uboot_env1_start
         .ok_or(FlashError::MissingBuildConstant(CONST_UBOOT_ENV1_START))?;

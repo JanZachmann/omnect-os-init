@@ -47,7 +47,7 @@ fn main() {
          pub const UBOOT_ENV1_START: Option<u64> = {uboot_env1_start};\n\
          /// Start sector of the second U-Boot environment partition.\n\
          pub const UBOOT_ENV2_START: Option<u64> = {uboot_env2_start};\n\
-         /// Size (in bytes) of the U-Boot environment.\n\
+         /// Size of the U-Boot environment (in KB).\n\
          pub const UBOOT_ENV_SIZE: Option<u64> = {uboot_env_size};\n\
          /// Initial size of the data partition (in KB).\n\
          pub const DATA_SIZE: Option<u64> = {data_size};\n\
