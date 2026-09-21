@@ -94,7 +94,6 @@ enum NotAStringArray {
     NotOnlyStrings,
 }
 
-/// Read `key` from `value` as an array of strings.
 fn string_array<'a>(
     value: &'a Value,
     key: &str,

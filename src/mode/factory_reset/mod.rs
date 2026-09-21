@@ -1267,9 +1267,7 @@ mod tests {
 
         #[test]
         fn a_trigger_without_a_usable_mode_is_invalid() {
-            // No mode at all, a mode that is not a number, an unsupported one,
-            // and json that does not even parse — none of them names a reset
-            // the init could run.
+            // None of these names a reset the init could run.
             for trigger in [
                 r#"{ mode: "1""#,
                 "{}",

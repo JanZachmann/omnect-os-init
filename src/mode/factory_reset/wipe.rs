@@ -197,7 +197,7 @@ mod tests {
 
     #[test]
     fn wipe_random_replaces_the_whole_file() {
-        // the size now comes from a seek, so the entry point runs on a temp file
+        // the size comes from a seek, so the entry point runs on a temp file
         let len = WIPE_CHUNK_SIZE + BLOCK_LEN;
         let file = filled(len);
 
@@ -272,8 +272,6 @@ mod tests {
 
     #[test]
     fn chunk_len_clamps_without_truncating() {
-        // A remainder of exactly 4 GiB is the case that a cast to usize turns
-        // into 0 on a 32-bit target, which would stall the loop forever.
         for (len, written) in [
             (FOUR_GIB, 0),
             (FOUR_GIB + BLOCK_LEN as u64, BLOCK_LEN as u64),
