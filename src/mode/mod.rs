@@ -64,13 +64,14 @@ pub enum BootMode {
     Flash(flash::config::FlashConfig),
 }
 
-/// Best-effort clear of both triggers ahead of the conflict refusal.
+/// Best-effort clear of the flash trigger keys.
 ///
-/// This is the one fatal path that runs before any mode has started; on a
-/// release image a fatal error halts forever, so leaving a trigger set here
-/// would mean every power cycle repeats the same refusal.
-#[cfg(all(feature = "flash-mode", feature = "factory-reset"))]
-fn clear_flash_and_reset_triggers(bl: &mut dyn BootEnv) {
+/// Used both by the conflict refusal and by a fatal path that runs before
+/// any mode has started: on a release image a fatal error halts forever, so
+/// leaving a trigger set here would mean every power cycle repeats the same
+/// outcome.
+#[cfg(feature = "flash-mode")]
+pub(crate) fn clear_flash_triggers(bl: &mut dyn BootEnv) {
     if let Err(e) = bl.set_env(BootEnvKey::FlashMode, None) {
         log::warn!("flash-mode: failed to clear the flash-mode trigger: {e}");
     }
@@ -78,6 +79,13 @@ fn clear_flash_and_reset_triggers(bl: &mut dyn BootEnv) {
     if let Err(e) = bl.set_env(BootEnvKey::FlashModeDevPath, None) {
         log::warn!("flash-mode: failed to clear the flash-mode-devpath trigger: {e}");
     }
+}
+
+/// Best-effort clear of both the flash and the factory-reset triggers ahead
+/// of the conflict refusal, so a re-queue starts from a clean slate.
+#[cfg(all(feature = "flash-mode", feature = "factory-reset"))]
+fn clear_flash_and_reset_triggers(bl: &mut dyn BootEnv) {
+    clear_flash_triggers(bl);
     if let Err(e) = bl.set_env(BootEnvKey::FactoryReset, None) {
         log::warn!("factory-reset: failed to clear the factory-reset trigger: {e}");
     }
@@ -122,7 +130,9 @@ impl BootMode {
     /// Detect the boot mode from the boot environment.
     ///
     /// A set `flash-mode` selects `Flash`; a set `factory-reset` selects
-    /// `FactoryReset`. Both at once is refused — they act on different disks and
+    /// `FactoryReset`, whether or not its value can be used — an unusable one
+    /// as `FactoryResetTrigger::Rejected`, so it is cleared and reported.
+    /// Both triggers at once is refused — they act on different disks and
     /// single-mode dispatch cannot perform both, so dropping one silently would
     /// be the worse failure. Both triggers are cleared before that refusal is
     /// raised, because a release image halts on a fatal error and would
@@ -130,7 +140,9 @@ impl BootMode {
     ///
     /// A `flash-mode` value that selects nothing is logged and the device boots
     /// normally: an operator typo must not stop a device from booting.
-    /// Falls back to `Normal` when the env cannot be read. Never blocks boot.
+    /// Falls back to `Normal` when an env read fails, since a conflict cannot
+    /// be ruled out and the flash is the destructive, irreversible side. Never
+    /// blocks boot.
     pub fn detect(_bl: Option<&mut dyn BootEnv>) -> Result<Self> {
         if let Some(_bl) = _bl {
             #[cfg(feature = "flash-mode")]
@@ -146,8 +158,9 @@ impl BootMode {
                             Ok(None) => {}
                             Err(e) => {
                                 log::warn!(
-                                    "factory-reset: failed to read env while checking for a flash conflict, proceeding with flash mode: {e}"
+                                    "factory-reset: failed to read env while checking for a flash conflict, booting normally: {e}"
                                 );
+                                return Ok(Self::Normal);
                             }
                         }
 
@@ -286,16 +299,24 @@ mod tests {
                 config.devpath.as_deref(),
                 Some(std::path::Path::new("/dev/mmcblk2"))
             );
+            // The success path clears nothing: clearing is the mode's own first step.
+            assert!(mock.set_env_calls.is_empty());
         }
 
+        #[cfg(feature = "factory-reset")]
         #[test]
-        fn detect_normal_for_an_unknown_flash_mode_value() {
+        fn detect_falls_through_to_factory_reset_for_an_unknown_flash_mode_value() {
             for unknown in ["", "0", "9", "yes"] {
-                let mut mock = create_mock_bootloader().with_env(BootEnvKey::FlashMode, unknown);
+                let mut mock = create_mock_bootloader()
+                    .with_env(BootEnvKey::FlashMode, unknown)
+                    .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
                 let mode = BootMode::detect(Some(&mut mock)).unwrap();
                 assert!(
-                    matches!(mode, BootMode::Normal),
-                    "{unknown} must boot normally, not brick the device"
+                    matches!(
+                        mode,
+                        BootMode::FactoryReset(FactoryResetTrigger::Accepted(_))
+                    ),
+                    "{unknown} must not short-circuit; it must reach the factory-reset handling"
                 );
             }
         }
@@ -317,8 +338,9 @@ mod tests {
                 ),
                 "the pair must be refused, not silently resolved: {err}"
             );
-            // Both triggers must be gone, or a release image halts on every power cycle.
+            // All three triggers must be gone, or a release image halts on every power cycle.
             assert!(mock.set_env_calls.contains(&BootEnvKey::FlashMode));
+            assert!(mock.set_env_calls.contains(&BootEnvKey::FlashModeDevPath));
             assert!(mock.set_env_calls.contains(&BootEnvKey::FactoryReset));
             assert_eq!(mock.get_env(BootEnvKey::FlashMode).unwrap(), None);
             assert_eq!(mock.get_env(BootEnvKey::FactoryReset).unwrap(), None);

@@ -192,10 +192,16 @@ pub fn run_init() -> Result<()> {
         BootMode::Normal => mode::normal::run(ctx),
         #[cfg(feature = "factory-reset")]
         BootMode::FactoryReset(trigger) => mode::factory_reset::run(ctx, trigger),
+        // A flash mode is selected but nothing dispatched it. Clear the
+        // trigger so a power cycle boots normally instead of repeating the
+        // same selection forever, then report why nothing happened.
         #[cfg(feature = "flash-mode")]
-        // Replaced in the dispatch task: a flash mode runs ahead of init_setup, so
-        // reaching this arm means the early check is missing.
-        BootMode::Flash(_) => Err(crate::error::FlashError::ConflictingTriggers.into()),
+        BootMode::Flash(_) => {
+            if let Some(bl) = ctx.boot_env.available_mut() {
+                mode::clear_flash_triggers(bl);
+            }
+            Err(crate::error::FlashError::DispatchUnavailable.into())
+        }
     }
 }
 

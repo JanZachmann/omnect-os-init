@@ -315,6 +315,11 @@ pub enum FlashError {
     )]
     ConflictingTriggers,
 
+    #[error(
+        "a flash mode was selected but nothing ran it; the trigger was cleared, re-queue it to retry"
+    )]
+    DispatchUnavailable,
+
     #[error("Destination device {} did not appear within {secs}s", device.display())]
     DestinationTimeout { device: PathBuf, secs: u64 },
 
