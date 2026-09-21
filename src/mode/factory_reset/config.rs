@@ -1,6 +1,5 @@
 use std::path::Path;
 
-use serde::Deserialize;
 use serde_json::Value;
 
 use crate::error::{FactoryResetError, Result};
@@ -10,6 +9,8 @@ const FACTORY_RESET_CONFIG_DIR: &str = "etc/omnect/factory-reset.d";
 const PRESERVE_LIST_MANDATORY: &str = "/etc/omnect/factory-reset.d/";
 const KEY_APPLICATIONS: &str = "applications";
 const KEY_PATHS: &str = "paths";
+const KEY_MODE: &str = "mode";
+const KEY_PRESERVE: &str = "preserve";
 
 /// Validated factory-reset mode. A value outside the supported range is
 /// rejected at deserialize time, so an unsupported trigger never reaches the
@@ -18,8 +19,7 @@ const KEY_PATHS: &str = "paths";
 /// `Mode1` reformats only. `Mode2` overwrites `etc` and `data` with random
 /// data before the reformat, `Mode3` discards all their blocks.
 #[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(try_from = "u32")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetMode {
     Mode1 = 1,
     Mode2 = 2,
@@ -38,19 +38,51 @@ impl TryFrom<u32> for ResetMode {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct FactoryResetConfig {
     pub mode: ResetMode,
-    #[serde(default)]
     pub preserve: Vec<String>,
 }
 
 impl FactoryResetConfig {
+    /// Parse the trigger value read from the boot environment.
+    ///
+    /// The error decides the reported status, so the two groups are kept
+    /// apart: anything about `mode` — unparsable json included, since then
+    /// there is no mode either — is `InvalidConfig` and reports `Invalid`,
+    /// while an unusable `preserve` reports `ConfigError`. `preserve` is
+    /// mandatory; an empty array is how a caller asks to keep nothing.
     pub fn parse(json: &str) -> Result<Self> {
-        serde_json::from_str(json).map_err(|e| {
+        let trigger: Value = serde_json::from_str(json).map_err(|e| {
             FactoryResetError::InvalidConfig(format!("Failed to parse factory-reset JSON: {e}"))
-                .into()
-        })
+        })?;
+
+        let mode = trigger
+            .get(KEY_MODE)
+            .and_then(Value::as_u64)
+            .and_then(|mode| u32::try_from(mode).ok())
+            .ok_or_else(|| {
+                FactoryResetError::InvalidConfig(format!("no numeric '{KEY_MODE}' in the trigger"))
+            })?;
+        let mode = ResetMode::try_from(mode).map_err(FactoryResetError::InvalidConfig)?;
+
+        let preserve = trigger.get(KEY_PRESERVE).ok_or_else(|| {
+            FactoryResetError::MissingField(format!("trigger has no '{KEY_PRESERVE}' key"))
+        })?;
+        let preserve = preserve.as_array().ok_or_else(|| {
+            FactoryResetError::InvalidPreserve(format!("'{KEY_PRESERVE}' must be an array"))
+        })?;
+        let preserve = preserve
+            .iter()
+            .map(|key| key.as_str().map(str::to_string))
+            .collect::<Option<Vec<String>>>()
+            .ok_or_else(|| {
+                FactoryResetError::InvalidPreserve(format!(
+                    "'{KEY_PRESERVE}' must contain only strings"
+                ))
+            })?;
+
+        Ok(Self { mode, preserve })
     }
 }
 
