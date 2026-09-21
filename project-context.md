@@ -14,6 +14,7 @@ src/
 ├── lib.rs                   # Library exports + run_init() + apply_boot_env_decision()
 ├── error.rs                 # Error type hierarchy
 ├── early_init.rs            # Mount /dev, /proc, /sys, /run before logging
+├── recovery.rs              # RecoveryClass -> Action policy (pure; main.rs executes it)
 ├── bootloader/
 │   ├── mod.rs               # BootEnv trait, BootEnvState, classify_boot_env()
 │   ├── grub.rs              # GRUB implementation (grub-editenv)
@@ -27,9 +28,11 @@ src/
 │   ├── fsck.rs              # e2fsck wrapper (all exit codes handled)
 │   ├── mount.rs             # Mount primitives (RAII, idempotency checks)
 │   ├── overlayfs.rs         # /etc overlay, /home overlay, bind mounts
+│   ├── reformat.rs          # mkfs.ext4 + tune2fs
 │   └── resize_data.rs       # Data partition auto-resize on first boot (feature = resize-data)
 ├── logging/
 │   ├── mod.rs               # KmsgLogger initializer
+│   ├── capture.rs           # In-memory copy of the log, for a mode that powers off
 │   └── kmsg.rs              # /dev/kmsg writer with kernel log levels
 ├── mode/
 │   ├── mod.rs               # BootMode enum, FactoryResetTrigger, BootContext, detect()
@@ -38,12 +41,11 @@ src/
 │   │   ├── mod.rs           # Reset sequence, status assembly, trigger rejection
 │   │   ├── config.rs        # Trigger parsing, preserve list from etc/omnect
 │   │   ├── backup_restore.rs # Preserve-list backup to tmpfs and restore
-│   │   ├── reformat.rs      # mkfs.ext4 + tune2fs
 │   │   └── wipe.rs          # Mode 2 random overwrite, mode 3 BLKDISCARD
 │   └── flash/               # Flash modes (feature = flash-mode)
 │       ├── mod.rs           # Dispatch, terminal action, log capture and persistence
 │       ├── config.rs        # Environment read, validation -> FlashConfig
-│       ├── efi.rs           # efibootmgr handling (feature = flash-mode-1)
+│       ├── efi.rs           # efibootmgr handling
 │       ├── clone.rs         # Mode 1 orchestration (feature = flash-mode-1)
 │       ├── sfdisk.rs        # Partition-table dump parsing and rewriting (feature = flash-mode-1)
 │       ├── rawio.rs         # In-process replacement for every `dd` call (feature = flash-mode-1)
@@ -53,9 +55,10 @@ src/
 │   ├── device.rs            # Root device detection (GRUB: blkid/fsuuid, U-Boot: root=)
 │   ├── layout.rs            # GPT/DOS partition map builder
 │   └── symlinks.rs          # /dev/omnect/* symlink creation
-├── preflight/
-│   ├── mod.rs               # Preflight step runner
-│   └── resize_data.rs       # resize-data preflight: guard check + degraded-mode dispatch
+├── init_setup/
+│   ├── mod.rs               # Init setup step runner
+│   ├── extra_bootargs.rs    # Sync omnect_extra_bootargs to the bootloader env
+│   └── resize_data.rs       # resize-data step: guard check + degraded-mode dispatch
 └── runtime/
     ├── mod.rs               # Public API
     ├── fs_link.rs           # fs-link symlink creation
@@ -154,8 +157,8 @@ src/
 The `BootMode` enum (`src/mode/mod.rs`) has the following implemented variants:
 - `Normal` — standard boot path; also used when the bootloader is unavailable (degraded boot)
 
-Data partition resize (feature = `resize-data`) is handled as a preflight step in
-`src/preflight/resize_data.rs`, not as a separate `BootMode` variant. It runs before
+Data partition resize (feature = `resize-data`) is handled as an init setup step in
+`src/init_setup/resize_data.rs`, not as a separate `BootMode` variant. It runs before
 `BootMode::detect()` and handles both the live-bootloader (guard check) and degraded-boot
 (no guard, resize runs every boot) cases.
 

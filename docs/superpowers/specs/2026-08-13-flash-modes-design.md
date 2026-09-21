@@ -31,8 +31,8 @@ wait is the hardest part to port and to test.
 ### 1.1 Fidelity policy
 
 Observable behaviour is preserved: the same environment keys, the same terminal
-actions, the same platform workarounds. Three exceptions, all deliberate and all
-recorded in [§9](#9-intentional-deviations-from-the-legacy-scripts):
+actions, the same platform workarounds. The exceptions are all deliberate and
+all recorded in [§9](#9-intentional-deviations-from-the-legacy-scripts):
 
 - two legacy bugs are fixed;
 - machine-driven unbounded waits become bounded; the wait for the operator's
@@ -151,7 +151,7 @@ the only mode implemented so far. Widening the gate is expected once mode 2 or
 3 lands.
 
 External tools are invoked through `std::process::Command` with named `const`
-paths, as `factory_reset/reformat.rs` already does. No new command-runner
+paths, as `filesystem/reformat.rs` already does. No new command-runner
 abstraction, and no `gpt`/libparted crate.
 
 ### 2.6 Source of truth for existing types
@@ -329,13 +329,16 @@ path that runs before any mode has started, so the §2.2 invariant does not
 cover it, and on a release image §8.1 halts forever rather than rebooting —
 leaving the triggers set would mean every power cycle hits the same refusal and
 the device never boots again. With both cleared, a power cycle boots normally
-and the operator re-queues whichever action they meant. The refusal is on kmsg
-and in the ODS status.
+and the operator re-queues whichever action they meant.
 
 Mode 2's second trigger, the `/etc/enforce_flash_mode` flag file (§5.4), ships
 inside the initramfs and cannot be cleared. It does not reopen the problem:
 clearing `factory-reset` is enough to remove the conflict, and the next boot
 runs mode 2 alone.
+
+The refusal reaches kmsg only. A flash boot never writes the ODS status file:
+`run_init` returns the error and the fatal-error path just logs it, so there is
+no status file for the refusal to appear in.
 
 Note also that the queued `factory-reset` key does not survive modes 2 and 3. On
 U-Boot the environment lives at the `UBOOT_ENV1_START`/`UBOOT_ENV2_START` byte
@@ -390,23 +393,26 @@ work tracked in §12 rather than part of the port.
 
 ### 4.1 Sequence
 
-1. Read `flash-mode-devpath`, resolve symlinks. Clear `flash-mode` and
-   `flash-mode-devpath`.
+1. Read `flash-mode-devpath`. Clear `flash-mode` and `flash-mode-devpath`.
 2. Validate the required build-time constants: `DATA_SIZE` always; on U-Boot
    also `UBOOT_ENV1_START` and `UBOOT_ENV_SIZE`. `UBOOT_ENV1_START` is also
    required whenever `BOOTLOADER_START` is set, independently of the
    bootloader feature, because step 8 computes the bootloader-area copy
    length as `UBOOT_ENV1_START - BOOTLOADER_START`. `UBOOT_ENV2_START` is
    optional (§10.7).
-3. Wait for the destination block device, bounded (§7).
-4. Reject an empty destination, a destination that is not a block device, and a
-   destination equal to the source. The last check compares the resolved
-   destination against the resolved booted device (`/dev/omnect/rootblk`), so a
-   symlink or an alias spelling of the running disk is caught too.
+3. Reject an empty destination, and one equal to the source or to a partition
+   of it, on the value as given. These need no device node, so they run ahead
+   of the wait and report a misconfiguration at once instead of after the full
+   timeout.
+4. Wait for the destination block device, bounded (§7). Then resolve the
+   destination path — once, here, because resolving needs the node to exist —
+   and use the resolved path for every step that follows. Repeat the checks of
+   step 3 on it, so an alias spelling of the running disk is caught too, and
+   reject a destination that is not a block device.
 5. `sync`, then unmount `/sysroot` completely — the boot partition first, then the
    rootfs. Both are mounted by `mount_core_partitions` on both bootloaders. The
    boot unmount is needed so the raw copy of the boot partition reads a
-   consistent image; the rootfs unmount is needed so step 12 does not run
+   consistent image; the rootfs unmount is needed so step 11 does not run
    `e2image` against a filesystem the kernel currently has mounted, with live
    superblock and journal state.
 6. Read the source partition-table dump, rewrite it (§4.2), apply it to the
@@ -419,9 +425,11 @@ work tracked in §12 rather than part of the port.
    is what enforces the first-boot condition on the clone.
 10. Copy destination `boot`, `factory` and `cert` from the corresponding source
     partitions.
-11. Assign fresh partition UUIDs to destination `boot` and `rootA`.
-12. Copy the running rootfs into destination `rootA` with
+11. Copy the running rootfs into destination `rootA` with
     `e2image -ra -p /dev/omnect/rootCurrent`.
+12. Assign fresh partition UUIDs to destination `boot` and `rootA`. The UUIDs
+    live in the partition table, so assigning them after the image copy is
+    equivalent and keeps them in one place.
 13. Write the default bootloader environment to the destination:
     - GRUB: mount the destination boot partition, copy
       `/etc/omnect/grubenv.in` to `EFI/BOOT/grubenv`, unmount;
@@ -438,7 +446,9 @@ partitions.
 
 Log persistence and the terminal action sit in `mod.rs`, around this sequence,
 not inside it: the log is written whether the sequence succeeded or failed, and
-`poweroff` follows only on success (§8.1, §8.3). This mirrors the legacy split
+`poweroff` follows only on success (§8.1, §8.3). A second `sync` runs there
+after the log write, because `reboot(2)` does not flush and step 15 is already
+behind it. This mirrors the legacy split
 between `run_flash_mode_1` and `flash_mode_1_run`.
 
 ### 4.2 Partition-table dump rewriting
@@ -619,12 +629,24 @@ One capture mechanism for all three modes, mirrored to kmsg and the console as i
 runs. Persistence depends on whether a safe target exists:
 
 - **Mode 1** — the log is written to the **source** data partition,
-  unconditionally, as legacy does. That disk was never written to, so this is
-  safe on both success and failure. Mode 1 mounts that partition itself for
-  the write: nothing else does so on a flash boot.
+  unconditionally, as legacy does. Nothing in the sequence writes destructively
+  to the source, so this is safe on both success and failure. Mode 1 mounts
+  that partition itself for the write: nothing else does so on a flash boot.
   `mount_remaining_partitions` (which mounts `data` in the Normal path) runs
   only there, and mode 1 unmounts the rootfs at step 5 before its own work
   starts.
+
+  "Not written destructively" is the precise claim. Three writes do reach the
+  source, each required and each matching legacy:
+
+  - clearing the flash triggers, which is `grubenv` on the source boot
+    partition under GRUB and the source U-Boot environment region under U-Boot
+    (§2.2);
+  - mounting the source `data` partition read-write for this log;
+  - on an EFI machine, rewriting the running machine's NVRAM boot entries (§6).
+
+  Stating it as "the source is never written" would be wrong, and would invite
+  a later change to break the property while the doc still reads as true.
 - **Modes 2 and 3** — the whole disk is overwritten. Before flashing the outcome
   is not yet known; after a failure the disk is in an unknown half-written state
   and mounting anything on it is unsafe. Persistence is therefore best-effort
@@ -643,12 +665,12 @@ Three bugs in `flash-mode-1`, fixed rather than reproduced:
    followed by `if [ ${i} -eq 30 ]; then stderr_fatal ...`. When the device
    appears on the 30th iteration, `i` is 30 and the script reports failure even
    though the device is present.
-2. **DOS extended-partition start read from the wrong path.** Line 133 calls
-   `get_start_sector $(readlink -f extended)` with a relative path, where every
-   sibling call passes `/dev/omnect/...`. `get_start_sector` matches its argument
-   against an `sfdisk -d` dump of the root block device, so the relative path
-   cannot match and the extended-partition size calculation is wrong on DOS
-   machines.
+2. **DOS extended-partition start read from the wrong path.** The
+   extended-container branch calls `get_start_sector $(readlink -f extended)`
+   with a relative path, where every sibling call passes `/dev/omnect/...`.
+   `get_start_sector` matches its argument against an `sfdisk -d` dump of the
+   root block device, so the relative path cannot match and the
+   extended-partition size calculation is wrong on DOS machines.
 3. **Unconditional partition-UUID refresh on a table with no per-partition
    UUID.** The partition-UUID refresh in `flash-mode-1` runs `sfdisk
    --part-uuid` on the boot and root partitions unconditionally, with `||
@@ -677,7 +699,17 @@ Behaviour changes, as opposed to bug fixes:
   both (86 then 87); single-mode dispatch cannot, and refuses the pair rather
   than dropping one silently. Both triggers are cleared before the error, so a
   power cycle boots normally (§3.3, §10.6);
-- modes 2 and 3 may persist a log where legacy did not (§8.3, §10.5).
+- modes 2 and 3 may persist a log where legacy did not (§8.3, §10.5);
+- the `check_fs` on the source data partition before the log mount is dropped.
+  Legacy runs it in `flash_mode_1_run` just before mounting; the port mounts
+  directly. Bounded: the log write is best-effort either way, so a mount that
+  fails only warns (§8.2);
+- the console tee is lost. Legacy pipes the whole run through
+  `tee … >/dev/console`, so the operator at the device sees every line. The
+  port emits `log::info!` to `/dev/kmsg` only, which a `quiet` boot keeps off
+  the console. `e2image` progress still reaches it, because the kernel gives
+  PID 1 `/dev/console` as its standard streams and the copy inherits them.
+  Recorded as a known deviation; a console writer is a separate decision.
 
 ### 9.1 Limitations: identifiers shared with the source disk
 
@@ -689,11 +721,11 @@ points are parity with legacy, not regressions introduced by the port.
   source's `sfdisk -d` dump is reapplied to the destination unchanged apart
   from resetting the data partition, and on DOS the extended container, to
   its shipped size (§4.2). On GPT, `boot` and `rootA` additionally receive
-  fresh per-partition UUIDs (§4.1 step 11); a DOS table has no per-partition
+  fresh per-partition UUIDs (§4.1 step 12); a DOS table has no per-partition
   UUID for `sfdisk` to refresh, so nothing is renewed there (§9 bug 3).
 - On both layouts the clone reproduces the source's vfat volume ID and ext4
   superblock UUID: `boot` is copied as a raw byte range and the rootfs via
-  `e2image` (§4.1 steps 10, 12), and neither touches filesystem-level
+  `e2image` (§4.1 steps 10, 11), and neither touches filesystem-level
   identifiers.
 
 With both disks attached, GRUB's `bootpart_fsuuid` boot-partition lookup
@@ -701,6 +733,16 @@ through `blkid` is therefore ambiguous — it matches by filesystem UUID, which
 both disks now share. Mode 1 powers off on success rather than rebooting
 (§10.4), which gives the operator a window to move the disk before either one
 is booted again.
+
+Two further consequences, both legacy parity:
+
+- The clone's `rootB` is never initialised. Only `rootA` receives an image
+  (§4.1 step 11), so a destination that previously held an omnect install keeps
+  whatever rootfs was in `rootB`. Harmless in practice: the default bootloader
+  environment written in step 13 selects `rootA`.
+- On an EFI machine, mode 1 repoints the **running** machine's NVRAM at the
+  destination disk (§6). After the power off, the source machine's default boot
+  entry names a disk the operator is about to remove.
 
 ## 10. Decisions required from reviewers
 
@@ -721,8 +763,13 @@ partition-alignment problem rather than fixing one.
 differing only by a trailing space in the label, commented as "for debug
 purposes, when booting after flash-mode-{1,2} fails".
 
-**Decided: drop it.** EFI updates since then have made it unnecessary; the port
-creates one entry and the result is to be confirmed by test (§6).
+**Decided: drop it.** The port creates one entry (§6).
+
+The reason given for dropping it — that EFI updates since then have made the
+second entry unnecessary — is **unverified**: no source was recorded for it, and
+the EFI path has had no hardware run. Confirmation by the hardware CI on an EFI
+machine is therefore a condition for shipping this, not a note. If a machine
+still needs the second entry, restore it and record why here.
 
 ### 10.3 Keep deleting every active EFI boot entry?
 
