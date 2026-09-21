@@ -7,6 +7,8 @@
 
 pub mod config;
 #[cfg(feature = "flash-mode-1")]
+pub mod efi;
+#[cfg(feature = "flash-mode-1")]
 pub mod rawio;
 #[cfg(feature = "flash-mode-1")]
 pub mod sfdisk;

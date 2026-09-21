@@ -9,6 +9,9 @@ use std::fs;
 
 use crate::error::ConfigError;
 
+const OS_RELEASE_PATH: &str = "/etc/os-release";
+const MACHINE_FEATURES_PREFIX: &str = "MACHINE_FEATURES=";
+
 /// Build-time constants generated from Yocto environment variables by build.rs.
 pub mod build {
     include!(concat!(env!("OUT_DIR"), "/build_config.rs"));
@@ -64,6 +67,10 @@ impl CmdlineConfig {
 pub struct Config {
     /// Parsed kernel command line.
     pub cmdline: CmdlineConfig,
+    /// Space-separated `MACHINE_FEATURES` value from the initramfs-local
+    /// `/etc/os-release`. Empty when the file, key, or value is unusable —
+    /// the same safe default as a machine that declares no features.
+    pub machine_features: String,
 }
 
 impl Config {
@@ -72,8 +79,35 @@ impl Config {
     /// Reads `/proc/cmdline` and evaluates compile-time feature flags.
     pub fn load() -> crate::Result<Self> {
         let cmdline = CmdlineConfig::load()?;
-        Ok(Self { cmdline })
+        let machine_features = load_machine_features();
+        Ok(Self {
+            cmdline,
+            machine_features,
+        })
     }
+}
+
+/// Read `MACHINE_FEATURES` from the **initramfs-local** `/etc/os-release`,
+/// not `/sysroot/etc/os-release` — a flash mode unmounts `/sysroot` before
+/// this value is needed. A file that cannot be read yields an empty string.
+fn load_machine_features() -> String {
+    fs::read_to_string(OS_RELEASE_PATH)
+        .map(|contents| parse_machine_features(&contents))
+        .unwrap_or_default()
+}
+
+/// Parses `MACHINE_FEATURES="<space-separated features>"` out of the
+/// contents of an `/etc/os-release`-shaped file.
+///
+/// A missing key or a line without a quoted value yields an empty string,
+/// matching the legacy `awk -F'"' '{print $2}'` extraction used to read it.
+pub fn parse_machine_features(os_release: &str) -> String {
+    os_release
+        .lines()
+        .find(|line| line.starts_with(MACHINE_FEATURES_PREFIX))
+        .and_then(|line| line.split('"').nth(1))
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -118,5 +152,30 @@ mod tests {
         // This test pins that contract so a refactor to first-wins is caught.
         let cfg = CmdlineConfig::parse("rootpart=2 rootpart=3");
         assert_eq!(cfg.get("rootpart"), Some("3"));
+    }
+
+    #[test]
+    fn machine_features_parses_the_quoted_value() {
+        let os_release = "ID=omnect\nMACHINE_FEATURES=\"efi usbhost vfat\"\nVERSION=1\n";
+        assert_eq!(parse_machine_features(os_release), "efi usbhost vfat");
+    }
+
+    #[test]
+    fn machine_features_missing_key_is_empty() {
+        let os_release = "ID=omnect\nVERSION=1\n";
+        assert_eq!(parse_machine_features(os_release), "");
+    }
+
+    #[test]
+    fn machine_features_unquoted_value_is_empty() {
+        // Mirrors the legacy `awk -F'"'` extraction: without quotes there is
+        // no field 2, so the line is treated as unparsable.
+        let os_release = "MACHINE_FEATURES=efi usbhost\n";
+        assert_eq!(parse_machine_features(os_release), "");
+    }
+
+    #[test]
+    fn machine_features_empty_file_is_empty() {
+        assert_eq!(parse_machine_features(""), "");
     }
 }
