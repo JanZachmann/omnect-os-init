@@ -4,8 +4,9 @@ Rust-based init process for omnect-os initramfs.
 
 ## Overview
 
-Replaces 14 bash-based initramfs scripts (~1500 LOC) with a single Rust binary
-acting as `/init` in the initramfs. Runs as PID 1 before `switch_root`.
+A single binary acting as `/init` in the initramfs, in place of the shell scripts that
+used to do this. Runs as PID 1: it prepares the partitions, the boot environment and the
+runtime state for `omnect-device-service`, then hands over with `switch_root`.
 
 Implemented functionality:
 
@@ -62,7 +63,7 @@ flowchart TD
     APPLY -->|"OK\nDegraded: ods.degraded_boot=true"| FBDETECT["compute_first_boot()\nset_update_pending()"]
 
     FBDETECT --> ISETUP["init_setup::run()\nextra_bootargs sync — always\nresize-data preflight if feature = resize-data"]
-    ISETUP -->|FsckRequiresReboot| FEB
+    ISETUP -->|"FsckRequiresReboot\nExtraBootArgsUpdated"| FEB
     ISETUP -->|"ResizeData error\nContinueDegraded — warn"| BMODE{"BootMode::detect()"}
     ISETUP -->|"Fatal (non-resize)"| FEB
     ISETUP -->|OK| BMODE
@@ -216,16 +217,17 @@ single failure is `Warning`, two failures are `Error` — an early sign of faili
 ## Building
 
 ```bash
-# Debug build (bootloader type must be specified)
-cargo build --features grub     # x86-64 EFI targets
-cargo build --features uboot    # ARM targets
+# A bootloader and a partition table are both mandatory; build.rs rejects
+# any other combination
+cargo build --features grub,gpt      # x86-64 EFI targets
+cargo build --features uboot,dos     # ARM targets
 
 # Release build (optimized for size)
-cargo build --release --features grub
-cargo build --release --features uboot
+cargo build --release --features grub,gpt
+cargo build --release --features uboot,gpt
 
 # With additional optional features
-cargo build --release --features "grub,persistent-var-log"
+cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 ```
 
 ## Features
@@ -253,7 +255,8 @@ cargo build --release --features "grub,persistent-var-log"
 
 ```bash
 # All four valid base combinations (bootloader × partition table)
-# test-utils is required to include the degraded_boot integration tests
+# test-utils is required: the degraded_boot and factory_reset integration
+# tests do not build without it
 cargo test --features grub,gpt,test-utils
 cargo test --features grub,dos,test-utils
 cargo test --features uboot,gpt,test-utils
