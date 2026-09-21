@@ -122,31 +122,31 @@ impl PartitionLayout {
 }
 
 /// Partition numbers shared by both GPT and DOS layouts
-const PARTITION_NUM_BOOT: u32 = 1;
-const PARTITION_NUM_ROOT_A: u32 = 2;
-const PARTITION_NUM_ROOT_B: u32 = 3;
+pub(crate) const PARTITION_NUM_BOOT: u32 = 1;
+pub(crate) const PARTITION_NUM_ROOT_A: u32 = 2;
+pub(crate) const PARTITION_NUM_ROOT_B: u32 = 3;
 
 /// GPT layout — partitions 4-7 are all primary
 #[cfg(feature = "gpt")]
-const PARTITION_NUM_FACTORY: u32 = 4;
+pub(crate) const PARTITION_NUM_FACTORY: u32 = 4;
 #[cfg(feature = "gpt")]
-const PARTITION_NUM_CERT: u32 = 5;
+pub(crate) const PARTITION_NUM_CERT: u32 = 5;
 #[cfg(feature = "gpt")]
-const PARTITION_NUM_ETC: u32 = 6;
+pub(crate) const PARTITION_NUM_ETC: u32 = 6;
 #[cfg(feature = "gpt")]
-const PARTITION_NUM_DATA: u32 = 7;
+pub(crate) const PARTITION_NUM_DATA: u32 = 7;
 
 /// DOS layout — partition 4 is the extended container; logical partitions start at 5
 #[cfg(feature = "dos")]
-const PARTITION_NUM_EXTENDED: u32 = 4;
+pub(crate) const PARTITION_NUM_EXTENDED: u32 = 4;
 #[cfg(feature = "dos")]
-const PARTITION_NUM_FACTORY: u32 = 5;
+pub(crate) const PARTITION_NUM_FACTORY: u32 = 5;
 #[cfg(feature = "dos")]
-const PARTITION_NUM_CERT: u32 = 6;
+pub(crate) const PARTITION_NUM_CERT: u32 = 6;
 #[cfg(feature = "dos")]
-const PARTITION_NUM_ETC: u32 = 7;
+pub(crate) const PARTITION_NUM_ETC: u32 = 7;
 #[cfg(feature = "dos")]
-const PARTITION_NUM_DATA: u32 = 8;
+pub(crate) const PARTITION_NUM_DATA: u32 = 8;
 
 /// Parse the trailing numeric partition suffix from a device path.
 ///
@@ -411,5 +411,23 @@ mod tests {
         let layout = PartitionLayout::new(device).unwrap();
         assert!(layout.partitions.contains_key(&PartitionName::Boot));
         assert!(layout.partitions.contains_key(&PartitionName::Data));
+    }
+
+    #[test]
+    fn partition_numbers_match_the_table_layout() {
+        assert_eq!(PARTITION_NUM_BOOT, 1);
+        assert_eq!(PARTITION_NUM_ROOT_A, 2);
+        assert_eq!(PARTITION_NUM_ROOT_B, 3);
+        #[cfg(feature = "gpt")]
+        {
+            assert_eq!(PARTITION_NUM_FACTORY, 4);
+            assert_eq!(PARTITION_NUM_DATA, 7);
+        }
+        #[cfg(feature = "dos")]
+        {
+            assert_eq!(PARTITION_NUM_EXTENDED, 4);
+            assert_eq!(PARTITION_NUM_FACTORY, 5);
+            assert_eq!(PARTITION_NUM_DATA, 8);
+        }
     }
 }
