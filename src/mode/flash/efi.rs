@@ -103,8 +103,10 @@ fn run_efibootmgr(args: &[String]) -> Result<String, FlashError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Delete every existing EFI boot entry, omnect or not — a full rebuild is
+/// Delete every active EFI boot entry, omnect or not — a full rebuild is
 /// simpler than reconciling stale entries left by a previous flash or OS.
+/// Inactive entries are left alone, because `boot_entry_ids` requires the
+/// active marker.
 fn delete_existing_entries() -> Result<(), FlashError> {
     let listing = run_efibootmgr(&[])?;
     for id in boot_entry_ids(&listing) {
@@ -135,9 +137,9 @@ fn write_boot_entry(target_disk: &Path) -> Result<(), FlashError> {
 
 /// Rebuild the EFI boot entry to point at a freshly flashed `target_disk`.
 ///
-/// A no-op when `machine_features` does not declare `efi`. Every existing
-/// entry is deleted first, not only omnect's own — that is the behaviour
-/// this ports from the legacy scripts.
+/// A no-op when `machine_features` does not declare `efi`. Every active entry
+/// is deleted first, not only omnect's own — that is the behaviour this ports
+/// from the legacy scripts.
 pub fn handle(
     target_disk: &Path,
     boot_partition: &Path,
