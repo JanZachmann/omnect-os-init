@@ -12,6 +12,9 @@ pub mod normal;
 #[cfg(feature = "factory-reset")]
 pub mod factory_reset;
 
+#[cfg(feature = "flash-mode")]
+pub mod flash;
+
 /// Runtime context passed to the active boot-mode handler.
 pub struct BootContext<'a> {
     pub(crate) config: &'a Config,
