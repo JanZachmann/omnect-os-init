@@ -4,10 +4,9 @@ Port the three flash modes from the legacy scripted initramfs
 (`meta-omnect/recipes-omnect/initrdscripts/omnect-os-initramfs/flash-mode-{1,2,3}`)
 to the Rust initramfs.
 
-**This spec has a blocking section: [§10 Decisions required from
-reviewers](#10-decisions-required-from-reviewers). Implementation must not start
-before every item there is decided. §10.2, §10.6, §10.7 and §10.8 are decided;
-§10.1, §10.3, §10.4 and §10.5 are still open.**
+**Every item in [§10 Decisions required from
+reviewers](#10-decisions-required-from-reviewers) is decided; the rest of the
+spec follows those decisions.**
 
 ## 1. Overview
 
@@ -136,13 +135,20 @@ src/mode/flash/
   efi.rs        efibootmgr handling                                      flash-mode
   clone.rs      mode 1 orchestration                                     flash-mode-1
   sfdisk.rs     partition-table dump parsing and rewriting      (pure)   flash-mode-1
+  rawio.rs      in-process replacement for every `dd` call               flash-mode-1
+  unmount.rs    `/sysroot` teardown and `/proc/mounts` sweep             flash-mode-1
   net.rs        interface up, dhcpcd, dropbear                           flash-mode-2/3
   bmap.rs       bmaptool wrapper                                         flash-mode-2/3
   scp.rs        mode 2 orchestration                                     flash-mode-2
   url.rs        mode 3 orchestration                                     flash-mode-3
 ```
 
-The right column is the gating feature (§3.6).
+The right column is the gating feature (§3.6). `rawio.rs` and `unmount.rs` were
+not anticipated in the original design; both hold logic modes 2 and 3 are
+expected to reuse (the byte-offset copy, and the `/sysroot`-plus-`/proc/mounts`
+teardown of §5.1), but each is gated on `flash-mode-1` for now, since mode 1 is
+the only mode implemented so far. Widening the gate is expected once mode 2 or
+3 lands.
 
 External tools are invoked through `std::process::Command` with named `const`
 paths, as `factory_reset/reformat.rs` already does. No new command-runner
@@ -164,13 +170,24 @@ GPT, 7/8 for DOS), the explicit `1..8` block-device checks, and the
 Mode 1 needs no new mechanism. `build.rs` already emits all five values it
 requires and documents them as "Used by flash-mode-1":
 
-| Yocto variable | Constant |
-|---|---|
-| `OMNECT_PART_OFFSET_UBOOT_ENV1` | `UBOOT_ENV1_START` |
-| `OMNECT_PART_OFFSET_UBOOT_ENV2` | `UBOOT_ENV2_START` |
-| `OMNECT_PART_SIZE_UBOOT_ENV` | `UBOOT_ENV_SIZE` |
-| `OMNECT_PART_SIZE_DATA` | `DATA_SIZE` |
-| `BOOTLOADER_SEEK` | `BOOTLOADER_START` |
+| Yocto variable | Constant | Unit |
+|---|---|---|
+| `OMNECT_PART_OFFSET_UBOOT_ENV1` | `UBOOT_ENV1_START` | KB |
+| `OMNECT_PART_OFFSET_UBOOT_ENV2` | `UBOOT_ENV2_START` | KB |
+| `OMNECT_PART_SIZE_UBOOT_ENV` | `UBOOT_ENV_SIZE` | KB |
+| `OMNECT_PART_SIZE_DATA` | `DATA_SIZE` | KB |
+| `BOOTLOADER_SEEK` | `BOOTLOADER_START` | KB |
+
+`omnect_conv_size_param` in `meta-omnect/classes/omnect_fw_env_config.bbclass`
+multiplies the U-Boot environment size and offsets by 1024 before writing
+`fw_env.config`, which is what fixes their unit as KB. `DATA_SIZE` and
+`BOOTLOADER_START` are KB for the same reason legacy treats them that way: the
+legacy `flash-mode-1` script comments `DATA_SIZE` as "initial size of data
+partition (in KB)" and computes byte offsets from `BOOTLOADER_START` as
+`BOOTLOADER_START*1024`. `UBOOT_ENV1_START` is
+also required whenever `BOOTLOADER_START` is set, on either bootloader, since
+the bootloader-area copy length is `UBOOT_ENV1_START - BOOTLOADER_START`
+(§4.1 step 2, step 8).
 
 Mode 2 adds two through the same mechanism:
 
@@ -376,8 +393,11 @@ work tracked in §12 rather than part of the port.
 1. Read `flash-mode-devpath`, resolve symlinks. Clear `flash-mode` and
    `flash-mode-devpath`.
 2. Validate the required build-time constants: `DATA_SIZE` always; on U-Boot
-   also `UBOOT_ENV1_START` and `UBOOT_ENV_SIZE`. `UBOOT_ENV2_START` is optional
-   (§10.7).
+   also `UBOOT_ENV1_START` and `UBOOT_ENV_SIZE`. `UBOOT_ENV1_START` is also
+   required whenever `BOOTLOADER_START` is set, independently of the
+   bootloader feature, because step 8 computes the bootloader-area copy
+   length as `UBOOT_ENV1_START - BOOTLOADER_START`. `UBOOT_ENV2_START` is
+   optional (§10.7).
 3. Wait for the destination block device, bounded (§7).
 4. Reject an empty destination, a destination that is not a block device, and a
    destination equal to the source. The last check compares the resolved
@@ -513,7 +533,10 @@ see §10.1.
 Applies on machines whose `MACHINE_FEATURES` contains `efi`. Ported from
 `flash_mode_efi_handling` in `common-sh`, unchanged:
 
-1. Delete every existing EFI boot entry.
+1. Delete every active EFI boot entry. `common-sh:334` greps
+   `^Boot[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]\*`; the trailing `\*` is
+   the marker `efibootmgr` prints only on the currently active entry, so an
+   inactive one is left alone.
 2. Mount the target boot partition — the destination's for mode 1, the running
    disk's for modes 2 and 3.
 3. Create an `omnect_os` entry pointing at `\EFI\BOOT\bootx64.efi` on partition 1
@@ -597,7 +620,11 @@ runs. Persistence depends on whether a safe target exists:
 
 - **Mode 1** — the log is written to the **source** data partition,
   unconditionally, as legacy does. That disk was never written to, so this is
-  safe on both success and failure.
+  safe on both success and failure. Mode 1 mounts that partition itself for
+  the write: nothing else does so on a flash boot.
+  `mount_remaining_partitions` (which mounts `data` in the Normal path) runs
+  only there, and mode 1 unmounts the rootfs at step 5 before its own work
+  starts.
 - **Modes 2 and 3** — the whole disk is overwritten. Before flashing the outcome
   is not yet known; after a failure the disk is in an unknown half-written state
   and mounting anything on it is unsafe. Persistence is therefore best-effort
@@ -609,7 +636,7 @@ See §10.5.
 
 ## 9. Intentional deviations from the legacy scripts
 
-Two bugs in `flash-mode-1`, fixed rather than reproduced:
+Three bugs in `flash-mode-1`, fixed rather than reproduced:
 
 1. **Destination-device wait off-by-one.** The loop is
    `for i in $(seq 1 30); do if [ -b "${blk_dev_dst}" ]; then break; fi; ...; done`
@@ -622,6 +649,14 @@ Two bugs in `flash-mode-1`, fixed rather than reproduced:
    against an `sfdisk -d` dump of the root block device, so the relative path
    cannot match and the extended-partition size calculation is wrong on DOS
    machines.
+3. **Unconditional partition-UUID refresh on a table with no per-partition
+   UUID.** `flash-mode-1:204-215` runs `sfdisk --part-uuid` on the boot and
+   root partitions unconditionally, with `|| return 1` on failure. An MBR
+   partition table has no per-partition UUID, so this step fails legacy mode 1
+   on a DOS machine — even though the partition-copy section just above it
+   (lines 168-192) already branches on `part_type` to handle GPT and DOS
+   separately. The port gates the UUID refresh on GPT (§4.1 step 11), so a
+   DOS clone completes.
 
 Also not ported:
 
@@ -643,12 +678,32 @@ Behaviour changes, as opposed to bug fixes:
   power cycle boots normally (§3.3, §10.6);
 - modes 2 and 3 may persist a log where legacy did not (§8.3, §10.5).
 
+### 9.1 Limitations: identifiers shared with the source disk
+
+Mode 1 reproduces some of the source disk's identifiers on the clone. Both
+points are parity with legacy, not regressions introduced by the port.
+
+- The destination keeps the source's disk-level identifier — the MBR disk
+  signature on a DOS table, the GPT `label-id` on a GPT table — because the
+  source's `sfdisk -d` dump is reapplied to the destination unchanged apart
+  from resetting the data partition, and on DOS the extended container, to
+  its shipped size (§4.2). On GPT, `boot` and `rootA` additionally receive
+  fresh per-partition UUIDs (§4.1 step 11); a DOS table has no per-partition
+  UUID for `sfdisk` to refresh, so nothing is renewed there (§9 bug 3).
+- On both layouts the clone reproduces the source's vfat volume ID and ext4
+  superblock UUID: `boot` is copied as a raw byte range and the rootfs via
+  `e2image` (§4.1 steps 10, 12), and neither touches filesystem-level
+  identifiers.
+
+With both disks attached, GRUB's `bootpart_fsuuid` boot-partition lookup
+through `blkid` is therefore ambiguous — it matches by filesystem UUID, which
+both disks now share. Mode 1 powers off on success rather than rebooting
+(§10.4), which gives the operator a window to move the disk before either one
+is booted again.
+
 ## 10. Decisions required from reviewers
 
-**Blocking.** Each item states the default, which is the conservative choice.
-Reviewers must confirm or overturn each one before implementation starts. Items
-already decided in review are marked **Decided** and the rest of the spec
-follows that decision.
+Every item below is decided, and the rest of the spec follows that decision.
 
 ### 10.1 Keep `non_bmap_dd_handling`?
 
@@ -657,7 +712,7 @@ legacy comment records post-flash boot failures observed on both GRUB and U-Boot
 but the root cause was never established, so this may be masking a `bmaptool` or
 partition-alignment problem rather than fixing one.
 
-**Default: keep.**
+**Decided: keep.**
 
 ### 10.2 Keep the duplicate EFI boot entry?
 
@@ -668,28 +723,28 @@ purposes, when booting after flash-mode-{1,2} fails".
 **Decided: drop it.** EFI updates since then have made it unnecessary; the port
 creates one entry and the result is to be confirmed by test (§6).
 
-### 10.3 Keep deleting every existing EFI boot entry?
+### 10.3 Keep deleting every active EFI boot entry?
 
-The current handling removes all EFI boot entries on the machine before creating
-its own, including entries unrelated to omnect.
+The current handling removes every active EFI boot entry on the machine before
+creating its own, including entries unrelated to omnect (§6 item 1).
 
-**Default: keep — it is what ships today.**
+**Decided: keep — it is what ships today.**
 
 ### 10.4 Uniform `reboot`, including mode 1?
 
 Mode 1 currently powers off on success.
 
-**Default: keep `poweroff` for mode 1** — it leaves a cloned disk an operator
+**Decided: keep `poweroff` for mode 1** — it leaves a cloned disk an operator
 must move, and a reboot would come back up on the source disk.
 
 ### 10.5 Persist a log for modes 2 and 3 at all?
 
-The default in §8.3 is a best-effort write after a successful flash, which costs
+§8.3 specifies a best-effort write after a successful flash, which costs
 an extra mount of a just-written partition and yields nothing on the failures
 where a log would help most.
 
-**Default: best-effort after success.** Overturning this means kmsg and console
-only, exactly like legacy.
+**Decided: best-effort after success.** The alternative would be kmsg and
+console only, exactly like legacy.
 
 ### 10.6 Should a queued factory reset still run before mode 1?
 
@@ -752,7 +807,7 @@ only smoke-tested. Real end-to-end coverage stays in Concourse CI on hardware.
 | Destination role → partition index, GPT and DOS | unit | `src/mode/flash/clone.rs` |
 | `curl` options selected from `MACHINE_FEATURES` `rtc` | unit | `src/mode/flash/url.rs` |
 | scp instruction text includes the acquired IP | unit | `src/mode/flash/scp.rs` |
-| Detection: flash mode takes precedence over factory reset | unit | `src/mode/mod.rs` |
+| Detection: both triggers set → both cleared, then refused | unit | `src/mode/mod.rs` |
 | Detection: mode 2 flag-file trigger, present and absent | integration | `tests/flash_modes.rs` |
 | Clear-first ordering, asserted via `set_env_calls` | integration | `tests/flash_modes.rs` |
 | Boot-env read failure falls back to Normal boot | integration | `tests/flash_modes.rs` |
