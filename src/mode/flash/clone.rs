@@ -63,6 +63,13 @@ const CONST_UBOOT_ENV_SIZE: &str = "UBOOT_ENV_SIZE";
 /// a source partition up in the layout.
 const LAYOUT_LOOKUP_OPERATION: &str = "lookup";
 
+/// Why a destination was refused. Shared with the tests, which assert on the
+/// condition an error reports rather than only on its presence.
+const REASON_NO_DESTINATION: &str = "no destination given";
+const REASON_IDENTICAL_DISK: &str = "identical to the booted disk";
+const REASON_SOURCE_PARTITION: &str = "a partition of the booted disk";
+const REASON_NOT_A_BLOCK_DEVICE: &str = "not a block device";
+
 /// The roles the clone writes, and therefore the destination partitions that
 /// have to exist once the rewritten table has been applied. A DOS extended
 /// container holds none of them, so its node is not required.
@@ -175,30 +182,58 @@ fn resolve(path: &Path) -> PathBuf {
 }
 
 /// Refuse a destination that is empty, that is the disk the device booted
-/// from, or that is not a block device.
+/// from, or that is one of that disk's partitions.
 ///
-/// Both sides of the source comparison are resolved first, so a symlink or an
-/// alias spelling of the running disk is caught too.
-pub fn validate_destination(destination: &Path, source: &Path) -> Result<(), FlashError> {
+/// Both sides of the comparison are resolved first, so a symlink or an alias
+/// spelling of the running disk is caught too. Writing a partition table into
+/// a partition of the running disk would damage the source before the next
+/// step could notice, so the partition case is refused here rather than left
+/// to the block-device checks.
+///
+/// Cheap enough to run before the device wait, which is what lets an unset
+/// destination be reported by name instead of after the full timeout.
+pub fn validate_destination_path(destination: &Path, source: &Path) -> Result<(), FlashError> {
     let invalid = |reason: String| FlashError::InvalidDestination {
         device: destination.to_path_buf(),
         reason,
     };
 
     if destination.as_os_str().is_empty() {
-        return Err(invalid("no destination given".to_string()));
+        return Err(invalid(REASON_NO_DESTINATION.to_string()));
     }
 
-    if resolve(destination) == resolve(source) {
-        return Err(invalid(format!(
-            "identical to the booted disk {}",
-            source.display()
-        )));
+    let resolved_destination = resolve(destination);
+    let resolved_source = resolve(source);
+    let destination_name = resolved_destination.to_string_lossy();
+    let source_name = resolved_source.to_string_lossy();
+
+    if let Some(rest) = destination_name.strip_prefix(source_name.as_ref())
+        && unmount::is_disk_or_partition_suffix(rest)
+    {
+        let what = if rest.is_empty() {
+            REASON_IDENTICAL_DISK
+        } else {
+            REASON_SOURCE_PARTITION
+        };
+        return Err(invalid(format!("{what} {}", source.display())));
     }
+
+    Ok(())
+}
+
+/// Everything `validate_destination_path` refuses, plus a destination that is
+/// not a block device.
+pub fn validate_destination(destination: &Path, source: &Path) -> Result<(), FlashError> {
+    validate_destination_path(destination, source)?;
+
+    let invalid = |reason: String| FlashError::InvalidDestination {
+        device: destination.to_path_buf(),
+        reason,
+    };
 
     let metadata = fs::metadata(destination).map_err(|e| invalid(format!("cannot stat: {e}")))?;
     if !metadata.file_type().is_block_device() {
-        return Err(invalid("not a block device".to_string()));
+        return Err(invalid(REASON_NOT_A_BLOCK_DEVICE.to_string()));
     }
 
     Ok(())
@@ -296,19 +331,17 @@ fn copy_rootfs(layout: &PartitionLayout, destination: &Path) -> Result<(), Flash
         reason,
     };
 
-    let output = Command::new(E2IMAGE_CMD)
+    // Inherited stdio: this is the longest step of the sequence, and the
+    // progress flag is only worth passing if the output reaches the console.
+    let status = Command::new(E2IMAGE_CMD)
         .args([E2IMAGE_RAW_FLAG, E2IMAGE_PROGRESS_FLAG])
         .arg(&src)
         .arg(&dst)
-        .output()
+        .status()
         .map_err(|e| copy_failed(format!("failed to run {E2IMAGE_CMD}: {e}")))?;
 
-    if !output.status.success() {
-        return Err(copy_failed(format!(
-            "{E2IMAGE_CMD} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        )));
+    if !status.success() {
+        return Err(copy_failed(format!("{E2IMAGE_CMD} failed ({status})")));
     }
 
     Ok(())
@@ -416,6 +449,10 @@ pub fn run_clone(ctx: &CloneCtx<'_>) -> Result<(), FlashError> {
         destination.display()
     );
 
+    // Ahead of the wait: an unset or source-owned destination is a
+    // misconfiguration the operator should hear about at once, not after the
+    // full timeout has run down.
+    validate_destination_path(destination, source)?;
     wait_for_block_device(destination, DEST_DEVICE_WAIT)?;
     validate_destination(destination, source)?;
 
@@ -515,10 +552,82 @@ mod tests {
         );
     }
 
+    /// The `reason` of an `InvalidDestination`, or a panic naming what came
+    /// back instead.
+    fn refusal_reason(result: Result<(), FlashError>) -> String {
+        match result {
+            Err(FlashError::InvalidDestination { reason, .. }) => reason,
+            other => panic!("expected the destination to be refused, got {other:?}"),
+        }
+    }
+
     #[test]
     fn a_destination_equal_to_the_source_is_refused() {
         let src = Path::new("/dev/mmcblk0");
-        assert!(validate_destination(src, src).is_err());
+        let reason = refusal_reason(validate_destination(src, src));
+        assert!(
+            reason.contains(REASON_IDENTICAL_DISK),
+            "the refusal must name the identical-disk condition, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_alias_spelling_of_the_source_is_resolved_and_refused() {
+        // A symlink is the spelling an operator is most likely to reach for,
+        // and only resolving both sides catches it.
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("disk");
+        let alias = dir.path().join("alias");
+        std::fs::write(&disk, b"").unwrap();
+        std::os::unix::fs::symlink(&disk, &alias).unwrap();
+
+        let reason = refusal_reason(validate_destination(&alias, &disk));
+        assert!(
+            reason.contains(REASON_IDENTICAL_DISK),
+            "a symlink to the booted disk must be refused as the disk itself, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_partition_of_the_source_is_refused_before_anything_is_written() {
+        // Applying a partition table to a partition of the running disk would
+        // damage the source, so this must not reach the block-device check.
+        for (source, destination) in [
+            ("/dev/sda", "/dev/sda2"),
+            ("/dev/mmcblk0", "/dev/mmcblk0p2"),
+        ] {
+            let reason = refusal_reason(validate_destination_path(
+                Path::new(destination),
+                Path::new(source),
+            ));
+            assert!(
+                reason.contains(REASON_SOURCE_PARTITION),
+                "{destination} must be refused as a partition of {source}, got: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_neighbouring_disk_passes_the_path_checks() {
+        // The prefix match must not swallow a legitimate destination.
+        for (source, destination) in [("/dev/sda", "/dev/sdb"), ("/dev/sda", "/dev/sdab")] {
+            assert!(
+                validate_destination_path(Path::new(destination), Path::new(source)).is_ok(),
+                "{destination} is not part of {source} and must pass"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unset_destination_is_refused_by_the_checks_that_run_before_the_wait() {
+        let reason = refusal_reason(validate_destination_path(
+            Path::new(""),
+            Path::new("/dev/sda"),
+        ));
+        assert!(
+            reason.contains(REASON_NO_DESTINATION),
+            "an unset destination must be named as such, got: {reason}"
+        );
     }
 
     #[cfg(feature = "uboot")]

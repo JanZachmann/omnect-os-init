@@ -32,7 +32,7 @@ pub fn unmount_sysroot(rootfs: &Path) -> Result<(), FlashError> {
 /// Whether `rest` (the device string with `disk`'s prefix stripped) is empty
 /// or a partition suffix — a bare number (`sda` + `1`) or a `p`-separated one
 /// (`mmcblk0` + `p1`).
-fn is_disk_or_partition_suffix(rest: &str) -> bool {
+pub fn is_disk_or_partition_suffix(rest: &str) -> bool {
     if rest.is_empty() {
         return true;
     }
