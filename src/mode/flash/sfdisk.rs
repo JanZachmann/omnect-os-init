@@ -21,15 +21,17 @@ const SFDISK_OPERATION_DUMP: &str = "dump";
 const SFDISK_OPERATION_APPLY: &str = "apply";
 
 const SECTOR_SIZE: u64 = 512;
-// sfdisk dumps are always in 512-byte sectors; a 1 KB block is two of those.
-const KB_PER_SECTOR_NUMERATOR: u64 = 2;
+// A 1 KB block is two sectors, but only when the sector size is 512 bytes.
+// verify_sector_scale rejects any dump that declares a different sector size,
+// so this conversion factor is safe to apply unconditionally afterwards.
+const SECTORS_PER_KB: u64 = 2;
 
 const UNIT_FIELD_PREFIX: &str = "unit:";
 const UNIT_SECTORS_VALUE: &str = "sectors";
+const SECTOR_SIZE_FIELD_PREFIX: &str = "sector-size:";
 #[cfg(feature = "gpt")]
 const LAST_LBA_FIELD: &str = "last-lba:";
 const DEVICE_LINE_PREFIX: &str = "/dev/";
-const DEVICE_FIELD_SEPARATOR: &str = " : ";
 const START_FIELD: &str = "start=";
 const SIZE_FIELD: &str = "size=";
 
@@ -39,7 +41,7 @@ const SIZE_FIELD: &str = "size=";
 /// Every other partition is carried over unchanged, so identities such as
 /// GPT `label-id` or partition types and names survive the clone.
 pub fn rewrite_dump(dump: &str, data_size_kb: u64) -> Result<String, FlashError> {
-    verify_unit_sectors(dump)?;
+    verify_sector_scale(dump)?;
 
     let mut lines: Vec<String> = dump.lines().map(str::to_string).collect();
 
@@ -49,7 +51,7 @@ pub fn rewrite_dump(dump: &str, data_size_kb: u64) -> Result<String, FlashError>
         ))
     })?;
     let data_start = parse_field_u64(&lines[data_idx], START_FIELD)?;
-    let data_sectors = data_size_kb * KB_PER_SECTOR_NUMERATOR;
+    let data_sectors = data_size_kb * SECTORS_PER_KB;
 
     log::info!(
         "Resetting the data partition to its shipped size: {data_sectors} sectors ({} bytes)",
@@ -65,7 +67,6 @@ pub fn rewrite_dump(dump: &str, data_size_kb: u64) -> Result<String, FlashError>
     Ok(out)
 }
 
-/// Dump the partition table of `device` with `sfdisk -d`.
 pub fn dump(device: &Path) -> Result<String, FlashError> {
     let output = Command::new(SFDISK_CMD)
         .arg(SFDISK_DUMP_FLAG)
@@ -154,7 +155,15 @@ fn rewrite_layout_specific(
         .iter()
         .position(|l| l.trim_start().starts_with(LAST_LBA_FIELD))
         .ok_or_else(|| FlashError::MalformedDump("missing 'last-lba:' header in dump".into()))?;
-    let new_last_lba = data_start + data_sectors - 1;
+    let new_last_lba = data_start
+        .checked_add(data_sectors)
+        .and_then(|end| end.checked_sub(1))
+        .ok_or_else(|| {
+            FlashError::MalformedDump(format!(
+                "data partition of {data_sectors} sectors starting at {data_start} \
+                 computes an invalid last-lba"
+            ))
+        })?;
     lines[last_lba_idx] = set_field_u64(&lines[last_lba_idx], LAST_LBA_FIELD, new_last_lba)?;
     Ok(())
 }
@@ -171,29 +180,51 @@ fn rewrite_layout_specific(
         ))
     })?;
     let extended_start = parse_field_u64(&lines[extended_idx], START_FIELD)?;
-    let new_size = data_start - extended_start + data_sectors;
+    let new_size = data_start.checked_sub(extended_start).ok_or_else(|| {
+        FlashError::MalformedDump(format!(
+            "extended container starts after the data partition: {}",
+            lines[extended_idx]
+        ))
+    })? + data_sectors;
     lines[extended_idx] = set_field_u64(&lines[extended_idx], SIZE_FIELD, new_size)?;
     Ok(())
 }
 
-fn verify_unit_sectors(dump: &str) -> Result<(), FlashError> {
+/// Reject a dump unless it declares both `unit: sectors` and `sector-size: 512`.
+///
+/// Every size this module computes is a 512-byte-sector count assuming a
+/// 1 KB block is two sectors; a dump declaring a different unit or a
+/// different sector size (e.g. a 4Kn device) would otherwise be silently
+/// mis-scaled into a corrupt partition table.
+fn verify_sector_scale(dump: &str) -> Result<(), FlashError> {
     let unit_line = dump
         .lines()
         .find(|l| l.trim_start().starts_with(UNIT_FIELD_PREFIX))
         .ok_or_else(|| FlashError::MalformedDump("missing 'unit:' declaration in dump".into()))?;
-    let value = unit_line
-        .split_once(':')
-        .map(|(_, value)| value.trim())
-        .unwrap_or_default();
-    if value != UNIT_SECTORS_VALUE {
+    let unit_value = field_value(unit_line, UNIT_FIELD_PREFIX).ok_or_else(|| {
+        FlashError::MalformedDump(format!("unparsable 'unit:' line: {unit_line}"))
+    })?;
+    if unit_value != UNIT_SECTORS_VALUE {
         return Err(FlashError::MalformedDump(format!(
             "dump is not in sectors: {unit_line}"
+        )));
+    }
+
+    let sector_size_line = dump
+        .lines()
+        .find(|l| l.trim_start().starts_with(SECTOR_SIZE_FIELD_PREFIX))
+        .ok_or_else(|| {
+            FlashError::MalformedDump("missing 'sector-size:' declaration in dump".into())
+        })?;
+    let sector_size = parse_field_u64(sector_size_line, SECTOR_SIZE_FIELD_PREFIX)?;
+    if sector_size != SECTOR_SIZE {
+        return Err(FlashError::MalformedDump(format!(
+            "unsupported sector size (only {SECTOR_SIZE}-byte sectors are supported): {sector_size_line}"
         )));
     }
     Ok(())
 }
 
-/// Find the line describing the partition numbered `partition_num`.
 fn find_partition_line(lines: &[String], partition_num: u32) -> Option<usize> {
     lines
         .iter()
@@ -206,7 +237,7 @@ fn partition_number(line: &str) -> Option<u32> {
     let token = line
         .trim_start()
         .strip_prefix(DEVICE_LINE_PREFIX)?
-        .split(DEVICE_FIELD_SEPARATOR)
+        .split_whitespace()
         .next()?;
     let digit_start = token
         .rfind(|c: char| !c.is_ascii_digit())
@@ -294,12 +325,9 @@ sector-size: 512
             .find(|l| l.contains("name=\"data\""))
             .expect("data line survives the rewrite");
         assert!(
-            data_line.contains("size=        8192")
-                || data_line.contains("size= 8192")
-                || data_line.replace(' ', "").contains("size=8192"),
+            data_line.replace(' ', "").contains("size=8192,"),
             "data must be reset to the shipped size: {data_line}"
         );
-        // Everything else is carried over untouched.
         assert!(out.contains("start=        8192, size=      131072"));
         assert!(out.contains("label: gpt"));
     }
@@ -341,27 +369,62 @@ sector-size: 512
         let out = rewrite_dump(DOS_DUMP, DATA_SIZE_KB).unwrap();
         let data = out.lines().find(|l| l.starts_with("/dev/sda8")).unwrap();
         assert!(
-            data.replace(' ', "").contains("size=8192"),
+            data.replace(' ', "").contains("size=8192,"),
             "data must be reset to the shipped size: {data}"
         );
         let extended = out.lines().find(|l| l.starts_with("/dev/sda4")).unwrap();
         // data_start - extended_start + DATA_SIZE*2 = 4472832 - 4333568 + 8192
         assert!(
-            extended.replace(' ', "").contains("size=147456"),
+            extended.replace(' ', "").contains("size=147456,"),
             "the extended container must end with the data partition: {extended}"
         );
     }
 
+    #[cfg(feature = "gpt")]
+    #[test]
+    fn gpt_rewrite_rejects_a_dump_missing_last_lba() {
+        let bad = "label: gpt\nunit: sectors\nsector-size: 512\n\n\
+                   /dev/mmcblk0p7 : start=100, size=10, name=\"data\"\n";
+        assert!(matches!(
+            rewrite_dump(bad, DATA_SIZE_KB),
+            Err(FlashError::MalformedDump(_))
+        ));
+    }
+
     #[test]
     fn rewrite_rejects_a_dump_with_no_data_partition() {
-        let err = rewrite_dump("label: gpt\nunit: sectors\n\n", DATA_SIZE_KB).unwrap_err();
+        let err = rewrite_dump(
+            "label: gpt\nunit: sectors\nsector-size: 512\n\n",
+            DATA_SIZE_KB,
+        )
+        .unwrap_err();
         assert!(matches!(err, FlashError::MalformedDump(_)), "{err}");
     }
 
     #[test]
     fn rewrite_rejects_a_dump_with_an_unparsable_start_sector() {
-        let bad = "label: gpt\nunit: sectors\nlast-lba: 100\n\n\
+        let bad = "label: gpt\nunit: sectors\nsector-size: 512\nlast-lba: 100\n\n\
                    /dev/mmcblk0p7 : start=notanumber, size=10, name=\"data\"\n";
+        assert!(matches!(
+            rewrite_dump(bad, DATA_SIZE_KB),
+            Err(FlashError::MalformedDump(_))
+        ));
+    }
+
+    #[test]
+    fn rewrite_rejects_a_dump_missing_sector_size() {
+        let bad = "label: gpt\nunit: sectors\n\n\
+                   /dev/mmcblk0p7 : start=100, size=10, name=\"data\"\n";
+        assert!(matches!(
+            rewrite_dump(bad, DATA_SIZE_KB),
+            Err(FlashError::MalformedDump(_))
+        ));
+    }
+
+    #[test]
+    fn rewrite_rejects_a_dump_with_an_unsupported_sector_size() {
+        let bad = "label: gpt\nunit: sectors\nsector-size: 4096\n\n\
+                   /dev/mmcblk0p7 : start=100, size=10, name=\"data\"\n";
         assert!(matches!(
             rewrite_dump(bad, DATA_SIZE_KB),
             Err(FlashError::MalformedDump(_))
