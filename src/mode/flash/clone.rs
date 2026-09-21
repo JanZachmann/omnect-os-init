@@ -579,6 +579,27 @@ mod tests {
         );
     }
 
+    // The two tests below pin DEST_PARTITION_ROLES against literal indices on
+    // purpose: the list has to stay in step with the reformat calls, the copy
+    // loop and the layout constants, and a pin written in terms of those same
+    // constants would follow any of them silently.
+
+    #[cfg(feature = "gpt")]
+    #[test]
+    fn the_roles_the_clone_writes_are_pinned_for_gpt() {
+        assert_eq!(DEST_PARTITION_ROLES, [1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[cfg(feature = "dos")]
+    #[test]
+    fn the_roles_the_clone_writes_are_pinned_for_dos() {
+        assert_eq!(DEST_PARTITION_ROLES, [1, 2, 3, 5, 6, 7, 8]);
+        assert!(
+            !DEST_PARTITION_ROLES.contains(&crate::partition::layout::PARTITION_NUM_EXTENDED),
+            "the extended container holds none of the roles the clone writes"
+        );
+    }
+
     /// The `reason` of an `InvalidDestination`, or a panic naming what came
     /// back instead.
     fn refusal_reason(result: Result<(), FlashError>) -> String {

@@ -488,8 +488,14 @@ sector-size: 512
 
     #[test]
     fn rewrite_rejects_a_dump_with_an_unparsable_start_sector() {
+        // The data partition is 7 on GPT and 8 on DOS, so both indices carry
+        // the bad start sector, and partition 4 is present so that the DOS
+        // rewrite would otherwise get all the way through. Without either, one
+        // layout stops at a missing partition and never reaches the parse.
         let bad = "label: gpt\nunit: sectors\nsector-size: 512\nlast-lba: 100\n\n\
-                   /dev/mmcblk0p7 : start=notanumber, size=10, name=\"data\"\n";
+                   /dev/mmcblk0p4 : start=50, size=10, type=5\n\
+                   /dev/mmcblk0p7 : start=notanumber, size=10, name=\"data\"\n\
+                   /dev/mmcblk0p8 : start=notanumber, size=10, name=\"data\"\n";
         assert!(matches!(
             rewrite_dump(bad, DATA_SIZE_KB),
             Err(FlashError::MalformedDump(_))
