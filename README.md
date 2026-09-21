@@ -217,16 +217,16 @@ single failure is `Warning`, two failures are `Error` — an early sign of faili
 ## Building
 
 ```bash
-# Debug build (bootloader type must be specified)
-cargo build --features grub     # x86-64 EFI targets
-cargo build --features uboot    # ARM targets
+# Debug build (bootloader type and partition table must both be specified)
+cargo build --features grub,<gpt|dos>     # x86-64 EFI targets
+cargo build --features uboot,<gpt|dos>    # ARM targets
 
 # Release build (optimized for size)
-cargo build --release --features grub
-cargo build --release --features uboot
+cargo build --release --features grub,<gpt|dos>
+cargo build --release --features uboot,<gpt|dos>
 
 # With additional optional features
-cargo build --release --features "grub,persistent-var-log"
+cargo build --release --features "grub,<gpt|dos>,persistent-var-log"
 ```
 
 ## Features
@@ -248,8 +248,9 @@ cargo build --release --features "grub,persistent-var-log"
 | `flash-mode-2` | Network flashing | Planned |
 | `flash-mode-3` | HTTP/HTTPS flashing | Planned |
 
-> **Note:** `grub` and `uboot` are mutually exclusive. Exactly one must be set at build time.
-> The Yocto recipe selects the correct feature via `CARGO_FEATURES` based on `MACHINE_FEATURES`.
+> **Note:** `grub` and `uboot` are mutually exclusive, and so are `gpt` and `dos`.
+> Exactly one of each pair must be set at build time — `build.rs` panics otherwise.
+> The Yocto recipe selects the correct features via `CARGO_FEATURES` based on `MACHINE_FEATURES`.
 > `flash-mode-1` is in the default feature set, so it is already enabled in the
 > `cargo build` examples above; add `--no-default-features` to build without it.
 
