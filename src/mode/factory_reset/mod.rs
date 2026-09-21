@@ -442,9 +442,10 @@ fn destructive_phase_failure_status(e: InitramfsError, paths: Vec<String>) -> Fa
     }
 }
 
-/// Status code for a reset that failed before the destructive phase — config
-/// problems are distinguished so ODS/cloud can tell a bad trigger from a real
-/// failure. `RestoreFailed` cannot arrive here: `restore_all` accumulates
+/// Status code for a reset that never reached the destructive phase, either
+/// because the trigger was unusable or because it failed before the first
+/// reformat. The config problems are distinguished so ODS/cloud can tell a bad
+/// request from a real failure. `RestoreFailed` cannot arrive here: `restore_all` accumulates
 /// per-path failures as `PartialFailure` and returns `Ok`.
 fn failure_status_code(e: &InitramfsError) -> FactoryResetStatusCode {
     match e {
@@ -1252,7 +1253,15 @@ mod tests {
         use crate::mode::factory_reset::config::ResetMode;
 
         fn status_of(trigger: &str) -> FactoryResetStatus {
-            let e = FactoryResetConfig::parse(trigger).expect_err("trigger must be rejected");
+            use crate::bootloader::{BootEnvKey, MockBootEnv};
+            use crate::mode::BootMode;
+
+            let bl = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, trigger);
+            let BootMode::FactoryReset(FactoryResetTrigger::Rejected(e)) =
+                BootMode::detect(Some(&bl)).expect("detect never fails")
+            else {
+                panic!("trigger must be rejected: {trigger}");
+            };
             aborted_status(&e)
         }
 
@@ -1266,6 +1275,8 @@ mod tests {
                 "{}",
                 r#"{"preserve":[]}"#,
                 r#"{"mode":"1","preserve":[]}"#,
+                r#"{"mode":-1,"preserve":[]}"#,
+                r#"{"mode":1.5,"preserve":[]}"#,
                 r#"{"mode":5,"preserve":[]}"#,
             ] {
                 assert_eq!(
@@ -1299,6 +1310,16 @@ mod tests {
             assert!(status.paths.is_empty());
             assert!(status.error.is_some(), "an Error status needs a reason");
             assert_eq!(status.context, None);
+        }
+
+        #[test]
+        fn a_failed_wipe_is_an_error_status() {
+            let e: InitramfsError = FactoryResetError::WipeFailed {
+                device: PathBuf::from("/dev/sda7"),
+                reason: "no discard support".into(),
+            }
+            .into();
+            assert_eq!(failure_status_code(&e), FactoryResetStatusCode::Error);
         }
 
         #[test]

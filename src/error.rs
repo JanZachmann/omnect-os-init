@@ -302,6 +302,27 @@ mod recovery_class_tests {
         assert_eq!(err.recovery_class(), RecoveryClass::RebootToApply);
     }
 
+    #[cfg(feature = "factory-reset")]
+    #[test]
+    fn factory_reset_wipe_and_preserve_errors_continue_degraded() {
+        let errors = [
+            InitramfsError::FactoryReset(FactoryResetError::WipeFailed {
+                device: std::path::PathBuf::from("/dev/sda7"),
+                reason: "no discard support".to_string(),
+            }),
+            InitramfsError::FactoryReset(FactoryResetError::InvalidPreserve(
+                "'paths' must be an array".to_string(),
+            )),
+        ];
+        for err in errors {
+            assert_eq!(
+                err.recovery_class(),
+                RecoveryClass::ContinueDegraded,
+                "{err}"
+            );
+        }
+    }
+
     #[test]
     fn extra_bootargs_updated_reboots_to_apply() {
         let err = InitramfsError::ExtraBootArgsUpdated;

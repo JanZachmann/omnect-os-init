@@ -4,6 +4,7 @@
 
 use omnect_os_init::MockBootEnv;
 use omnect_os_init::bootloader::BootEnvKey;
+use omnect_os_init::mode::factory_reset::config::ResetMode;
 use omnect_os_init::mode::{BootMode, FactoryResetTrigger};
 use omnect_os_init::runtime::{FactoryResetStatus, FactoryResetStatusCode, OdsStatus};
 
@@ -118,16 +119,18 @@ fn detect_reports_an_unsupported_mode_instead_of_booting_normally() {
 
 #[test]
 fn detect_supported_mode_selects_factory_reset() {
-    for mode_value in ["1", "2", "3"] {
-        let trigger = format!(r#"{{"mode":{mode_value},"preserve":[]}}"#);
+    for (mode_value, expected) in [
+        ("1", ResetMode::Mode1),
+        ("2", ResetMode::Mode2),
+        ("3", ResetMode::Mode3),
+    ] {
+        let trigger = format!(r#"{{"mode":{mode_value},"preserve":["applications"]}}"#);
         let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, &trigger);
         let mode = BootMode::detect(Some(&mock)).unwrap();
-        assert!(
-            matches!(
-                mode,
-                BootMode::FactoryReset(FactoryResetTrigger::Accepted(_))
-            ),
-            "supported mode {mode_value} must select FactoryReset"
-        );
+        let BootMode::FactoryReset(FactoryResetTrigger::Accepted(config)) = mode else {
+            panic!("supported mode {mode_value} must select FactoryReset");
+        };
+        assert_eq!(config.mode, expected, "mode {mode_value} mapped wrongly");
+        assert_eq!(config.preserve, vec!["applications".to_string()]);
     }
 }

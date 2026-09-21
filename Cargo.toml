@@ -46,5 +46,9 @@ panic = "abort"        # Smaller panic handling
 name = "degraded_boot"
 required-features = ["test-utils"]
 
+[[test]]
+name = "factory_reset"
+required-features = ["test-utils"]
+
 [dev-dependencies]
 tempfile = { version = "3.20", default-features = false }

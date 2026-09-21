@@ -71,6 +71,14 @@ section describes. The reported status follows the rule the shell
 implementation used: anything about `mode` is `Invalid` (status 1), an
 unusable `preserve` is `ConfigError` (status 3).
 
+Two further deltas belong in this list, both restoring what the shell
+implementation did. `preserve` is mandatory — an empty array is how a caller
+asks to keep nothing, while a trigger without the key reports `ConfigError`
+instead of resetting with an empty preserve list. And a file in
+`factory-reset.d` without a usable `paths` array fails the reset with
+`ConfigError` instead of being skipped, because skipping it wipes the paths
+the caller asked to keep and still reports success.
+
 ## 2. Component Changes
 
 ### 2.1 `src/mode/factory_reset/config.rs`
@@ -87,13 +95,15 @@ unusable `preserve` is `ConfigError` (status 3).
 const WIPE_CHUNK_SIZE: usize = 1024 * 1024;
 ```
 
-- `wipe_random(device: &Path) -> Result<()>` — mode 2. Query the device size
-  (`BLKGETSIZE64` ioctl), then stream `/dev/urandom` in `WIPE_CHUNK_SIZE`
-  chunks over the whole device; log progress to kmsg every
-  `WIPE_PROGRESS_LOG_INTERVAL` bytes (named const, 1 GiB); sync at the end.
-- `wipe_discard(device: &Path) -> Result<()>` — mode 3. `BLKGETSIZE64` +
-  `BLKDISCARD` ioctls, defined via `nix` ioctl macros (nix 0.29 is already a
-  dependency; no new crates).
+- `wipe_random(device: &Path) -> Result<()>` — mode 2. Take the device size
+  from a seek to its end, then stream `/dev/urandom` in `WIPE_CHUNK_SIZE`
+  chunks over the whole device; log progress to kmsg and flush every
+  `WIPE_PROGRESS_INTERVAL` bytes (named const, 1 GiB), and flush again at the
+  end. Reading the size with a seek instead of the `BLKGETSIZE64` ioctl keeps
+  the whole entry point testable against a temp file.
+- `wipe_discard(device: &Path) -> Result<()>` — mode 3. The `BLKDISCARD`
+  ioctl, defined via a `nix` ioctl macro (nix 0.29 is already a dependency;
+  no new crates).
 - Testability split: the mode-2 overwrite loop takes an open file + length so
   it is unit-testable against a temp file; `wipe_random` is the thin
   block-device wrapper (size query + call).
@@ -158,8 +168,9 @@ is untouched.
 - **`wipe.rs`:**
   - overwrite loop against a temp file: full length overwritten, content is
     not the previous content, no short-write truncation.
-  - `BLKDISCARD`/`BLKGETSIZE64` wrappers stay thin and untested (need a real
-    block device); their call sites are covered through the ops trait mock.
+  - `BLKDISCARD` cannot succeed without a real block device, so mode 3 is
+    covered by its failure paths (a regular file rejects the ioctl) and
+    through the ops trait mock at the call site.
 - **`mod.rs`:** mode 1 never calls wipe; wipe failure alone → Error status
   with the note in `error`; wipe failure + reformat retry → Error with the
   retry note still in `context`; wipe failure + restore partial failure →

@@ -1,5 +1,11 @@
 # Design: Legacy Alignment of Boot-Env and fsck Handling
 
+> **Correction (2026-09-21).** The three factory-reset gaps this document
+> records as out of scope are closed: an unusable trigger is cleared and
+> reported, `preserve` is mandatory, and a problem in a preserve configuration
+> file reports status 3 as the shell implementation did. See
+> `2026-08-11-factory-reset-modes-2-3-4-design.md` §1.2.
+
 **Date:** 2026-07-29
 **Status:** Implemented — omnect/omnect-os-init#22
 **Scope:** omnect-os-init — `runtime::omnect_device_service`, `filesystem::boot_sequence`,

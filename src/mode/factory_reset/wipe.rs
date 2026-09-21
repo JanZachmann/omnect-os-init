@@ -3,7 +3,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
-use crate::error::{FactoryResetError, Result};
+use crate::error::{FactoryResetError, InitramfsError, Result};
 
 /// Chunk size for the mode-2 random overwrite.
 const WIPE_CHUNK_SIZE: usize = 1024 * 1024;
@@ -24,18 +24,22 @@ nix::ioctl_write_ptr_bad!(
     [u64; 2]
 );
 
+fn wipe_failed(device: &Path, reason: impl std::fmt::Display) -> InitramfsError {
+    FactoryResetError::WipeFailed {
+        device: device.to_path_buf(),
+        reason: reason.to_string(),
+    }
+    .into()
+}
+
 /// Overwrite `device` with random data — factory-reset mode 2.
 pub fn wipe_random(device: &Path) -> Result<()> {
     let mut file = open_device(device)?;
     let len = device_size(device, &file)?;
 
     log::info!("wiping {} with random data ({len} bytes)", device.display());
-    overwrite_with_random(&mut file, len, WIPE_PROGRESS_INTERVAL).map_err(|e| {
-        FactoryResetError::WipeFailed {
-            device: device.to_path_buf(),
-            reason: format!("random overwrite failed: {e}"),
-        }
-    })?;
+    overwrite_with_random(&mut file, len, WIPE_PROGRESS_INTERVAL)
+        .map_err(|e| wipe_failed(device, format!("random overwrite failed: {e}")))?;
 
     log::info!("wiped {} with random data", device.display());
     Ok(())
@@ -53,23 +57,18 @@ pub fn wipe_discard(device: &Path) -> Result<()> {
     );
     let range: [u64; 2] = [0, len];
     // SAFETY: `range` outlives the call and holds the two u64 the ioctl reads.
-    unsafe { blkdiscard(file.as_raw_fd(), &range) }.map_err(|e| FactoryResetError::WipeFailed {
-        device: device.to_path_buf(),
-        reason: format!("BLKDISCARD failed: {e}"),
-    })?;
+    unsafe { blkdiscard(file.as_raw_fd(), &range) }
+        .map_err(|e| wipe_failed(device, format!("BLKDISCARD failed: {e}")))?;
 
     log::info!("discarded all blocks of {}", device.display());
     Ok(())
 }
 
 fn open_device(device: &Path) -> Result<File> {
-    OpenOptions::new().write(true).open(device).map_err(|e| {
-        FactoryResetError::WipeFailed {
-            device: device.to_path_buf(),
-            reason: format!("cannot open device: {e}"),
-        }
-        .into()
-    })
+    OpenOptions::new()
+        .write(true)
+        .open(device)
+        .map_err(|e| wipe_failed(device, format!("cannot open device: {e}")))
 }
 
 /// Size of a block device: seeking to its end reports it, which keeps this
@@ -79,10 +78,7 @@ fn device_size(device: &Path, file: &File) -> Result<u64> {
     let size = handle
         .seek(SeekFrom::End(0))
         .and_then(|size| handle.seek(SeekFrom::Start(0)).map(|_| size))
-        .map_err(|e| FactoryResetError::WipeFailed {
-            device: device.to_path_buf(),
-            reason: format!("cannot determine size: {e}"),
-        })?;
+        .map_err(|e| wipe_failed(device, format!("cannot determine size: {e}")))?;
     Ok(size)
 }
 
@@ -104,10 +100,7 @@ fn overwrite_with_random(
 
     target.seek(SeekFrom::Start(0))?;
     while written < len {
-        // Clamp in u64: casting the remainder first truncates on a 32-bit
-        // target, and a remainder that is a multiple of 4 GiB becomes a
-        // zero-length chunk the loop never gets past.
-        let chunk = (len - written).min(WIPE_CHUNK_SIZE as u64) as usize;
+        let chunk = chunk_len(len, written);
         urandom.read_exact(&mut buf[..chunk])?;
         target.write_all(&buf[..chunk])?;
         written += chunk as u64;
@@ -123,9 +116,20 @@ fn overwrite_with_random(
     target.sync_all()
 }
 
+/// Bytes to write next: a whole chunk, or what is left of `len`.
+///
+/// Clamping happens in u64. Casting the remainder to `usize` first truncates
+/// on a 32-bit target, where a remainder that is a multiple of 4 GiB becomes a
+/// zero-length chunk the loop never gets past.
+fn chunk_len(len: u64, written: u64) -> usize {
+    (len - written).min(WIPE_CHUNK_SIZE as u64) as usize
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FOUR_GIB: u64 = 4 * 1024 * 1024 * 1024;
 
     const FILLER: u8 = 0xAA;
     const BLOCK_LEN: usize = 4096;
@@ -210,5 +214,75 @@ mod tests {
             err.to_string().contains("cannot open device"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn wipe_random_writes_random_data_not_a_constant() {
+        // What mode 2 is for: the old content is replaced by something an
+        // attacker cannot predict. A loop that forgot to read /dev/urandom
+        // would still replace every byte — with zeros.
+        let len = BLOCK_LEN;
+        let first = filled(len);
+        let second = filled(len);
+
+        wipe_random(first.path()).unwrap();
+        wipe_random(second.path()).unwrap();
+
+        let first = std::fs::read(first.path()).unwrap();
+        let second = std::fs::read(second.path()).unwrap();
+        assert_ne!(first, second, "two wipes must not write the same bytes");
+
+        let mut seen = first.to_vec();
+        seen.sort_unstable();
+        seen.dedup();
+        assert!(
+            seen.len() > u8::MAX as usize / 4,
+            "only {} distinct byte values, that is not random data",
+            seen.len()
+        );
+    }
+
+    #[test]
+    fn wipe_discard_reports_a_device_that_cannot_discard() {
+        // a regular file rejects the ioctl, which is the same path hardware
+        // without discard support takes
+        let file = filled(BLOCK_LEN);
+
+        let err = wipe_discard(file.path()).unwrap_err();
+
+        assert!(
+            err.to_string().contains("BLKDISCARD failed"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains(&file.path().display().to_string()),
+            "the error must name the device: {err}"
+        );
+    }
+
+    #[test]
+    fn wipe_discard_reports_a_device_it_cannot_open() {
+        let err = wipe_discard(Path::new("/does/not/exist")).unwrap_err();
+
+        assert!(
+            err.to_string().contains("cannot open device"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn chunk_len_clamps_without_truncating() {
+        // A remainder of exactly 4 GiB is the case that a cast to usize turns
+        // into 0 on a 32-bit target, which would stall the loop forever.
+        for (len, written) in [
+            (FOUR_GIB, 0),
+            (FOUR_GIB + BLOCK_LEN as u64, BLOCK_LEN as u64),
+            (2 * FOUR_GIB, FOUR_GIB),
+        ] {
+            assert_eq!(chunk_len(len, written), WIPE_CHUNK_SIZE, "{len}/{written}");
+        }
+
+        assert_eq!(chunk_len(BLOCK_LEN as u64, 0), BLOCK_LEN);
+        assert_eq!(chunk_len(FOUR_GIB, FOUR_GIB - 1), 1);
     }
 }

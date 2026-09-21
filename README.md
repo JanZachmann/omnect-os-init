@@ -70,11 +70,12 @@ flowchart TD
     BMODE -->|Fatal| FEB
 
     BMODE -->|Normal| MREM["mount_remaining_partitions()\ndata · factory · cert + fsck\npersist_fsck_results — always"]
-    BMODE -->|"FactoryReset(config)\nfeature = factory-reset"| FCLEAR
+    BMODE -->|"FactoryReset(trigger)\nfeature = factory-reset"| FCLEAR
 
     subgraph FRESET["factory_reset::run() — always ContinueDegraded"]
         direction TB
         FCLEAR["clear factory-reset\nbootloader var (best-effort)"] --> FMOUNT["mount factory(ro) + etc(rw) + data(rw)\n+ overlays"]
+        FCLEAR -->|"trigger unusable"| FSTATUS
         FMOUNT --> FBACKUP["build_preserve_list()\nbackup_all() → /tmp/factory_reset/backup"]
         FBACKUP --> FUMOUNT1["umount"]
         FUMOUNT1 --> FWIPE["wipe_partitions()\nmode 2: random overwrite · mode 3: discard\nmode 1: skipped · failure never aborts"]
@@ -158,14 +159,21 @@ including degraded boot.
 **Notes on factory reset (`FRESET` block)**
 
 Enabled by the `factory-reset` feature. `BootMode::detect()` reads the `factory-reset`
-bootloader env key; a present, valid-JSON value dispatches to `mode::factory_reset::run()`
-instead of `mode::normal::run()`. The reset sequence (mount → backup → wipe → reformat →
+bootloader env key; any present value dispatches to `mode::factory_reset::run()` instead of
+`mode::normal::run()`. A value the init cannot use is cleared and reported there — status 1
+for a problem with `mode`, status 3 for a problem with `preserve` — rather than booting on
+in silence, which would leave the caller waiting for a result forever. The reset sequence (mount → backup → wipe → reformat →
 mount → restore) always completes with a `FactoryResetStatus` recorded in the ODS status JSON —
 success or error — and then falls through into the same `mode::normal::run()` path a
 normal boot takes (`MREM` onward), so a failed or unsupported reset never blocks the
 device from booting: `FactoryResetError` is classified as `ContinueDegraded`.
 
 **Factory reset — wipe modes (`FWIPE`)**
+
+The trigger must name a `mode` of 1 to 3 and carry a `preserve` array; an empty array keeps
+nothing. A file in `/etc/omnect/factory-reset.d` is read for its `paths` array, and one
+without a usable `paths` array fails the reset — skipping it would wipe the paths it was
+meant to keep and still report success.
 
 The wipe runs once the backup is in initramfs RAM and before the reformat. Mode 2 writes
 data from `/dev/urandom`, mode 3 uses the `BLKDISCARD` ioctl, which the hardware has to

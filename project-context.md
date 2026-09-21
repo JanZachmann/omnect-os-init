@@ -32,8 +32,14 @@ src/
 │   ├── mod.rs               # KmsgLogger initializer
 │   └── kmsg.rs              # /dev/kmsg writer with kernel log levels
 ├── mode/
-│   ├── mod.rs               # BootMode enum, BootContext, detect()
-│   └── normal.rs            # Normal boot handler (post-mount overlays → switch_root)
+│   ├── mod.rs               # BootMode enum, FactoryResetTrigger, BootContext, detect()
+│   ├── normal.rs            # Normal boot handler (post-mount overlays → switch_root)
+│   └── factory_reset/       # Factory reset (feature = factory-reset)
+│       ├── mod.rs           # Reset sequence, status assembly, trigger rejection
+│       ├── config.rs        # Trigger parsing, preserve list from etc/omnect
+│       ├── backup_restore.rs # Preserve-list backup to tmpfs and restore
+│       ├── reformat.rs      # mkfs.ext4 + tune2fs
+│       └── wipe.rs          # Mode 2 random overwrite, mode 3 BLKDISCARD
 ├── partition/
 │   ├── mod.rs               # Public API
 │   ├── device.rs            # Root device detection (GRUB: blkid/fsuuid, U-Boot: root=)
@@ -54,7 +60,9 @@ src/
 - **Check:** `cargo check`
 - **Format:** `cargo fmt -- --check`
 - **Lint:** `cargo clippy --tests --features <grub|uboot> -- -D warnings -W clippy::items_after_statements -W clippy::items_after_test_module`
-- **Test:** `test-utils` must be included to run the degraded-boot integration tests. Run all 14 valid feature combinations:
+- **Test:** `test-utils` must be included; the `degraded_boot` and `factory_reset`
+  integration tests require it. The `factory-reset` combinations are listed in the README,
+  which is the complete list. Base combinations:
   ```
   cargo test --features grub,gpt,test-utils
   cargo test --features grub,dos,test-utils
@@ -84,6 +92,7 @@ src/
 | `persistent-var-log` | Persistent `/var/log` mount |
 | `release-image` | Release behaviour: loop on fatal error; continue booting in degraded mode |
 | `resize-data` | Expand data partition + filesystem to fill disk on first boot |
+| `factory-reset` | Factory reset, modes 1-3: backup → wipe (2 and 3) → reformat → restore |
 | `test-utils` | Expose `MockBootEnv` for integration tests — never enabled in production builds |
 
 ## 5. Runtime Constraints
@@ -121,12 +130,15 @@ Data partition resize (feature = `resize-data`) is handled as a preflight step i
 `BootMode::detect()` and handles both the live-bootloader (guard check) and degraded-boot
 (no guard, resize runs every boot) cases.
 
+`FactoryReset(FactoryResetTrigger)` is implemented (feature `factory-reset`). The trigger
+is carried even when its value is unusable, as `FactoryResetTrigger::Rejected`, so the
+value is cleared and the failure reported instead of the boot continuing in silence.
+
 The following variants are planned:
-- `FactoryReset(FactoryResetConfig)` — wipes data partition, re-provisions device
 - `FlashMode(FlashKind)` — enables in-field OS flashing
 
 When implementing a new variant:
-1. Add the variant to `BootMode` and update `BootMode::detect()` to read the relevant bootloader env key. If the key is absent or the bootloader is unavailable, `detect()` must return `Normal` (degraded boot).
+1. Add the variant to `BootMode` and update `BootMode::detect()` to read the relevant bootloader env key. If the key is absent or the bootloader is unavailable, `detect()` must return `Normal` (degraded boot). A key that is present but unusable belongs to its own mode, which clears it and reports the failure — see `FactoryResetTrigger`.
 2. Add typed payload structs as needed (define them in `src/mode/mod.rs` near the `BootMode` enum).
 3. Add `BootEnvKey` entries for the detection keys.
 4. Add a handler module under `src/mode/` mirroring `src/mode/normal.rs`.

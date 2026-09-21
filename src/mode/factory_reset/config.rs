@@ -13,8 +13,8 @@ const KEY_MODE: &str = "mode";
 const KEY_PRESERVE: &str = "preserve";
 
 /// Validated factory-reset mode. A value outside the supported range is
-/// rejected at deserialize time, so an unsupported trigger never reaches the
-/// reset sequence. The discriminant is the on-wire mode number.
+/// rejected when the trigger is parsed, so an unsupported mode never reaches
+/// the reset sequence. The discriminant is the on-wire mode number.
 ///
 /// `Mode1` reformats only. `Mode2` overwrites `etc` and `data` with random
 /// data before the reformat, `Mode3` discards all their blocks.
@@ -66,24 +66,49 @@ impl FactoryResetConfig {
             })?;
         let mode = ResetMode::try_from(mode).map_err(FactoryResetError::InvalidConfig)?;
 
-        let preserve = trigger.get(KEY_PRESERVE).ok_or_else(|| {
-            FactoryResetError::MissingField(format!("trigger has no '{KEY_PRESERVE}' key"))
+        let preserve = string_array(&trigger, KEY_PRESERVE).map_err(|e| match e {
+            NotAStringArray::Missing => {
+                FactoryResetError::MissingField(format!("trigger has no '{KEY_PRESERVE}' key"))
+            }
+            NotAStringArray::NotAnArray => {
+                FactoryResetError::InvalidPreserve(format!("'{KEY_PRESERVE}' must be an array"))
+            }
+            NotAStringArray::NotOnlyStrings => FactoryResetError::InvalidPreserve(format!(
+                "'{KEY_PRESERVE}' must contain only strings"
+            )),
         })?;
-        let preserve = preserve.as_array().ok_or_else(|| {
-            FactoryResetError::InvalidPreserve(format!("'{KEY_PRESERVE}' must be an array"))
-        })?;
-        let preserve = preserve
-            .iter()
-            .map(|key| key.as_str().map(str::to_string))
-            .collect::<Option<Vec<String>>>()
-            .ok_or_else(|| {
-                FactoryResetError::InvalidPreserve(format!(
-                    "'{KEY_PRESERVE}' must contain only strings"
-                ))
-            })?;
 
-        Ok(Self { mode, preserve })
+        Ok(Self {
+            mode,
+            preserve: preserve.into_iter().map(str::to_string).collect(),
+        })
     }
+}
+
+/// Why a json value did not yield a list of strings. The caller turns this
+/// into its own error variant, since the same shape means `Invalid` for the
+/// trigger's mode-bearing object and `ConfigError` for a preserve list.
+enum NotAStringArray {
+    Missing,
+    NotAnArray,
+    NotOnlyStrings,
+}
+
+/// Read `key` from `value` as an array of strings.
+fn string_array<'a>(
+    value: &'a Value,
+    key: &str,
+) -> std::result::Result<Vec<&'a str>, NotAStringArray> {
+    let array = value
+        .get(key)
+        .ok_or(NotAStringArray::Missing)?
+        .as_array()
+        .ok_or(NotAStringArray::NotAnArray)?;
+    array
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<&str>>>()
+        .ok_or(NotAStringArray::NotOnlyStrings)
 }
 
 /// Reject a preserve-list entry that is empty or contains a `..` component,
@@ -138,27 +163,23 @@ pub fn build_preserve_list(config: &FactoryResetConfig, rootfs: &Path) -> Result
             let value = key_config
                 .as_ref()
                 .expect("key_config must be Some for non-application keys");
-            let paths = value.get(key.as_str()).ok_or_else(|| {
-                FactoryResetError::MissingField(format!(
-                    "{}: no '{key}' key",
-                    config_file.display()
-                ))
+            let paths = string_array(value, key).map_err(|e| {
+                let file = config_file.display();
+                match e {
+                    NotAStringArray::Missing => {
+                        FactoryResetError::MissingField(format!("{file}: no '{key}' key"))
+                    }
+                    NotAStringArray::NotAnArray => FactoryResetError::InvalidPreserve(format!(
+                        "{file}: value for key '{key}' must be an array"
+                    )),
+                    NotAStringArray::NotOnlyStrings => FactoryResetError::InvalidPreserve(format!(
+                        "{file}: value for key '{key}' must contain only strings"
+                    )),
+                }
             })?;
-            let arr = paths.as_array().ok_or_else(|| {
-                FactoryResetError::InvalidPreserve(format!(
-                    "{}: value for key '{key}' must be an array",
-                    config_file.display()
-                ))
-            })?;
-            for p in arr {
-                let s = p.as_str().ok_or_else(|| {
-                    FactoryResetError::InvalidPreserve(format!(
-                        "{}: value for key '{key}' must contain only strings",
-                        config_file.display()
-                    ))
-                })?;
-                validate_preserve_path(s)?;
-                list.push(s.to_string());
+            for path in paths {
+                validate_preserve_path(path)?;
+                list.push(path.to_string());
             }
         }
     }
@@ -206,24 +227,20 @@ fn collect_application_paths(rootfs: &Path, list: &mut Vec<String>) -> Result<()
             FactoryResetError::InvalidPreserve(format!("{}: invalid JSON ({e})", path.display()))
         })?;
 
-        let paths = value.get(KEY_PATHS).ok_or_else(|| {
-            FactoryResetError::InvalidPreserve(format!("{}: no '{KEY_PATHS}' key", path.display()))
+        let paths = string_array(&value, KEY_PATHS).map_err(|e| {
+            let file = path.display();
+            let reason = match e {
+                NotAStringArray::Missing => format!("no '{KEY_PATHS}' key"),
+                NotAStringArray::NotAnArray => format!("'{KEY_PATHS}' must be an array"),
+                NotAStringArray::NotOnlyStrings => {
+                    format!("'{KEY_PATHS}' must contain only strings")
+                }
+            };
+            FactoryResetError::InvalidPreserve(format!("{file}: {reason}"))
         })?;
-        let arr = paths.as_array().ok_or_else(|| {
-            FactoryResetError::InvalidPreserve(format!(
-                "{}: '{KEY_PATHS}' must be an array",
-                path.display()
-            ))
-        })?;
-        for p in arr {
-            let s = p.as_str().ok_or_else(|| {
-                FactoryResetError::InvalidPreserve(format!(
-                    "{}: '{KEY_PATHS}' must contain only strings",
-                    path.display()
-                ))
-            })?;
-            validate_preserve_path(s)?;
-            list.push(s.to_string());
+        for preserve_path in paths {
+            validate_preserve_path(preserve_path)?;
+            list.push(preserve_path.to_string());
         }
     }
 
