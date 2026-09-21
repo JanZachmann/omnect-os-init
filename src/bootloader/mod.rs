@@ -97,6 +97,13 @@ pub enum BootEnvKey {
     /// destructive phase, so the failure survives even if the boot that
     /// follows halts before switch_root. Plain text `"<partition>:<reason>"`.
     FactoryResetLastError,
+    #[cfg(feature = "flash-mode")]
+    /// `flash-mode` — mode selector set by the operator. Cleared by the initramfs
+    /// before the selected mode starts work.
+    FlashMode,
+    #[cfg(feature = "flash-mode-1")]
+    /// `flash-mode-devpath` — destination block device for mode 1.
+    FlashModeDevPath,
 }
 
 impl BootEnvKey {
@@ -113,6 +120,10 @@ impl BootEnvKey {
             Self::FactoryReset => Cow::Borrowed("factory-reset"),
             #[cfg(feature = "factory-reset")]
             Self::FactoryResetLastError => Cow::Borrowed("omnect_factory_reset_last_error"),
+            #[cfg(feature = "flash-mode")]
+            Self::FlashMode => Cow::Borrowed("flash-mode"),
+            #[cfg(feature = "flash-mode-1")]
+            Self::FlashModeDevPath => Cow::Borrowed("flash-mode-devpath"),
         }
     }
 }
@@ -661,5 +672,13 @@ mod tests {
             assert!(stored.len() <= "data:".len() + MAX_FACTORY_RESET_FAILURE_REASON_LEN);
             assert!(stored.starts_with("data:x"));
         }
+    }
+
+    #[cfg(feature = "flash-mode")]
+    #[test]
+    fn flash_mode_keys_use_the_legacy_hyphenated_names() {
+        assert_eq!(BootEnvKey::FlashMode.as_str(), "flash-mode");
+        #[cfg(feature = "flash-mode-1")]
+        assert_eq!(BootEnvKey::FlashModeDevPath.as_str(), "flash-mode-devpath");
     }
 }
