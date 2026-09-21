@@ -1,6 +1,5 @@
 pub mod backup_restore;
 pub mod config;
-pub mod reformat;
 pub mod wipe;
 
 use std::path::{Path, PathBuf};
@@ -22,7 +21,6 @@ use crate::{
 use crate::mode::factory_reset::{
     backup_restore::{backup_all, restore_all},
     config::{FactoryResetConfig, ResetMode, build_preserve_list},
-    reformat::reformat_ext4,
     wipe::{wipe_discard, wipe_random},
 };
 
@@ -253,7 +251,15 @@ struct RealReformatOps<'a> {
 
 impl ReformatRetryOps for RealReformatOps<'_> {
     fn reformat(&mut self, device: &Path, label: &str) -> Result<()> {
-        reformat_ext4(device, label)
+        crate::filesystem::reformat_ext4(device, label).map_err(|e| {
+            // Keep the factory-reset class: an unreformattable partition degrades the
+            // boot, it does not stop it. The shared helper cannot know that.
+            FactoryResetError::ReformatFailed {
+                device: device.to_path_buf(),
+                reason: e.to_string(),
+            }
+            .into()
+        })
     }
 
     fn mount_all(&mut self) -> Result<()> {
@@ -645,6 +651,20 @@ fn reformat_and_mount_with_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failed_reformat_still_continues_degraded() {
+        let err: crate::error::InitramfsError = crate::error::FactoryResetError::ReformatFailed {
+            device: std::path::PathBuf::from("/dev/omnect/data"),
+            reason: "mkfs.ext4 failed".into(),
+        }
+        .into();
+        assert_eq!(
+            err.recovery_class(),
+            crate::recovery::RecoveryClass::ContinueDegraded,
+            "a factory reset that cannot reformat must not become fatal"
+        );
+    }
 
     #[cfg(feature = "factory-reset")]
     mod retry_tests {

@@ -9,6 +9,8 @@ mod boot_sequence;
 mod fsck;
 mod mount;
 mod overlayfs;
+#[cfg(any(feature = "factory-reset", feature = "flash-mode-1"))]
+mod reformat;
 #[cfg(feature = "resize-data")]
 pub mod resize_data;
 
@@ -32,6 +34,8 @@ pub use self::overlayfs::{
 };
 #[cfg(feature = "factory-reset")]
 pub(crate) use self::overlayfs::{paths, setup_data_overlay_tracked, setup_etc_overlay_tracked};
+#[cfg(any(feature = "factory-reset", feature = "flash-mode-1"))]
+pub(crate) use self::reformat::reformat_ext4;
 
 use crate::error::FilesystemError;
 
