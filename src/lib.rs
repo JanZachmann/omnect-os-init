@@ -186,12 +186,16 @@ pub fn run_init() -> Result<()> {
         init_setup::run(ctx)?;
     }
 
-    let ctx = BootContext::new(&config, &layout, rootfs, bootloader_env, ods_status);
+    let mut ctx = BootContext::new(&config, &layout, rootfs, bootloader_env, ods_status);
 
-    match BootMode::detect(ctx.boot_env.available())? {
+    match BootMode::detect(ctx.boot_env.available_mut())? {
         BootMode::Normal => mode::normal::run(ctx),
         #[cfg(feature = "factory-reset")]
         BootMode::FactoryReset(trigger) => mode::factory_reset::run(ctx, trigger),
+        #[cfg(feature = "flash-mode")]
+        // Replaced in the dispatch task: a flash mode runs ahead of init_setup, so
+        // reaching this arm means the early check is missing.
+        BootMode::Flash(_) => Err(crate::error::FlashError::ConflictingTriggers.into()),
     }
 }
 

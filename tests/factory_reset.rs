@@ -105,8 +105,8 @@ fn factory_reset_warning_status_serializes_as_four() {
 fn detect_reports_an_unsupported_mode_instead_of_booting_normally() {
     for mode_value in ["0", "4", "5"] {
         let trigger = format!(r#"{{"mode":{mode_value},"preserve":[]}}"#);
-        let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, &trigger);
-        let mode = BootMode::detect(Some(&mock)).unwrap();
+        let mut mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, &trigger);
+        let mode = BootMode::detect(Some(&mut mock)).unwrap();
         assert!(
             matches!(
                 mode,
@@ -125,8 +125,8 @@ fn detect_supported_mode_selects_factory_reset() {
         ("3", ResetMode::Mode3),
     ] {
         let trigger = format!(r#"{{"mode":{mode_value},"preserve":["applications"]}}"#);
-        let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, &trigger);
-        let mode = BootMode::detect(Some(&mock)).unwrap();
+        let mut mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, &trigger);
+        let mode = BootMode::detect(Some(&mut mock)).unwrap();
         let BootMode::FactoryReset(FactoryResetTrigger::Accepted(config)) = mode else {
             panic!("supported mode {mode_value} must select FactoryReset");
         };
