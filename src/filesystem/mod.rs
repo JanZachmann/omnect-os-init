@@ -4,6 +4,7 @@
 //! - Mounting and unmounting filesystems
 //! - Running fsck before mounting
 //! - Overlayfs setup for etc and home
+//! - Reformatting a partition as ext4
 
 mod boot_sequence;
 mod fsck;

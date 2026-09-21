@@ -11,7 +11,7 @@ use crate::{
     error::{FactoryResetError, FilesystemError, InitramfsError, Result},
     filesystem::{
         FsType, MountOptions, PartitionMountSpec, mount_points, mount_tracked_partition, paths,
-        setup_data_overlay_tracked, setup_etc_overlay_tracked, unmount_tracked,
+        reformat_ext4, setup_data_overlay_tracked, setup_etc_overlay_tracked, unmount_tracked,
     },
     mode::{BootContext, FactoryResetTrigger, factory_reset::backup_restore::RestoreResult},
     partition::{PartitionLayout, PartitionName},
@@ -251,7 +251,7 @@ struct RealReformatOps<'a> {
 
 impl ReformatRetryOps for RealReformatOps<'_> {
     fn reformat(&mut self, device: &Path, label: &str) -> Result<()> {
-        crate::filesystem::reformat_ext4(device, label).map_err(|e| {
+        reformat_ext4(device, label).map_err(|e| {
             // Keep the factory-reset class: an unreformattable partition degrades the
             // boot, it does not stop it. The shared helper cannot know that.
             FactoryResetError::ReformatFailed {
@@ -663,6 +663,45 @@ mod tests {
             err.recovery_class(),
             crate::recovery::RecoveryClass::ContinueDegraded,
             "a factory reset that cannot reformat must not become fatal"
+        );
+    }
+
+    #[test]
+    fn real_reformat_ops_wraps_the_shared_helper_error_as_factory_reset() {
+        use crate::partition::RootDevice;
+        use std::collections::HashMap;
+
+        let layout = PartitionLayout {
+            partitions: HashMap::new(),
+            device: RootDevice {
+                base: PathBuf::from("/dev/sda"),
+                partition_sep: "",
+                root_partition: PathBuf::from("/dev/sda2"),
+            },
+        };
+        let rootfs = PathBuf::from("/");
+        let mut ods_status = OdsStatus::new();
+        let mut mounts: Vec<PathBuf> = Vec::new();
+        let mut ops = RealReformatOps {
+            layout: &layout,
+            rootfs: &rootfs,
+            ods_status: &mut ods_status,
+            mounts: &mut mounts,
+        };
+
+        // /nonexistent/zzz cannot be formatted, so reformat_ext4 returns Err;
+        // this test checks that RealReformatOps::reformat wraps that Err.
+        let err = ops
+            .reformat(Path::new("/nonexistent/zzz"), "data")
+            .expect_err("reformatting a nonexistent device must fail");
+
+        assert!(
+            matches!(
+                err,
+                InitramfsError::FactoryReset(FactoryResetError::ReformatFailed { .. })
+            ),
+            "expected the shared helper's error to be wrapped back into \
+             FactoryResetError::ReformatFailed, got: {err:?}"
         );
     }
 
