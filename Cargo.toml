@@ -53,5 +53,9 @@ required-features = ["test-utils"]
 name = "factory_reset"
 required-features = ["test-utils"]
 
+[[test]]
+name = "flash_modes"
+required-features = ["test-utils", "flash-mode"]
+
 [dev-dependencies]
 tempfile = { version = "3.20", default-features = false }
