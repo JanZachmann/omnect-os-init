@@ -88,6 +88,14 @@ fn write_log(data_partition: &Path, lines: &[String]) -> Result<(), FlashError> 
 /// that survives a failed clone — but losing it must not change the outcome
 /// the operator already has on kmsg and the console.
 fn persist_log(layout: &PartitionLayout, lines: &[String]) {
+    // A run always logs its own outcome, so an empty capture means the capture
+    // itself was lost. Writing the empty file anyway would leave the operator
+    // unable to tell that from a run that logged nothing.
+    if lines.is_empty() {
+        log::warn!("flash mode: nothing was captured; no run log is written");
+        return;
+    }
+
     let Some(data_partition) = layout.get(PartitionName::Data) else {
         log::warn!("flash mode: the source layout has no data partition; the run log is not kept");
         return;
@@ -186,7 +194,6 @@ mod tests {
             log_contents(&["first".to_string(), "second".to_string()]),
             "first\nsecond\n"
         );
-        assert_eq!(log_contents(&[]), "");
     }
 
     #[cfg(feature = "flash-mode-1")]
