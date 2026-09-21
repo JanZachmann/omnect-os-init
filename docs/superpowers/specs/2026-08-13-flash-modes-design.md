@@ -533,7 +533,7 @@ see §10.1.
 Applies on machines whose `MACHINE_FEATURES` contains `efi`. Ported from
 `flash_mode_efi_handling` in `common-sh`, unchanged:
 
-1. Delete every active EFI boot entry. `common-sh:334` greps
+1. Delete every active EFI boot entry. `flash_mode_efi_handling` greps
    `^Boot[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]\*`; the trailing `\*` is
    the marker `efibootmgr` prints only on the currently active entry, so an
    inactive one is left alone.
@@ -650,13 +650,14 @@ Three bugs in `flash-mode-1`, fixed rather than reproduced:
    cannot match and the extended-partition size calculation is wrong on DOS
    machines.
 3. **Unconditional partition-UUID refresh on a table with no per-partition
-   UUID.** `flash-mode-1:204-215` runs `sfdisk --part-uuid` on the boot and
-   root partitions unconditionally, with `|| return 1` on failure. An MBR
-   partition table has no per-partition UUID, so this step fails legacy mode 1
-   on a DOS machine — even though the partition-copy section just above it
-   (lines 168-192) already branches on `part_type` to handle GPT and DOS
-   separately. The port gates the UUID refresh on GPT (§4.1 step 11), so a
-   DOS clone completes.
+   UUID.** The partition-UUID refresh in `flash-mode-1` runs `sfdisk
+   --part-uuid` on the boot and root partitions unconditionally, with `||
+   return 1` on failure. An MBR partition table has no per-partition UUID, so
+   this step fails legacy mode 1 on a DOS machine — even though the
+   partition-copy section just above it already branches on `part_type` to
+   handle GPT and DOS separately for the `etc`/`data` reformat and the
+   boot/factory/cert copy. The port gates the UUID refresh on GPT (§4.1 step
+   11), so a DOS clone completes.
 
 Also not ported:
 

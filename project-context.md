@@ -64,13 +64,16 @@ src/
 ```
 
 ## 3. Build & Test Commands
-- **Build:** `cargo build` / `cargo build --release`
-- **Check:** `cargo check`
+- **Build:** `cargo build --features <grub|uboot>,<gpt|dos>` / `cargo build --release --features <grub|uboot>,<gpt|dos>`
+- **Check:** `cargo check --features <grub|uboot>,<gpt|dos>`
 - **Format:** `cargo fmt -- --check`
-- **Lint:** `cargo clippy --tests --features <grub|uboot>,test-utils -- -D warnings -W clippy::items_after_statements -W clippy::items_after_test_module`.
-  `test-utils` must be included here too: every `[[test]]` target in
-  `Cargo.toml` has `required-features = ["test-utils", ...]`, so without it
-  `--tests` compiles only `device_detection.rs` and `fsck_status.rs` — none of
+- **Lint:** `cargo clippy --tests --features <grub|uboot>,<gpt|dos>,test-utils -- -D warnings -W clippy::items_after_statements -W clippy::items_after_test_module`.
+  `build.rs` panics unless exactly one bootloader feature and exactly one
+  partition-table feature are enabled, so both placeholders above must be
+  substituted for the command to run at all. `test-utils` must be included
+  too: every `[[test]]` target in `Cargo.toml` has
+  `required-features = ["test-utils", ...]`, so without it `--tests` compiles
+  only `device_detection.rs` and `fsck_status.rs` — none of
   `tests/factory_reset.rs`, `tests/degraded_boot.rs` or `tests/flash_modes.rs`
   are linted.
 - **Test:** `test-utils` must be included; the `degraded_boot` and `factory_reset`
