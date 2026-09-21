@@ -90,7 +90,7 @@ impl FactoryResetConfig {
 /// which would otherwise let backup/restore escape the rootfs tree.
 fn validate_preserve_path(path: &str) -> Result<()> {
     if path.trim_start_matches('/').is_empty() {
-        return Err(FactoryResetError::InvalidConfig(
+        return Err(FactoryResetError::InvalidPreserve(
             "preserve path must not be empty".to_string(),
         )
         .into());
@@ -99,7 +99,7 @@ fn validate_preserve_path(path: &str) -> Result<()> {
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir));
     if escapes_rootfs {
-        return Err(FactoryResetError::InvalidConfig(format!(
+        return Err(FactoryResetError::InvalidPreserve(format!(
             "preserve path '{path}' contains '..' and would escape rootfs"
         ))
         .into());
@@ -121,7 +121,7 @@ pub fn build_preserve_list(config: &FactoryResetConfig, rootfs: &Path) -> Result
             ))
         })?;
         let value: Value = serde_json::from_str(&content).map_err(|e| {
-            FactoryResetError::InvalidConfig(format!(
+            FactoryResetError::InvalidPreserve(format!(
                 "Failed to parse {}: {e}",
                 config_file.display()
             ))
@@ -145,14 +145,14 @@ pub fn build_preserve_list(config: &FactoryResetConfig, rootfs: &Path) -> Result
                 ))
             })?;
             let arr = paths.as_array().ok_or_else(|| {
-                FactoryResetError::InvalidConfig(format!(
+                FactoryResetError::InvalidPreserve(format!(
                     "{}: value for key '{key}' must be an array",
                     config_file.display()
                 ))
             })?;
             for p in arr {
                 let s = p.as_str().ok_or_else(|| {
-                    FactoryResetError::InvalidConfig(format!(
+                    FactoryResetError::InvalidPreserve(format!(
                         "{}: value for key '{key}' must contain only strings",
                         config_file.display()
                     ))
@@ -203,20 +203,27 @@ fn collect_application_paths(rootfs: &Path, list: &mut Vec<String>) -> Result<()
         })?;
 
         let value: Value = serde_json::from_str(&content).map_err(|e| {
-            FactoryResetError::InvalidConfig(format!("{}: invalid JSON ({e})", path.display()))
+            FactoryResetError::InvalidPreserve(format!("{}: invalid JSON ({e})", path.display()))
         })?;
 
-        if let Some(arr) = value.get(KEY_PATHS).and_then(|v| v.as_array()) {
-            for p in arr {
-                let s = p.as_str().ok_or_else(|| {
-                    FactoryResetError::InvalidConfig(format!(
-                        "{}: '{KEY_PATHS}' array must contain only strings",
-                        path.display()
-                    ))
-                })?;
-                validate_preserve_path(s)?;
-                list.push(s.to_string());
-            }
+        let paths = value.get(KEY_PATHS).ok_or_else(|| {
+            FactoryResetError::InvalidPreserve(format!("{}: no '{KEY_PATHS}' key", path.display()))
+        })?;
+        let arr = paths.as_array().ok_or_else(|| {
+            FactoryResetError::InvalidPreserve(format!(
+                "{}: '{KEY_PATHS}' must be an array",
+                path.display()
+            ))
+        })?;
+        for p in arr {
+            let s = p.as_str().ok_or_else(|| {
+                FactoryResetError::InvalidPreserve(format!(
+                    "{}: '{KEY_PATHS}' must contain only strings",
+                    path.display()
+                ))
+            })?;
+            validate_preserve_path(s)?;
+            list.push(s.to_string());
         }
     }
 
@@ -384,7 +391,7 @@ mod tests {
         let error = build_preserve_list(&cfg, temp.path()).unwrap_err();
         assert!(matches!(
             error,
-            crate::error::InitramfsError::FactoryReset(FactoryResetError::InvalidConfig(_))
+            crate::error::InitramfsError::FactoryReset(FactoryResetError::InvalidPreserve(_))
         ));
     }
 
@@ -402,12 +409,62 @@ mod tests {
         let error = build_preserve_list(&cfg, temp.path()).unwrap_err();
         assert!(matches!(
             error,
-            crate::error::InitramfsError::FactoryReset(FactoryResetError::InvalidConfig(_))
+            crate::error::InitramfsError::FactoryReset(FactoryResetError::InvalidPreserve(_))
         ));
     }
 
     #[test]
-    fn build_preserve_list_applications_invalid_json_returns_invalid_config() {
+    fn build_preserve_list_applications_without_usable_paths_is_an_error() {
+        // A file the caller put there to keep something, which does not say
+        // what to keep. Skipping it would wipe those paths and still report
+        // success.
+        for content in [
+            "{}",
+            r#"{"path": ""}"#,
+            r#"{"paths": ""}"#,
+            r#"{"paths": [1]}"#,
+        ] {
+            let temp = TempDir::new().unwrap();
+            let dir = temp.path().join("etc/omnect/factory-reset.d");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("app.json"), content).unwrap();
+
+            let cfg = FactoryResetConfig {
+                mode: ResetMode::Mode1,
+                preserve: vec!["applications".into()],
+            };
+            let error = build_preserve_list(&cfg, temp.path()).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    crate::error::InitramfsError::FactoryReset(FactoryResetError::InvalidPreserve(
+                        _
+                    ))
+                ),
+                "{content}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_preserve_list_applications_empty_paths_array_is_accepted() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("etc/omnect/factory-reset.d");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("app.json"), r#"{"paths": []}"#).unwrap();
+
+        let cfg = FactoryResetConfig {
+            mode: ResetMode::Mode1,
+            preserve: vec!["applications".into()],
+        };
+        assert_eq!(
+            build_preserve_list(&cfg, temp.path()).unwrap(),
+            vec![PRESERVE_LIST_MANDATORY.to_string()]
+        );
+    }
+
+    #[test]
+    fn build_preserve_list_applications_invalid_json_is_a_preserve_error() {
         let temp = TempDir::new().unwrap();
         let dir = temp.path().join("etc/omnect/factory-reset.d");
         fs::create_dir_all(&dir).unwrap();
@@ -420,7 +477,7 @@ mod tests {
         let error = build_preserve_list(&cfg, temp.path()).unwrap_err();
         assert!(matches!(
             error,
-            crate::error::InitramfsError::FactoryReset(FactoryResetError::InvalidConfig(_))
+            crate::error::InitramfsError::FactoryReset(FactoryResetError::InvalidPreserve(_))
         ));
     }
 
@@ -480,7 +537,7 @@ mod tests {
         let error = build_preserve_list(&cfg, temp.path()).unwrap_err();
         assert!(matches!(
             error,
-            crate::error::InitramfsError::FactoryReset(FactoryResetError::InvalidConfig(_))
+            crate::error::InitramfsError::FactoryReset(FactoryResetError::InvalidPreserve(_))
         ));
     }
 
@@ -498,7 +555,7 @@ mod tests {
         let error = build_preserve_list(&cfg, temp.path()).unwrap_err();
         assert!(matches!(
             error,
-            crate::error::InitramfsError::FactoryReset(FactoryResetError::InvalidConfig(_))
+            crate::error::InitramfsError::FactoryReset(FactoryResetError::InvalidPreserve(_))
         ));
     }
 }
