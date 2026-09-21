@@ -61,7 +61,7 @@ flowchart TD
     APPLY -->|Fatal| FEB
     APPLY -->|"OK\nDegraded: ods.degraded_boot=true"| FBDETECT["compute_first_boot()\nset_update_pending()"]
 
-    FBDETECT --> ISETUP["init_setup::run()\nresize-data preflight\nif feature = resize-data"]
+    FBDETECT --> ISETUP["init_setup::run()\nextra_bootargs sync — always\nresize-data preflight if feature = resize-data"]
     ISETUP -->|FsckRequiresReboot| FEB
     ISETUP -->|"ResizeData error\nContinueDegraded — warn"| BMODE{"BootMode::detect()"}
     ISETUP -->|"Fatal (non-resize)"| FEB
@@ -95,7 +95,7 @@ flowchart TD
     OVL -->|OK| LINKS["create_fs_links()\ndrain_fsck_env() — env → JSON, then clear\ncreate_ods_runtime_files()"]
     OVL -->|Fail| FEB
 
-    LINKS -->|OK| FBM["write_first_boot_marker()\nif first_boot ∧ resize_ok ∧ env_available\nbest-effort — warn on fail"]
+    LINKS -->|OK| FBM["write_first_boot_marker()\nif first_boot ∧ resize_ok ∧ extra_bootargs_ok ∧ env_available\nbest-effort — warn on fail"]
     LINKS -->|Fail| FEB
 
     FBM --> SR["switch_root → systemd"]
