@@ -34,7 +34,7 @@ Observable behaviour is preserved: the same environment keys, the same terminal
 actions, the same platform workarounds. The exceptions are all deliberate and
 all recorded in [§9](#9-intentional-deviations-from-the-legacy-scripts):
 
-- two legacy bugs are fixed;
+- three legacy bugs are fixed;
 - machine-driven unbounded waits become bounded; the wait for the operator's
   `scp` stays unbounded (§10.8);
 - `dd` is replaced by in-process file I/O.
@@ -679,7 +679,7 @@ Three bugs in `flash-mode-1`, fixed rather than reproduced:
    partition-copy section just above it already branches on `part_type` to
    handle GPT and DOS separately for the `etc`/`data` reformat and the
    boot/factory/cert copy. The port gates the UUID refresh on GPT (§4.1 step
-   11), so a DOS clone completes.
+   12), so a DOS clone completes.
 
 Also not ported:
 
