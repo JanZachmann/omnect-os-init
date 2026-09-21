@@ -66,10 +66,9 @@ pub enum BootMode {
 
 /// Best-effort clear of the flash trigger keys.
 ///
-/// Used both by the conflict refusal and by a fatal path that runs before
-/// any mode has started: on a release image a fatal error halts forever, so
-/// leaving a trigger set here would mean every power cycle repeats the same
-/// outcome.
+/// Used by the conflict refusal and as the flash mode's own first step. On a
+/// release image a fatal error halts forever, so a trigger left set would mean
+/// every power cycle repeats the same outcome.
 #[cfg(feature = "flash-mode")]
 pub(crate) fn clear_flash_triggers(bl: &mut dyn BootEnv) {
     if let Err(e) = bl.set_env(BootEnvKey::FlashMode, None) {

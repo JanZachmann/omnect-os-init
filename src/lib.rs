@@ -175,7 +175,19 @@ pub fn run_init() -> Result<()> {
     // on it without threading the value through every return type.
     set_update_pending(update_pending_from_env(&bootloader_env));
 
-    {
+    // Detected once: a second read would repeat the warnings detection logs
+    // and could see a different answer than the one that is dispatched below.
+    let mode = BootMode::detect(bootloader_env.available_mut())?;
+
+    // A flash mode clones or overwrites a whole disk, so init_setup's work on
+    // the running disk is either discarded seconds later or not carried over,
+    // and an extra-bootargs reboot would only delay the flash.
+    #[cfg(feature = "flash-mode")]
+    let skip_init_setup = matches!(mode, BootMode::Flash(_));
+    #[cfg(not(feature = "flash-mode"))]
+    let skip_init_setup = false;
+
+    if !skip_init_setup {
         let ctx = init_setup::InitSetupCtx {
             layout: &layout,
             boot_env: &mut bootloader_env,
@@ -186,22 +198,14 @@ pub fn run_init() -> Result<()> {
         init_setup::run(ctx)?;
     }
 
-    let mut ctx = BootContext::new(&config, &layout, rootfs, bootloader_env, ods_status);
+    let ctx = BootContext::new(&config, &layout, rootfs, bootloader_env, ods_status);
 
-    match BootMode::detect(ctx.boot_env.available_mut())? {
+    match mode {
         BootMode::Normal => mode::normal::run(ctx),
         #[cfg(feature = "factory-reset")]
         BootMode::FactoryReset(trigger) => mode::factory_reset::run(ctx, trigger),
-        // A flash mode is selected but nothing dispatched it. Clear the
-        // trigger so a power cycle boots normally instead of repeating the
-        // same selection forever, then report why nothing happened.
         #[cfg(feature = "flash-mode")]
-        BootMode::Flash(_) => {
-            if let Some(bl) = ctx.boot_env.available_mut() {
-                mode::clear_flash_triggers(bl);
-            }
-            Err(crate::error::FlashError::DispatchUnavailable.into())
-        }
+        BootMode::Flash(flash_config) => mode::flash::run(ctx, flash_config),
     }
 }
 

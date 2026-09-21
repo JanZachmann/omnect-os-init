@@ -2,6 +2,10 @@ use std::path::PathBuf;
 
 use crate::error::FlashError;
 
+/// The `flash-mode-devpath` key as `FlashError::InvalidEnvValue` names it.
+#[cfg(feature = "flash-mode-1")]
+pub const DEVPATH_KEY: &str = "flash-mode-devpath";
+
 /// Which flash mode the operator selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashMode {
@@ -36,7 +40,7 @@ pub fn parse_devpath(value: Option<&str>) -> Result<PathBuf, FlashError> {
     let path = value.unwrap_or_default().trim();
     if path.is_empty() {
         return Err(FlashError::InvalidEnvValue {
-            key: "flash-mode-devpath",
+            key: DEVPATH_KEY,
             reason: "not set".into(),
         });
     }
