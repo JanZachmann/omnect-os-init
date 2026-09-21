@@ -5,6 +5,8 @@
 //! once — the trigger is cleared before any work starts, so a crash mid-flash
 //! leads to a normal boot attempt rather than an endless re-entry.
 
+#[cfg(feature = "flash-mode-1")]
+pub mod clone;
 pub mod config;
 #[cfg(feature = "flash-mode-1")]
 pub mod efi;

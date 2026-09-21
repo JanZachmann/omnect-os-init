@@ -10,7 +10,7 @@ mod boot_sequence;
 mod fsck;
 mod mount;
 mod overlayfs;
-#[cfg(feature = "factory-reset")]
+#[cfg(any(feature = "factory-reset", feature = "flash-mode-1"))]
 mod reformat;
 #[cfg(feature = "resize-data")]
 pub mod resize_data;
@@ -35,10 +35,7 @@ pub use self::overlayfs::{
 };
 #[cfg(feature = "factory-reset")]
 pub(crate) use self::overlayfs::{paths, setup_data_overlay_tracked, setup_etc_overlay_tracked};
-// TODO: widen to `any(feature = "factory-reset", feature = "flash-mode-1")` once
-// flash-mode-1 has a caller for reformat_ext4; until then that combination has no
-// caller and fails the dead-code lint.
-#[cfg(feature = "factory-reset")]
+#[cfg(any(feature = "factory-reset", feature = "flash-mode-1"))]
 pub(crate) use self::reformat::reformat_ext4;
 
 use crate::error::FilesystemError;

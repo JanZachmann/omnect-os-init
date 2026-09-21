@@ -421,12 +421,16 @@ mod tests {
         #[cfg(feature = "gpt")]
         {
             assert_eq!(PARTITION_NUM_FACTORY, 4);
+            assert_eq!(PARTITION_NUM_CERT, 5);
+            assert_eq!(PARTITION_NUM_ETC, 6);
             assert_eq!(PARTITION_NUM_DATA, 7);
         }
         #[cfg(feature = "dos")]
         {
             assert_eq!(PARTITION_NUM_EXTENDED, 4);
             assert_eq!(PARTITION_NUM_FACTORY, 5);
+            assert_eq!(PARTITION_NUM_CERT, 6);
+            assert_eq!(PARTITION_NUM_ETC, 7);
             assert_eq!(PARTITION_NUM_DATA, 8);
         }
     }

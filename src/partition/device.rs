@@ -10,7 +10,7 @@
 //! - **U-Boot** (`root=/dev/<device>`): full device path set by U-Boot bootargs
 //!   (e.g. `root=/dev/mmcblk1p2`). Base device and separator are derived from the path.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -215,6 +215,21 @@ pub fn device_from_path(path: &str) -> Result<RootDevice> {
     Ok(rd)
 }
 
+/// The separator between a bare disk path and a partition number.
+///
+/// Names that already end in a digit (`mmcblk2`, `nvme0n1`) take a `p` so the
+/// partition number stays readable; the others append it directly.
+#[cfg(feature = "flash-mode-1")]
+pub(crate) fn partition_sep_for(disk: &Path) -> &'static str {
+    let ends_with_digit = disk
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.chars().next_back())
+        .is_some_and(|c| c.is_ascii_digit());
+
+    if ends_with_digit { "p" } else { "" }
+}
+
 /// Splits a partition device name into `(base_name, separator)`.
 ///
 /// Examples: `"sda2"` → `("sda", "")`, `"mmcblk1p2"` → `("mmcblk1", "p")`
@@ -241,7 +256,7 @@ fn split_partition_suffix(name: &str) -> Result<(String, &'static str)> {
     )))
 }
 
-fn wait_for_device(device: &std::path::Path) -> Result<()> {
+fn wait_for_device(device: &Path) -> Result<()> {
     let timeout = Duration::from_secs(DEVICE_WAIT_TIMEOUT_SECS);
     let start = Instant::now();
     loop {
@@ -293,6 +308,14 @@ mod tests {
             split_partition_suffix("vda2").unwrap(),
             ("vda".to_string(), "")
         );
+    }
+
+    #[cfg(feature = "flash-mode-1")]
+    #[test]
+    fn test_partition_sep_for_bare_disks() {
+        assert_eq!(partition_sep_for(Path::new("/dev/sda")), "");
+        assert_eq!(partition_sep_for(Path::new("/dev/mmcblk2")), "p");
+        assert_eq!(partition_sep_for(Path::new("/dev/nvme0n1")), "p");
     }
 
     #[test]

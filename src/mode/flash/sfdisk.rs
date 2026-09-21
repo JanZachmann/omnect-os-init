@@ -19,6 +19,8 @@ pub const SFDISK_CMD: &str = "/sbin/sfdisk";
 const SFDISK_DUMP_FLAG: &str = "-d";
 const SFDISK_OPERATION_DUMP: &str = "dump";
 const SFDISK_OPERATION_APPLY: &str = "apply";
+#[cfg(feature = "gpt")]
+const SFDISK_PART_UUID_FLAG: &str = "--part-uuid";
 
 const SECTOR_SIZE: u64 = 512;
 // A 1 KB block is two sectors, but only when the sector size is 512 bytes.
@@ -140,6 +142,45 @@ pub fn apply(device: &Path, dump: &str) -> Result<(), FlashError> {
                 String::from_utf8_lossy(&output.stderr)
             ),
         });
+    }
+
+    Ok(())
+}
+
+/// The `sfdisk` argument vector that gives partition `part_num` of `device`
+/// the UUID `uuid`.
+#[cfg(feature = "gpt")]
+fn part_uuid_args(device: &Path, part_num: u32, uuid: &str) -> Vec<String> {
+    vec![
+        SFDISK_PART_UUID_FLAG.to_string(),
+        device.display().to_string(),
+        part_num.to_string(),
+        uuid.to_string(),
+    ]
+}
+
+/// Give partition `part_num` of `device` a fresh GPT partition-entry UUID.
+///
+/// The UUID lives in the partition table, so it survives any later image copy
+/// into that partition.
+#[cfg(feature = "gpt")]
+pub fn set_part_uuid(device: &Path, part_num: u32, uuid: &str) -> Result<(), FlashError> {
+    let uuid_failed = |reason: String| FlashError::UuidFailed {
+        device: device.to_path_buf(),
+        reason,
+    };
+
+    let output = Command::new(SFDISK_CMD)
+        .args(part_uuid_args(device, part_num, uuid))
+        .output()
+        .map_err(|e| uuid_failed(format!("failed to run {SFDISK_CMD}: {e}")))?;
+
+    if !output.status.success() {
+        return Err(uuid_failed(format!(
+            "{SFDISK_CMD} {SFDISK_PART_UUID_FLAG} on partition {part_num} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
 
     Ok(())
@@ -291,6 +332,24 @@ mod tests {
     use super::*;
 
     const DATA_SIZE_KB: u64 = 4096; // 8192 sectors
+
+    #[cfg(feature = "gpt")]
+    #[test]
+    fn part_uuid_args_name_the_disk_the_partition_and_the_new_uuid() {
+        assert_eq!(
+            part_uuid_args(
+                Path::new("/dev/mmcblk2"),
+                2,
+                "9b7a1c3e-0000-4000-8000-000000000001"
+            ),
+            vec![
+                "--part-uuid".to_string(),
+                "/dev/mmcblk2".to_string(),
+                "2".to_string(),
+                "9b7a1c3e-0000-4000-8000-000000000001".to_string(),
+            ]
+        );
+    }
 
     #[cfg(feature = "gpt")]
     const GPT_DUMP: &str = "\

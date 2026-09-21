@@ -303,6 +303,9 @@ pub enum FlashError {
     #[error("Missing build-time constant: {0}")]
     MissingBuildConstant(&'static str),
 
+    #[error("Build-time constant {name} is unusable: {reason}")]
+    InvalidBuildConstant { name: &'static str, reason: String },
+
     #[error("Destination device {} is unusable: {reason}", device.display())]
     InvalidDestination { device: PathBuf, reason: String },
 
