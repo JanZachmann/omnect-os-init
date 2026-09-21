@@ -7,4 +7,8 @@
 
 pub mod config;
 #[cfg(feature = "flash-mode-1")]
+pub mod rawio;
+#[cfg(feature = "flash-mode-1")]
 pub mod sfdisk;
+#[cfg(feature = "flash-mode-1")]
+pub mod unmount;
