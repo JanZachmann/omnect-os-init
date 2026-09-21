@@ -8,7 +8,6 @@
 #[cfg(feature = "flash-mode-1")]
 pub mod clone;
 pub mod config;
-#[cfg(feature = "flash-mode-1")]
 pub mod efi;
 #[cfg(feature = "flash-mode-1")]
 pub mod rawio;
@@ -148,6 +147,10 @@ pub fn run(mut ctx: BootContext<'_>, flash_config: config::FlashConfig) -> crate
     persist_log(ctx.layout, &take_capture());
 
     outcome?;
+
+    // The run log is written after the sequence's own sync, and reboot(2) does
+    // not flush, so without this the log can be lost on the power off.
+    nix::unistd::sync();
 
     // reboot(2) returns Result<Infallible, _>, so the Ok side is uninhabited
     // and this let is irrefutable.

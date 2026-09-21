@@ -11,6 +11,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::error::FlashError;
+use crate::mode::flash::clone::CONST_DATA_SIZE;
 use crate::partition::layout::PARTITION_NUM_DATA;
 #[cfg(feature = "dos")]
 use crate::partition::layout::PARTITION_NUM_EXTENDED;
@@ -53,16 +54,32 @@ pub fn rewrite_dump(dump: &str, data_size_kb: u64) -> Result<String, FlashError>
         ))
     })?;
     let data_start = parse_field_u64(&lines[data_idx], START_FIELD)?;
-    let data_sectors = data_size_kb * SECTORS_PER_KB;
+    let unusable_data_size = |what: &str| FlashError::InvalidBuildConstant {
+        name: CONST_DATA_SIZE,
+        reason: format!("{data_size_kb} KB does not fit {what}"),
+    };
+    let data_sectors = data_size_kb
+        .checked_mul(SECTORS_PER_KB)
+        .ok_or_else(|| unusable_data_size("a sector count"))?;
+    let data_bytes = data_sectors
+        .checked_mul(SECTOR_SIZE)
+        .ok_or_else(|| unusable_data_size("a byte count"))?;
 
     log::info!(
-        "Resetting the data partition to its shipped size: {data_sectors} sectors ({} bytes)",
-        data_sectors * SECTOR_SIZE
+        "Resetting the data partition to its shipped size: {data_sectors} sectors ({data_bytes} bytes)"
     );
 
     lines[data_idx] = set_field_u64(&lines[data_idx], SIZE_FIELD, data_sectors)?;
 
     rewrite_layout_specific(&mut lines, data_start, data_sectors)?;
+
+    // The table about to be applied is the most useful thing in the
+    // post-mortem of a failed apply. One record per line, because a multi-line
+    // record reaches `/dev/kmsg` as a single write with embedded newlines.
+    log::info!("rewritten partition table for the destination:");
+    for line in &lines {
+        log::info!("{line}");
+    }
 
     let mut out = lines.join("\n");
     out.push('\n');
@@ -97,51 +114,51 @@ pub fn dump(device: &Path) -> Result<String, FlashError> {
 
 /// Apply a rewritten dump to `device` by piping it into `sfdisk`.
 pub fn apply(device: &Path, dump: &str) -> Result<(), FlashError> {
+    let apply_failed = |reason: String| FlashError::PartitionTable {
+        device: device.to_path_buf(),
+        operation: SFDISK_OPERATION_APPLY.to_string(),
+        reason,
+    };
+
     let mut child = Command::new(SFDISK_CMD)
         .arg(device)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| FlashError::PartitionTable {
-            device: device.to_path_buf(),
-            operation: SFDISK_OPERATION_APPLY.to_string(),
-            reason: format!("failed to spawn {SFDISK_CMD}: {e}"),
-        })?;
+        .map_err(|e| apply_failed(format!("failed to spawn {SFDISK_CMD}: {e}")))?;
 
-    child
+    let written = child
         .stdin
         .take()
-        .ok_or_else(|| FlashError::PartitionTable {
-            device: device.to_path_buf(),
-            operation: SFDISK_OPERATION_APPLY.to_string(),
-            reason: "failed to open stdin".to_string(),
-        })?
-        .write_all(dump.as_bytes())
-        .map_err(|e| FlashError::PartitionTable {
-            device: device.to_path_buf(),
-            operation: SFDISK_OPERATION_APPLY.to_string(),
-            reason: format!("failed to write the dump to {SFDISK_CMD}: {e}"),
-        })?;
+        .ok_or_else(|| "failed to open stdin".to_string())
+        .and_then(|mut stdin| {
+            stdin
+                .write_all(dump.as_bytes())
+                .map_err(|e| format!("failed to write the dump to {SFDISK_CMD}: {e}"))
+        });
 
+    // Reaped on both paths: a dump sfdisk rejects makes it exit before the
+    // write completes, so the write reports a broken pipe while the message
+    // saying what is wrong with the table is on the child's stderr. This is
+    // the first destructive step, and after a power off the persisted log is
+    // the only post-mortem left.
     let output = child
         .wait_with_output()
-        .map_err(|e| FlashError::PartitionTable {
-            device: device.to_path_buf(),
-            operation: SFDISK_OPERATION_APPLY.to_string(),
-            reason: format!("failed to wait for {SFDISK_CMD}: {e}"),
-        })?;
+        .map_err(|e| apply_failed(format!("failed to wait for {SFDISK_CMD}: {e}")))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if let Err(reason) = written {
+        return Err(apply_failed(format!(
+            "{reason}; {SFDISK_CMD} said: {stderr}"
+        )));
+    }
 
     if !output.status.success() {
-        return Err(FlashError::PartitionTable {
-            device: device.to_path_buf(),
-            operation: SFDISK_OPERATION_APPLY.to_string(),
-            reason: format!(
-                "{SFDISK_CMD} failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        });
+        return Err(apply_failed(format!(
+            "{SFDISK_CMD} failed ({}): {stderr}",
+            output.status
+        )));
     }
 
     Ok(())
@@ -221,12 +238,21 @@ fn rewrite_layout_specific(
         ))
     })?;
     let extended_start = parse_field_u64(&lines[extended_idx], START_FIELD)?;
-    let new_size = data_start.checked_sub(extended_start).ok_or_else(|| {
-        FlashError::MalformedDump(format!(
-            "extended container starts after the data partition: {}",
-            lines[extended_idx]
-        ))
-    })? + data_sectors;
+    let new_size = data_start
+        .checked_sub(extended_start)
+        .ok_or_else(|| {
+            FlashError::MalformedDump(format!(
+                "extended container starts after the data partition: {}",
+                lines[extended_idx]
+            ))
+        })?
+        .checked_add(data_sectors)
+        .ok_or_else(|| {
+            FlashError::MalformedDump(format!(
+                "data partition of {data_sectors} sectors starting at {data_start} \
+                 computes an invalid extended-container size"
+            ))
+        })?;
     lines[extended_idx] = set_field_u64(&lines[extended_idx], SIZE_FIELD, new_size)?;
     Ok(())
 }

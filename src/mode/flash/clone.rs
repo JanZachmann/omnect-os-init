@@ -1,10 +1,15 @@
 //! Flash mode 1: clone the running disk onto a second block device.
 //!
-//! The sequence is destructive on the destination and never writes the
-//! source, so a failure costs the clone and nothing else. The clone leaves
-//! the destination in the state a freshly flashed image has: a shipped-size
-//! data partition, empty `etc` and `data` filesystems, and a default
-//! bootloader environment.
+//! The sequence is destructive on the destination only, so a failure costs the
+//! clone and nothing else. The clone leaves the destination in the state a
+//! freshly flashed image has: a shipped-size data partition, empty `etc` and
+//! `data` filesystems, and a default bootloader environment.
+//!
+//! There is no destructive write to the source, but three deliberate writes do
+//! reach it, each required and each matching the legacy scripts: clearing the
+//! flash triggers in the source bootloader environment, mounting the source
+//! `data` partition read-write to persist the run log, and, on an EFI machine,
+//! rewriting the running machine's NVRAM boot entries.
 
 use std::fs;
 use std::os::unix::fs::FileTypeExt;
@@ -51,7 +56,9 @@ const BOOT_ENV_MOUNT_POINT: &str = "/tmp/clone-boot";
 #[cfg(feature = "uboot")]
 const UBOOT_ENV_SOURCE: &str = "/etc/omnect/uboot-env.bin";
 
-const CONST_DATA_SIZE: &str = "DATA_SIZE";
+/// Also used by `sfdisk`, which names this constant when the size it carries
+/// cannot be scaled into a sector or byte count.
+pub(crate) const CONST_DATA_SIZE: &str = "DATA_SIZE";
 const CONST_BOOTLOADER_START: &str = "BOOTLOADER_START";
 const CONST_UBOOT_ENV1_START: &str = "UBOOT_ENV1_START";
 #[cfg(feature = "uboot")]
@@ -108,13 +115,19 @@ pub fn required_constants() -> Result<Constants, FlashError> {
     let data_size = build::DATA_SIZE.ok_or(FlashError::MissingBuildConstant(CONST_DATA_SIZE))?;
 
     #[cfg(feature = "uboot")]
+    if build::UBOOT_ENV_SIZE.is_none() {
+        return Err(FlashError::MissingBuildConstant(CONST_UBOOT_ENV_SIZE));
+    }
+
+    // Two independent conditions make the offset mandatory: U-Boot keeps its
+    // environment there, and a machine reserving a bootloader area needs it as
+    // that area's end. Both are checked here rather than where the area is
+    // copied, so a build missing the constant fails before the destination has
+    // been repartitioned.
+    if (cfg!(feature = "uboot") || build::BOOTLOADER_START.is_some())
+        && build::UBOOT_ENV1_START.is_none()
     {
-        if build::UBOOT_ENV1_START.is_none() {
-            return Err(FlashError::MissingBuildConstant(CONST_UBOOT_ENV1_START));
-        }
-        if build::UBOOT_ENV_SIZE.is_none() {
-            return Err(FlashError::MissingBuildConstant(CONST_UBOOT_ENV_SIZE));
-        }
+        return Err(FlashError::MissingBuildConstant(CONST_UBOOT_ENV1_START));
     }
 
     Ok(Constants {
@@ -223,6 +236,11 @@ pub fn validate_destination_path(destination: &Path, source: &Path) -> Result<()
 
 /// Everything `validate_destination_path` refuses, plus a destination that is
 /// not a block device.
+///
+/// The path checks are repeated rather than assumed: before the device wait
+/// they can only compare the spellings, because `canonicalize` fails on a node
+/// that does not exist yet. Run here, on a destination the wait has seen, they
+/// resolve for real.
 pub fn validate_destination(destination: &Path, source: &Path) -> Result<(), FlashError> {
     validate_destination_path(destination, source)?;
 
@@ -441,19 +459,28 @@ fn write_boot_env(constants: &Constants, destination: &Path) -> Result<(), Flash
 pub fn run_clone(ctx: &CloneCtx<'_>) -> Result<(), FlashError> {
     let constants = required_constants()?;
     let source = ctx.layout.device.base.as_path();
-    let destination = ctx.destination;
 
     log::info!(
         "flash mode 1: cloning {} onto {}",
         source.display(),
-        destination.display()
+        ctx.destination.display()
     );
 
-    // Ahead of the wait: an unset or source-owned destination is a
-    // misconfiguration the operator should hear about at once, not after the
-    // full timeout has run down.
-    validate_destination_path(destination, source)?;
-    wait_for_block_device(destination, DEST_DEVICE_WAIT)?;
+    // Ahead of the wait, and on the value as given: an unset or source-owned
+    // destination is a misconfiguration the operator should hear about at
+    // once, not after the full timeout has run down.
+    validate_destination_path(ctx.destination, source)?;
+    wait_for_block_device(ctx.destination, DEST_DEVICE_WAIT)?;
+
+    // The single point of resolution, and it belongs here: `canonicalize`
+    // needs the node to exist, so an alias can only be resolved once the wait
+    // has seen it. Everything below addresses the destination by the resolved
+    // path, because `destination_partition` appends a partition index to it
+    // and an alias such as a by-id link names no partition of its own.
+    let destination = resolve(ctx.destination);
+    let destination = destination.as_path();
+    log::info!("destination resolved to {}", destination.display());
+
     validate_destination(destination, source)?;
 
     // `e2image` below must not read a mounted filesystem, and the raw boot

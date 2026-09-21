@@ -4,6 +4,12 @@
 //! moment it finishes. Turning the capture on lets the mode write the whole run
 //! to a disk it did not touch, which is the only post-mortem a failed flash
 //! leaves behind.
+//!
+//! The design assumes a single execution stream: nothing in the crate spawns a
+//! thread, and a mode's `run` calls `start_capture` and `take_capture` once
+//! each. That is what makes the `Relaxed` flag enough — introducing a thread
+//! would need the ordering between the flag and the buffer behind it to be
+//! reconsidered.
 
 use std::cmp::Ordering;
 use std::sync::Mutex;
