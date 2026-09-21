@@ -80,8 +80,14 @@ impl Log for KmsgLogger {
         let prefix = Self::level_to_kernel_prefix(record.level());
         let message = format!("{}{}{}\n", prefix, LOG_PREFIX, record.args());
 
-        let mut kmsg = self.kmsg.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = kmsg.write_all(message.as_bytes());
+        {
+            let mut kmsg = self.kmsg.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = kmsg.write_all(message.as_bytes());
+        }
+
+        // Additive: a mode that asked for a capture gets a copy, everything
+        // else sees the kmsg write above and nothing more.
+        crate::logging::capture_record(record);
     }
 
     fn flush(&self) {
