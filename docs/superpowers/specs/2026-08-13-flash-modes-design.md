@@ -447,8 +447,8 @@ partitions.
 Log persistence and the terminal action sit in `mod.rs`, around this sequence,
 not inside it: the log is written whether the sequence succeeded or failed, and
 `poweroff` follows only on success (§8.1, §8.3). A second `sync` runs there
-after the log write, because `reboot(2)` does not flush and step 15 is already
-behind it. This mirrors the legacy split
+after the log write, because `reboot(2)` does not flush and step 15 runs before
+the log is written. This mirrors the legacy split
 between `run_flash_mode_1` and `flash_mode_1_run`.
 
 ### 4.2 Partition-table dump rewriting
