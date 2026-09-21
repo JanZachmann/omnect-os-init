@@ -90,6 +90,11 @@ pub fn copy_range(
         let mut written = 0;
         while written < n {
             match dst_file.write(&buf[written..n]) {
+                Ok(0) => {
+                    return Err(copy_failed(format!(
+                        "destination stopped accepting data after {written} of {n} bytes in this chunk"
+                    )));
+                }
                 Ok(w) => written += w,
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(copy_failed(format!("writing destination: {e}"))),
