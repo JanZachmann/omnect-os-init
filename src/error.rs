@@ -86,6 +86,7 @@ impl InitramfsError {
             Self::FactoryReset(
                 FactoryResetError::InvalidConfig(_)
                 | FactoryResetError::MissingField(_)
+                | FactoryResetError::InvalidPreserve(_)
                 | FactoryResetError::BackupFailed { .. }
                 | FactoryResetError::RestoreFailed { .. }
                 | FactoryResetError::ReformatFailed { .. }
@@ -261,6 +262,9 @@ pub enum FactoryResetError {
 
     #[error("Missing field in factory-reset config: {0}")]
     MissingField(String),
+
+    #[error("Invalid preserve list: {0}")]
+    InvalidPreserve(String),
 
     #[error("Backup failed for {}: {reason}", path.display())]
     BackupFailed { path: PathBuf, reason: String },

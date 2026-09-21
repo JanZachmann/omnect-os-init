@@ -13,7 +13,7 @@ use crate::{
         FsType, MountOptions, PartitionMountSpec, mount_points, mount_tracked_partition, paths,
         setup_data_overlay_tracked, setup_etc_overlay_tracked, unmount_tracked,
     },
-    mode::{BootContext, factory_reset::backup_restore::RestoreResult},
+    mode::{BootContext, FactoryResetTrigger, factory_reset::backup_restore::RestoreResult},
     partition::{PartitionLayout, PartitionName},
     runtime::{FactoryResetStatus, FactoryResetStatusCode, OdsStatus},
 };
@@ -38,7 +38,10 @@ const ETC_PARTITION_LABEL: &str = "etc";
 ///
 /// Clears the trigger env var, runs the reset sequence, writes status to
 /// `ods_status`, and always delegates to Normal boot — never blocks the device.
-pub fn run(mut ctx: BootContext<'_>, config: FactoryResetConfig) -> Result<()> {
+/// A trigger that could not be parsed skips the sequence and is reported as
+/// the failure it is; clearing it still happens, so it is answered once
+/// instead of on every boot.
+pub fn run(mut ctx: BootContext<'_>, trigger: FactoryResetTrigger) -> Result<()> {
     // Failing to clear the trigger (set_env) is non-fatal — log and continue with the reset.
     // If set_env consistently fails the trigger persists and the reset will
     // repeat on every boot until set_env succeeds. This is the accepted
@@ -49,26 +52,37 @@ pub fn run(mut ctx: BootContext<'_>, config: FactoryResetConfig) -> Result<()> {
         warn!("Failed to clear factory-reset bootloader var: {e}; proceeding anyway");
     }
 
-    let (status, signal) = match run_reset(ctx.layout, ctx.rootfs, &config, &mut ctx.ods_status) {
-        Ok(pair) => pair,
-        Err(e) => {
-            warn!("Factory reset failed: {e}; continuing with Normal boot");
-            (
-                FactoryResetStatus {
-                    status: failure_status_code(&e),
-                    error: Some(e.to_string()),
-                    context: None,
-                    paths: vec![],
-                    data_wiped: false,
-                },
-                None,
-            )
+    let (status, signal) = match trigger {
+        FactoryResetTrigger::Rejected(e) => {
+            warn!("Factory reset not started: {e}; continuing with Normal boot");
+            (aborted_status(&e), None)
+        }
+        FactoryResetTrigger::Accepted(config) => {
+            match run_reset(ctx.layout, ctx.rootfs, &config, &mut ctx.ods_status) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!("Factory reset failed: {e}; continuing with Normal boot");
+                    (aborted_status(&e), None)
+                }
+            }
         }
     };
     persist_exhausted_signal(signal.as_ref(), &mut ctx.boot_env);
     ctx.ods_status.set_factory_reset(status);
 
     crate::mode::normal::run(ctx)
+}
+
+/// Status for a reset that never reached the destructive phase: nothing was
+/// touched, so `data_wiped` is false and no path was preserved.
+fn aborted_status(e: &InitramfsError) -> FactoryResetStatus {
+    FactoryResetStatus {
+        status: failure_status_code(e),
+        error: Some(e.to_string()),
+        context: None,
+        paths: vec![],
+        data_wiped: false,
+    }
 }
 
 /// Best-effort write of the unrecoverable-failure signal to the bootloader env,
@@ -359,9 +373,9 @@ fn failure_status_code(e: &InitramfsError) -> FactoryResetStatusCode {
         InitramfsError::FactoryReset(FactoryResetError::InvalidConfig(_)) => {
             FactoryResetStatusCode::Invalid
         }
-        InitramfsError::FactoryReset(FactoryResetError::MissingField(_)) => {
-            FactoryResetStatusCode::ConfigError
-        }
+        InitramfsError::FactoryReset(
+            FactoryResetError::MissingField(_) | FactoryResetError::InvalidPreserve(_),
+        ) => FactoryResetStatusCode::ConfigError,
         _ => FactoryResetStatusCode::Error,
     }
 }
@@ -981,6 +995,69 @@ mod tests {
             let error = status.error.expect("error");
             assert!(error.contains("mkfs failed twice"), "{error}");
             assert!(error.contains("cp failed"), "{error}");
+        }
+    }
+
+    #[cfg(feature = "factory-reset")]
+    mod trigger_status_tests {
+        use super::*;
+        use crate::mode::factory_reset::config::ResetMode;
+
+        fn status_of(trigger: &str) -> FactoryResetStatus {
+            let e = FactoryResetConfig::parse(trigger).expect_err("trigger must be rejected");
+            aborted_status(&e)
+        }
+
+        #[test]
+        fn a_trigger_without_a_usable_mode_is_invalid() {
+            // No mode at all, a mode that is not a number, an unsupported one,
+            // and json that does not even parse — none of them names a reset
+            // the init could run.
+            for trigger in [
+                r#"{ mode: "1""#,
+                "{}",
+                r#"{"preserve":[]}"#,
+                r#"{"mode":"1","preserve":[]}"#,
+                r#"{"mode":5,"preserve":[]}"#,
+            ] {
+                assert_eq!(
+                    status_of(trigger).status,
+                    FactoryResetStatusCode::Invalid,
+                    "{trigger}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_trigger_with_an_unusable_preserve_is_a_config_error() {
+            for trigger in [
+                r#"{"mode":1}"#,
+                r#"{"mode":1,"pre":["ignored"]}"#,
+                r#"{"mode":1,"preserve":""}"#,
+                r#"{"mode":1,"preserve":[1]}"#,
+            ] {
+                assert_eq!(
+                    status_of(trigger).status,
+                    FactoryResetStatusCode::ConfigError,
+                    "{trigger}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_rejected_trigger_reports_that_nothing_was_touched() {
+            let status = status_of("{}");
+            assert!(!status.data_wiped);
+            assert!(status.paths.is_empty());
+            assert!(status.error.is_some(), "an Error status needs a reason");
+            assert_eq!(status.context, None);
+        }
+
+        #[test]
+        fn a_usable_trigger_parses() {
+            let config = FactoryResetConfig::parse(r#"{"mode":1,"preserve":[]}"#).unwrap();
+            assert_eq!(config.mode, ResetMode::Mode1);
+            assert!(config.preserve.is_empty());
         }
     }
 

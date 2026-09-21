@@ -59,14 +59,26 @@ of failing with status 1, and a mode-4 trigger is rejected as `Invalid`
 (status 1). ODS and omnect-ui drop `Mode4` from their mode type, so the value
 can no longer be sent from the cloud or the local UI — see section 4.
 
+**Correction (2026-09-21).** When this section was written the init did not
+report a rejected trigger at all: a value it could not parse — a mode outside
+the accepted range included — only produced a kmsg warning, the boot
+continued as Normal, no `factory_reset` object was written, and the trigger
+kept its value, so the warning repeated on every following boot. A mode-4
+trigger therefore did not come back as `Invalid`; it came back as silence,
+which is worse for the caller and which the on-device tests catch. The init
+now reports every trigger it cannot use and clears it, which is what this
+section describes. The reported status follows the rule the shell
+implementation used: anything about `mode` is `Invalid` (status 1), an
+unusable `preserve` is `ConfigError` (status 3).
+
 ## 2. Component Changes
 
 ### 2.1 `src/mode/factory_reset/config.rs`
 
 - `ResetMode` gains `Mode2 = 2` and `Mode3 = 3`.
-- `TryFrom<u32>` accepts 1–3; everything else stays rejected (status
-  `Invalid`). Mode stays number-only: the trigger already carries the mode as
-  a number in the on-device tests.
+- `TryFrom<u32>` accepts 1–3; everything else is rejected and reported as
+  status `Invalid`, see the correction in 1.2. Mode stays number-only: the
+  trigger already carries the mode as a number in the on-device tests.
 
 ### 2.2 New: `src/mode/factory_reset/wipe.rs`
 
