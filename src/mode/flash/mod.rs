@@ -6,3 +6,5 @@
 //! leads to a normal boot attempt rather than an endless re-entry.
 
 pub mod config;
+#[cfg(feature = "flash-mode-1")]
+pub mod sfdisk;
