@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use log::Record;
 
@@ -18,8 +19,13 @@ use log::Record;
 /// that has already gone wrong.
 const CAPTURE_MAX_LINES: usize = 4096;
 
-/// `Some` while a mode is capturing. Never held across a call that logs, so the
-/// logger cannot deadlock on it.
+/// Whether a capture is running. Checked before the lock, so a boot that never
+/// captures pays one atomic load per record instead of a lock acquisition.
+static CAPTURING: AtomicBool = AtomicBool::new(false);
+
+/// `Some` while a mode is capturing. Held only around the push, never while a
+/// record is formatted, so a `Display` impl that logs cannot re-enter this and
+/// deadlock.
 static CAPTURE: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
 fn push_bounded(buffer: &mut Vec<String>, line: String) {
@@ -37,27 +43,42 @@ fn push_bounded(buffer: &mut Vec<String>, line: String) {
 /// Every failure path here is a silent return: a poisoned lock costs the log,
 /// and losing the log must never cost the boot.
 pub(crate) fn capture_record(record: &Record) {
+    if !CAPTURING.load(AtomicOrdering::Relaxed) {
+        return;
+    }
+
+    // Formatting runs the call site's Display impls, so it happens before the
+    // lock is taken. A capture taken in between only costs this one line.
+    let line = format!("[{}] {}", record.level(), record.args());
+
     let Ok(mut capture) = CAPTURE.lock() else {
         return;
     };
     let Some(buffer) = capture.as_mut() else {
         return;
     };
-    push_bounded(buffer, format!("[{}] {}", record.level(), record.args()));
+    push_bounded(buffer, line);
 }
 
 /// Begin capturing, discarding anything an earlier capture left behind.
-pub fn start_capture() {
+///
+/// A flash mode is the only caller, so a build without one carries the hook in
+/// `capture_record` and no way to switch it on.
+#[cfg(any(test, feature = "flash-mode"))]
+pub(crate) fn start_capture() {
     if let Ok(mut capture) = CAPTURE.lock() {
         *capture = Some(Vec::new());
+        // Last, so the flag is never true without a buffer behind it.
+        CAPTURING.store(true, AtomicOrdering::Relaxed);
     }
 }
 
 /// Stop capturing and hand back what was collected.
 ///
-/// Empty when no capture was running or the lock is poisoned — the caller
-/// persists what it gets and does not treat emptiness as an error.
-pub fn take_capture() -> Vec<String> {
+/// Empty when no capture was running or the lock is poisoned.
+#[cfg(any(test, feature = "flash-mode"))]
+pub(crate) fn take_capture() -> Vec<String> {
+    CAPTURING.store(false, AtomicOrdering::Relaxed);
     CAPTURE
         .lock()
         .ok()
@@ -99,6 +120,15 @@ mod tests {
             captured.contains(&"[INFO] cloning /dev/sda onto /dev/sdb".to_string()),
             "got {captured:?}"
         );
+    }
+
+    #[test]
+    fn a_cleared_flag_stops_the_capture_before_the_lock_is_reached() {
+        let _guard = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+        start_capture();
+        CAPTURING.store(false, AtomicOrdering::Relaxed);
+        log_at_info("must not be captured");
+        assert!(take_capture().is_empty());
     }
 
     #[test]

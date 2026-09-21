@@ -84,9 +84,9 @@ fn write_log(data_partition: &Path, lines: &[String]) -> Result<(), FlashError> 
 
 /// Persist the run log, best-effort.
 ///
-/// Mode 1 never writes the source disk, which makes this log the one record
-/// that survives a failed clone — but losing it must not change the outcome
-/// the operator already has on kmsg and the console.
+/// The clone sequence leaves the source disk untouched, which makes this log
+/// the one record that survives a failed clone — but losing it must not change
+/// the outcome the operator already has on kmsg and the console.
 fn persist_log(layout: &PartitionLayout, lines: &[String]) {
     // A run always logs its own outcome, so an empty capture means the capture
     // itself was lost. Writing the empty file anyway would leave the operator
@@ -128,16 +128,18 @@ fn run_selected_mode(
 /// takes over — a shell in the debug image, a log-and-halt loop in the release
 /// image.
 pub fn run(mut ctx: BootContext<'_>, flash_config: config::FlashConfig) -> crate::Result<()> {
+    // First line, so a failed trigger clear reaches the persisted log too: it
+    // means the mode may re-enter on the next boot, which the operator has to
+    // learn from the post-mortem. kmsg is gone after the power off, which
+    // leaves the file on the source disk as the only record of the run.
+    start_capture();
+
     // Before any work: a crash mid-flash must lead to a normal boot attempt
     // rather than an endless re-entry.
     if let Some(bl) = ctx.boot_env.available_mut() {
         clear_flash_triggers(bl);
     }
 
-    // Every line the sequence logs is kept from here on, so the file on the
-    // source disk holds the whole run and not just its outcome. kmsg is gone
-    // after the power off, which leaves that file as the only post-mortem.
-    start_capture();
     let outcome = run_selected_mode(&flash_config, &ctx);
     match &outcome {
         Ok(()) => log::info!("flash mode finished"),
