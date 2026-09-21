@@ -130,7 +130,8 @@ impl BootMode {
     ///
     /// A set `flash-mode` selects `Flash`; a set `factory-reset` selects
     /// `FactoryReset`, whether or not its value can be used — an unusable one
-    /// as `FactoryResetTrigger::Rejected`, so it is cleared and reported.
+    /// is carried as `FactoryResetTrigger::Rejected`, so it is cleared and
+    /// reported.
     /// Both triggers at once is refused — they act on different disks and
     /// single-mode dispatch cannot perform both, so dropping one silently would
     /// be the worse failure. Both triggers are cleared before that refusal is

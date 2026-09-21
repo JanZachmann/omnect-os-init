@@ -295,8 +295,7 @@ pub enum FactoryResetError {
 /// Errors during a flash mode.
 ///
 /// Every variant is fatal: a flash either completes or leaves the operator to
-/// power-cycle. Mode 1 never writes the source disk, so a failure there costs
-/// nothing but the clone.
+/// power-cycle.
 #[cfg(feature = "flash-mode")]
 #[derive(Error, Debug)]
 pub enum FlashError {
