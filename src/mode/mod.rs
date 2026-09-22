@@ -47,7 +47,7 @@ impl<'a> BootContext<'a> {
 #[cfg(feature = "factory-reset")]
 pub enum FactoryResetTrigger {
     Accepted(factory_reset::config::FactoryResetConfig),
-    Rejected(crate::error::InitramfsError),
+    Rejected(crate::error::FactoryResetError),
 }
 
 /// The detected boot mode to execute.
@@ -67,6 +67,11 @@ impl BootMode {
         #[cfg(feature = "factory-reset")]
         if let Some(bl) = _bl {
             match bl.get_env(BootEnvKey::FactoryReset) {
+                // GRUB reports a key set to an empty value as `Some("")` where
+                // U-Boot reports `None`. The shell init cleared the trigger by
+                // writing an empty string, so a device coming from it carries
+                // one; that is not a request to reset.
+                Ok(Some(json)) if json.trim().is_empty() => {}
                 Ok(Some(json)) => match factory_reset::config::FactoryResetConfig::parse(&json) {
                     Ok(config) => {
                         return Ok(Self::FactoryReset(FactoryResetTrigger::Accepted(config)));
@@ -150,6 +155,20 @@ mod tests {
                         BootMode::FactoryReset(FactoryResetTrigger::Rejected(_))
                     ),
                     "trigger {trigger} must be rejected, not ignored"
+                );
+            }
+        }
+
+        #[test]
+        fn detect_normal_when_the_trigger_is_blank() {
+            // the shell init cleared the trigger by writing an empty string,
+            // and GRUB reports that as Some("")
+            for trigger in ["", " ", "\n"] {
+                let mock = create_mock_bootloader().with_env(BootEnvKey::FactoryReset, trigger);
+                let mode = BootMode::detect(Some(&mock)).unwrap();
+                assert!(
+                    matches!(mode, BootMode::Normal),
+                    "a blank trigger must not start a reset: {trigger:?}"
                 );
             }
         }

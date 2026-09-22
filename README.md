@@ -160,8 +160,9 @@ including degraded boot.
 **Notes on factory reset (`FRESET` block)**
 
 Enabled by the `factory-reset` feature. `BootMode::detect()` reads the `factory-reset`
-bootloader env key; any present value dispatches to `mode::factory_reset::run()` instead of
-`mode::normal::run()`. A value the init cannot use is cleared and reported there — status 1
+bootloader env key; any non-blank value dispatches to `mode::factory_reset::run()` instead of
+`mode::normal::run()`. A blank value is not a request to reset — GRUB reports a key set to an
+empty value as a present one, and the shell init cleared the key that way. A value the init cannot use is cleared and reported there — status 1
 when it does not name a mode the init can run, unparsable json included, status 3 when the
 problem is `preserve` — rather than booting on
 in silence, which would leave the caller waiting for a result forever. The reset sequence (mount → backup → wipe → reformat →

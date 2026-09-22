@@ -53,6 +53,7 @@ pub fn run(mut ctx: BootContext<'_>, trigger: FactoryResetTrigger) -> Result<()>
 
     let (status, signal) = match trigger {
         FactoryResetTrigger::Rejected(e) => {
+            let e: InitramfsError = e.into();
             warn!("Factory reset not started: {e}; continuing with Normal boot");
             (aborted_status(&e), None)
         }
@@ -160,18 +161,18 @@ fn run_reset(
 
 /// Injectable abstraction over the wipe side effects, see `ReformatRetryOps`.
 trait WipeOps {
-    fn wipe_random(&mut self, device: &Path) -> Result<()>;
-    fn wipe_discard(&mut self, device: &Path) -> Result<()>;
+    fn wipe_random(&mut self, device: &Path) -> std::result::Result<(), FactoryResetError>;
+    fn wipe_discard(&mut self, device: &Path) -> std::result::Result<(), FactoryResetError>;
 }
 
 struct RealWipeOps;
 
 impl WipeOps for RealWipeOps {
-    fn wipe_random(&mut self, device: &Path) -> Result<()> {
+    fn wipe_random(&mut self, device: &Path) -> std::result::Result<(), FactoryResetError> {
         wipe_random(device)
     }
 
-    fn wipe_discard(&mut self, device: &Path) -> Result<()> {
+    fn wipe_discard(&mut self, device: &Path) -> std::result::Result<(), FactoryResetError> {
         wipe_discard(device)
     }
 }
@@ -185,25 +186,21 @@ fn wipe_partitions(
     etc_dev: &Path,
     ops: &mut dyn WipeOps,
 ) -> Option<String> {
+    type Wipe = fn(&mut dyn WipeOps, &Path) -> std::result::Result<(), FactoryResetError>;
+    let wipe: Wipe = match mode {
+        ResetMode::Mode1 => return None,
+        ResetMode::Mode2 => |ops, device| ops.wipe_random(device),
+        ResetMode::Mode3 => |ops, device| ops.wipe_discard(device),
+    };
+
     let mut notes: Vec<String> = Vec::new();
     for (partition, device) in [
         (PartitionName::Etc, etc_dev),
         (PartitionName::Data, data_dev),
     ] {
-        let wiped = match mode {
-            ResetMode::Mode1 => return None,
-            ResetMode::Mode2 => ops.wipe_random(device),
-            ResetMode::Mode3 => ops.wipe_discard(device),
-        };
-        if let Err(e) = wiped {
+        if let Err(e) = wipe(ops, device) {
             warn!("factory reset: wipe of {partition} failed; continuing: {e}");
-            // Drop the outer "Factory reset error:" prefix, the note already
-            // sits in the factory-reset result.
-            let reason = match e {
-                InitramfsError::FactoryReset(inner) => inner.to_string(),
-                other => other.to_string(),
-            };
-            notes.push(format!("{partition}: {reason}"));
+            notes.push(format!("{partition}: {e}"));
         }
     }
 
@@ -1091,25 +1088,31 @@ mod tests {
                 }
             }
 
-            fn record(&mut self, kind: &'static str, device: &Path) -> Result<()> {
+            fn record(
+                &mut self,
+                kind: &'static str,
+                device: &Path,
+            ) -> std::result::Result<(), FactoryResetError> {
                 self.calls.push((kind, device.to_path_buf()));
                 if self.fail.iter().any(|d| d == device) {
                     return Err(FactoryResetError::WipeFailed {
                         device: device.to_path_buf(),
                         reason: "no discard support".into(),
-                    }
-                    .into());
+                    });
                 }
                 Ok(())
             }
         }
 
         impl WipeOps for ScriptedWipeOps {
-            fn wipe_random(&mut self, device: &Path) -> Result<()> {
+            fn wipe_random(&mut self, device: &Path) -> std::result::Result<(), FactoryResetError> {
                 self.record("random", device)
             }
 
-            fn wipe_discard(&mut self, device: &Path) -> Result<()> {
+            fn wipe_discard(
+                &mut self,
+                device: &Path,
+            ) -> std::result::Result<(), FactoryResetError> {
                 self.record("discard", device)
             }
         }
@@ -1253,7 +1256,7 @@ mod tests {
             else {
                 panic!("trigger must be rejected: {trigger}");
             };
-            aborted_status(&e)
+            aborted_status(&e.into())
         }
 
         #[test]

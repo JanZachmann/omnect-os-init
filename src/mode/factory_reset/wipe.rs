@@ -1,9 +1,12 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-use crate::error::{FactoryResetError, InitramfsError, Result};
+use crate::error::FactoryResetError;
+
+type WipeResult<T> = std::result::Result<T, FactoryResetError>;
 
 const WIPE_CHUNK_SIZE: usize = 1024 * 1024;
 const WIPE_PROGRESS_INTERVAL: u64 = 1024 * 1024 * 1024;
@@ -21,16 +24,15 @@ nix::ioctl_write_ptr_bad!(
     [u64; 2]
 );
 
-fn wipe_failed(device: &Path, reason: impl std::fmt::Display) -> InitramfsError {
+fn wipe_failed(device: &Path, reason: impl std::fmt::Display) -> FactoryResetError {
     FactoryResetError::WipeFailed {
         device: device.to_path_buf(),
         reason: reason.to_string(),
     }
-    .into()
 }
 
 /// Overwrite `device` with random data — factory-reset mode 2.
-pub fn wipe_random(device: &Path) -> Result<()> {
+pub fn wipe_random(device: &Path) -> WipeResult<()> {
     let mut file = open_device(device)?;
     let len = device_size(device, &file)?;
 
@@ -44,7 +46,7 @@ pub fn wipe_random(device: &Path) -> Result<()> {
 
 /// Discard every block of `device` — factory-reset mode 3. Fails on hardware
 /// without discard support.
-pub fn wipe_discard(device: &Path) -> Result<()> {
+pub fn wipe_discard(device: &Path) -> WipeResult<()> {
     let file = open_device(device)?;
     let len = device_size(device, &file)?;
 
@@ -61,14 +63,18 @@ pub fn wipe_discard(device: &Path) -> Result<()> {
     Ok(())
 }
 
-fn open_device(device: &Path) -> Result<File> {
+/// O_EXCL makes the kernel refuse a block device that is still mounted, so a
+/// wipe cannot run against a live filesystem even if a caller forgets to
+/// unmount first.
+fn open_device(device: &Path) -> WipeResult<File> {
     OpenOptions::new()
         .write(true)
+        .custom_flags(nix::libc::O_EXCL)
         .open(device)
         .map_err(|e| wipe_failed(device, format!("cannot open device: {e}")))
 }
 
-fn device_size(device: &Path, file: &File) -> Result<u64> {
+fn device_size(device: &Path, file: &File) -> WipeResult<u64> {
     let mut handle = file;
     let size = handle
         .seek(SeekFrom::End(0))
