@@ -180,6 +180,18 @@ mod tests {
     }
 
     #[test]
+    fn overwrite_propagates_a_write_failure() {
+        let file = filled(BLOCK_LEN);
+        // a read-only handle makes write_all fail; a loop that swallowed the
+        // error would report a wipe that never happened
+        let mut readonly = File::open(file.path()).unwrap();
+
+        overwrite_with_random(&mut readonly, BLOCK_LEN as u64, WIPE_PROGRESS_INTERVAL).unwrap_err();
+
+        assert_eq!(std::fs::read(file.path()).unwrap(), vec![FILLER; BLOCK_LEN]);
+    }
+
+    #[test]
     fn device_size_reports_the_length_and_rewinds() {
         let len = WIPE_CHUNK_SIZE + BLOCK_LEN;
         let file = filled(len);

@@ -42,10 +42,36 @@ const ETC_PARTITION_LABEL: &str = "etc";
 /// A trigger that could not be parsed skips the sequence and is reported as
 /// the failure it is.
 pub fn run(mut ctx: BootContext<'_>, trigger: FactoryResetTrigger) -> Result<()> {
+    let (layout, rootfs) = (ctx.layout, ctx.rootfs);
+    answer_trigger(
+        &mut ctx.boot_env,
+        &mut ctx.ods_status,
+        trigger,
+        |config, ods_status| run_reset(layout, rootfs, config, ods_status),
+    );
+
+    crate::mode::normal::run(ctx)
+}
+
+/// Clear the trigger, run `reset` when the trigger was usable, and record the
+/// outcome in `ods_status`.
+///
+/// Split from `run` so the answer a trigger gets is testable on its own: a
+/// trigger the init cannot use must still be cleared and reported, or the
+/// caller waits for a result while the same warning repeats on every boot.
+fn answer_trigger(
+    boot_env: &mut crate::bootloader::BootEnvState,
+    ods_status: &mut OdsStatus,
+    trigger: FactoryResetTrigger,
+    reset: impl FnOnce(
+        &FactoryResetConfig,
+        &mut OdsStatus,
+    ) -> Result<(FactoryResetStatus, Option<ResetFailureSignal>)>,
+) {
     // Failing to clear the trigger (set_env) is non-fatal — log and continue with the reset.
     // If set_env consistently fails the trigger persists and the reset will
     // repeat on every boot until set_env succeeds.
-    if let Some(bl) = ctx.boot_env.available_mut()
+    if let Some(bl) = boot_env.available_mut()
         && let Err(e) = bl.set_env(BootEnvKey::FactoryReset, None)
     {
         warn!("Failed to clear factory-reset bootloader var: {e}; proceeding anyway");
@@ -57,20 +83,16 @@ pub fn run(mut ctx: BootContext<'_>, trigger: FactoryResetTrigger) -> Result<()>
             warn!("Factory reset not started: {e}; continuing with Normal boot");
             (aborted_status(&e), None)
         }
-        FactoryResetTrigger::Accepted(config) => {
-            match run_reset(ctx.layout, ctx.rootfs, &config, &mut ctx.ods_status) {
-                Ok(pair) => pair,
-                Err(e) => {
-                    warn!("Factory reset failed: {e}; continuing with Normal boot");
-                    (aborted_status(&e), None)
-                }
+        FactoryResetTrigger::Accepted(config) => match reset(&config, ods_status) {
+            Ok(pair) => pair,
+            Err(e) => {
+                warn!("Factory reset failed: {e}; continuing with Normal boot");
+                (aborted_status(&e), None)
             }
-        }
+        },
     };
-    persist_exhausted_signal(signal.as_ref(), &mut ctx.boot_env);
-    ctx.ods_status.set_factory_reset(status);
-
-    crate::mode::normal::run(ctx)
+    persist_exhausted_signal(signal.as_ref(), boot_env);
+    ods_status.set_factory_reset(status);
 }
 
 /// Status for a reset that never reached the destructive phase: nothing was
@@ -137,26 +159,45 @@ fn run_reset(
         FactoryResetError::MountError("etc partition not found in layout".to_string())
     })?;
 
-    let wipe_note = wipe_partitions(config.mode, data_dev, etc_dev, &mut RealWipeOps);
-
-    let (status, signal) = match run_destructive_phase(
-        layout,
-        rootfs,
-        &mut mounts,
-        ods_status,
-        ReformatTargets {
-            data_dev,
-            etc_dev,
-            preserve_list: &preserve_list,
-            backed_up: &backed_up,
-            backup_dir: &backup_dir,
+    Ok(wipe_and_rebuild(
+        config.mode,
+        data_dev,
+        etc_dev,
+        &mut RealWipeOps,
+        || match run_destructive_phase(
+            layout,
+            rootfs,
+            &mut mounts,
+            ods_status,
+            ReformatTargets {
+                data_dev,
+                etc_dev,
+                preserve_list: &preserve_list,
+                backed_up: &backed_up,
+                backup_dir: &backup_dir,
+            },
+        ) {
+            Ok(pair) => pair,
+            Err(e) => (destructive_phase_failure_status(e, preserve_list), None),
         },
-    ) {
-        Ok(pair) => pair,
-        Err(e) => (destructive_phase_failure_status(e, preserve_list), None),
-    };
+    ))
+}
 
-    Ok((apply_wipe_note(status, wipe_note), signal))
+/// Wipe (modes 2 and 3), then rebuild — reformat, mount and restore.
+///
+/// Split from `run_reset` so the order and the folded-in wipe note are
+/// testable without block devices: the wipe has to run before the rebuild, and
+/// its failure has to reach the status whatever the rebuild reported.
+fn wipe_and_rebuild(
+    mode: ResetMode,
+    data_dev: &Path,
+    etc_dev: &Path,
+    wipe_ops: &mut dyn WipeOps,
+    rebuild: impl FnOnce() -> (FactoryResetStatus, Option<ResetFailureSignal>),
+) -> (FactoryResetStatus, Option<ResetFailureSignal>) {
+    let wipe_note = wipe_partitions(mode, data_dev, etc_dev, wipe_ops);
+    let (status, signal) = rebuild();
+    (apply_wipe_note(status, wipe_note), signal)
 }
 
 /// Injectable abstraction over the wipe side effects, see `ReformatRetryOps`.
@@ -1166,6 +1207,7 @@ mod tests {
                 ]
             );
             assert!(note.starts_with("etc: "), "{note}");
+            assert!(!note.contains("Factory reset error"), "{note}");
             assert!(note.contains(ETC_DEV), "{note}");
             assert!(!note.contains(DATA_DEV), "{note}");
         }
@@ -1224,6 +1266,112 @@ mod tests {
                 format!("data: wipe failed{CONTEXT_SEPARATOR}cp failed")
             );
             assert_eq!(status.context.as_deref(), Some("1 of 2 paths restored"));
+        }
+
+        /// Records the wipe calls and the rebuild in one list, so a test can
+        /// assert the order between them.
+        struct LoggingWipeOps {
+            log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+            fail: Vec<PathBuf>,
+        }
+
+        impl LoggingWipeOps {
+            fn record(
+                &mut self,
+                kind: &str,
+                device: &Path,
+            ) -> std::result::Result<(), FactoryResetError> {
+                self.log
+                    .borrow_mut()
+                    .push(format!("{kind} {}", device.display()));
+                if self.fail.iter().any(|d| d == device) {
+                    return Err(FactoryResetError::WipeFailed {
+                        device: device.to_path_buf(),
+                        reason: "no discard support".into(),
+                    });
+                }
+                Ok(())
+            }
+        }
+
+        impl WipeOps for LoggingWipeOps {
+            fn wipe_random(&mut self, device: &Path) -> std::result::Result<(), FactoryResetError> {
+                self.record("random", device)
+            }
+
+            fn wipe_discard(
+                &mut self,
+                device: &Path,
+            ) -> std::result::Result<(), FactoryResetError> {
+                self.record("discard", device)
+            }
+        }
+
+        /// Run the composition with a rebuild that logs itself and returns
+        /// `rebuilt`. Yields the resulting status and the full call order.
+        fn rebuild_after_wipe(
+            mode: ResetMode,
+            failing: &[&str],
+            rebuilt: FactoryResetStatus,
+        ) -> (FactoryResetStatus, Vec<String>) {
+            let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            let mut ops = LoggingWipeOps {
+                log: std::rc::Rc::clone(&log),
+                fail: failing.iter().map(PathBuf::from).collect(),
+            };
+            let rebuild_log = std::rc::Rc::clone(&log);
+            let (status, _) = wipe_and_rebuild(
+                mode,
+                Path::new(DATA_DEV),
+                Path::new(ETC_DEV),
+                &mut ops,
+                || {
+                    rebuild_log.borrow_mut().push("rebuild".to_string());
+                    (rebuilt, None)
+                },
+            );
+            let order = log.borrow().clone();
+            (status, order)
+        }
+
+        fn success() -> FactoryResetStatus {
+            restored_status(&[], &[], RestoreResult::Success, &["/p".to_string()])
+        }
+
+        #[test]
+        fn the_wipe_runs_before_the_rebuild() {
+            let (_, order) = rebuild_after_wipe(ResetMode::Mode2, &[], success());
+            assert_eq!(
+                order,
+                vec![
+                    format!("random {ETC_DEV}"),
+                    format!("random {DATA_DEV}"),
+                    "rebuild".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn mode1_rebuilds_without_wiping() {
+            let (status, order) = rebuild_after_wipe(ResetMode::Mode1, &[], success());
+            assert_eq!(order, vec!["rebuild".to_string()]);
+            assert_eq!(status.status, FactoryResetStatusCode::Success);
+        }
+
+        #[test]
+        fn a_wipe_failure_reaches_the_status_a_successful_rebuild_reported() {
+            let (status, order) = rebuild_after_wipe(ResetMode::Mode3, &[ETC_DEV], success());
+            assert_eq!(order.len(), 3, "both devices and the rebuild: {order:?}");
+            assert_eq!(status.status, FactoryResetStatusCode::Error);
+            assert!(
+                status
+                    .error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("etc: ")),
+                "{:?}",
+                status.error
+            );
+            assert!(status.data_wiped);
         }
 
         #[test]
@@ -1304,20 +1452,141 @@ mod tests {
         }
 
         #[test]
-        fn a_failed_wipe_is_an_error_status() {
-            let e: InitramfsError = FactoryResetError::WipeFailed {
-                device: PathBuf::from("/dev/sda7"),
-                reason: "no discard support".into(),
-            }
-            .into();
-            assert_eq!(failure_status_code(&e), FactoryResetStatusCode::Error);
-        }
-
-        #[test]
         fn a_usable_trigger_parses() {
             let config = FactoryResetConfig::parse(r#"{"mode":1,"preserve":[]}"#).unwrap();
             assert_eq!(config.mode, ResetMode::Mode1);
             assert!(config.preserve.is_empty());
+        }
+    }
+
+    #[cfg(feature = "factory-reset")]
+    mod answer_trigger_tests {
+        use super::*;
+        use crate::bootloader::{BootEnvKey, BootEnvState, MockBootEnv};
+        use crate::mode::factory_reset::config::ResetMode;
+
+        const TRIGGER: &str = r#"{"mode":1,"preserve":[]}"#;
+
+        fn env_holding_a_trigger() -> BootEnvState {
+            BootEnvState::Available(Box::new(
+                MockBootEnv::new().with_env(BootEnvKey::FactoryReset, TRIGGER),
+            ))
+        }
+
+        fn trigger_still_set(env: &BootEnvState) -> bool {
+            env.available()
+                .unwrap()
+                .get_env(BootEnvKey::FactoryReset)
+                .unwrap()
+                .is_some()
+        }
+
+        #[test]
+        fn a_rejected_trigger_is_cleared_and_reported_without_running_a_reset() {
+            let mut env = env_holding_a_trigger();
+            let mut ods = OdsStatus::new();
+
+            answer_trigger(
+                &mut env,
+                &mut ods,
+                FactoryResetTrigger::Rejected(FactoryResetError::InvalidConfig(
+                    "no mode".to_string(),
+                )),
+                |_, _| unreachable!("a rejected trigger must not start a reset"),
+            );
+
+            assert!(!trigger_still_set(&env), "the trigger must not survive");
+            let status = ods.factory_reset.expect("the caller needs an answer");
+            assert_eq!(status.status, FactoryResetStatusCode::Invalid);
+            assert!(status.error.is_some());
+            assert!(!status.data_wiped);
+        }
+
+        #[test]
+        fn an_accepted_trigger_is_cleared_and_its_outcome_recorded() {
+            let mut env = env_holding_a_trigger();
+            let mut ods = OdsStatus::new();
+
+            answer_trigger(
+                &mut env,
+                &mut ods,
+                FactoryResetTrigger::Accepted(FactoryResetConfig::parse(TRIGGER).unwrap()),
+                |config, _| {
+                    assert_eq!(config.mode, ResetMode::Mode1);
+                    Ok((
+                        restored_status(&[], &[], RestoreResult::Success, &["/p".to_string()]),
+                        None,
+                    ))
+                },
+            );
+
+            assert!(!trigger_still_set(&env));
+            let status = ods.factory_reset.expect("the caller needs an answer");
+            assert_eq!(status.status, FactoryResetStatusCode::Success);
+        }
+
+        #[test]
+        fn a_reset_that_failed_early_is_reported_as_a_safe_abort() {
+            let mut env = env_holding_a_trigger();
+            let mut ods = OdsStatus::new();
+
+            answer_trigger(
+                &mut env,
+                &mut ods,
+                FactoryResetTrigger::Accepted(FactoryResetConfig::parse(TRIGGER).unwrap()),
+                |_, _| Err(FactoryResetError::MountError("etc busy".to_string()).into()),
+            );
+
+            assert!(!trigger_still_set(&env));
+            let status = ods.factory_reset.expect("the caller needs an answer");
+            assert_eq!(status.status, FactoryResetStatusCode::Error);
+            assert!(!status.data_wiped);
+        }
+
+        #[test]
+        fn an_exhausted_reset_persists_its_signal() {
+            let mut env = env_holding_a_trigger();
+            let mut ods = OdsStatus::new();
+            let signal = ResetFailureSignal {
+                partition: PartitionName::Etc,
+                reason: "mkfs retry exhausted".into(),
+            };
+
+            answer_trigger(
+                &mut env,
+                &mut ods,
+                FactoryResetTrigger::Accepted(FactoryResetConfig::parse(TRIGGER).unwrap()),
+                |_, _| Ok(exhausted_outcome(signal, &[], &[])),
+            );
+
+            assert_eq!(
+                env.available()
+                    .unwrap()
+                    .get_env(BootEnvKey::FactoryResetLastError)
+                    .unwrap(),
+                Some("etc:mkfs retry exhausted".to_string())
+            );
+        }
+
+        #[test]
+        fn a_trigger_that_cannot_be_cleared_is_still_reported() {
+            // set_env failing must not swallow the answer; the reset repeats
+            // next boot, but the caller learns the outcome of this one.
+            let mut env =
+                BootEnvState::Available(Box::new(MockBootEnv::new().with_set_env_error()));
+            let mut ods = OdsStatus::new();
+
+            answer_trigger(
+                &mut env,
+                &mut ods,
+                FactoryResetTrigger::Rejected(FactoryResetError::MissingField(
+                    "no preserve".to_string(),
+                )),
+                |_, _| unreachable!("a rejected trigger must not start a reset"),
+            );
+
+            let status = ods.factory_reset.expect("the caller needs an answer");
+            assert_eq!(status.status, FactoryResetStatusCode::ConfigError);
         }
     }
 
