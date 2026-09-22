@@ -28,11 +28,10 @@ use crate::mode::factory_reset::{
 
 const FACTORY_RESET_BACKUP_DIR: &str = "/tmp/factory_reset/backup";
 
-/// Shared join separator for the retry note and restore partial-failure context.
+/// Shared join separator for every note that ends up in the factory-reset status.
 pub(crate) const CONTEXT_SEPARATOR: &str = ";";
 
-/// ext4 volume labels applied by `reformat_ext4`. These name the on-disk
-/// volume label; the `mount_points` constants name the mount location.
+/// ext4 volume labels applied by `reformat_ext4`.
 const DATA_PARTITION_LABEL: &str = "data";
 const ETC_PARTITION_LABEL: &str = "etc";
 
@@ -41,13 +40,11 @@ const ETC_PARTITION_LABEL: &str = "etc";
 /// Clears the trigger env var, runs the reset sequence, writes status to
 /// `ods_status`, and always delegates to Normal boot — never blocks the device.
 /// A trigger that could not be parsed skips the sequence and is reported as
-/// the failure it is; clearing it still happens, so it is answered once
-/// instead of on every boot.
+/// the failure it is.
 pub fn run(mut ctx: BootContext<'_>, trigger: FactoryResetTrigger) -> Result<()> {
     // Failing to clear the trigger (set_env) is non-fatal — log and continue with the reset.
     // If set_env consistently fails the trigger persists and the reset will
-    // repeat on every boot until set_env succeeds. This is the accepted
-    // trade-off per the error-handling table in the design spec.
+    // repeat on every boot until set_env succeeds.
     if let Some(bl) = ctx.boot_env.available_mut()
         && let Err(e) = bl.set_env(BootEnvKey::FactoryReset, None)
     {
@@ -161,8 +158,7 @@ fn run_reset(
     Ok((apply_wipe_note(status, wipe_note), signal))
 }
 
-/// Injectable abstraction over the wipe side effects, so the mode dispatch and
-/// the continue-on-failure control flow are unit-testable without block devices.
+/// Injectable abstraction over the wipe side effects, see `ReformatRetryOps`.
 trait WipeOps {
     fn wipe_random(&mut self, device: &Path) -> Result<()>;
     fn wipe_discard(&mut self, device: &Path) -> Result<()>;
@@ -180,11 +176,9 @@ impl WipeOps for RealWipeOps {
     }
 }
 
-/// Wipe `etc` and `data` for modes 2 and 3; mode 1 reformats without a wipe.
-///
 /// Never fails the reset: a failure on one device does not skip the other, and
 /// reformat + restore still run, so the device stays usable. The collected
-/// notes end up in the status `error` field, see `apply_wipe_note`.
+/// notes end up in the status `error` field.
 fn wipe_partitions(
     mode: ResetMode,
     data_dev: &Path,
@@ -203,8 +197,8 @@ fn wipe_partitions(
         };
         if let Err(e) = wiped {
             warn!("factory reset: wipe of {partition} failed; continuing: {e}");
-            // The note lands in the factory-reset result, so the outer
-            // "Factory reset error" wrapper would only repeat the obvious.
+            // Drop the outer "Factory reset error:" prefix, the note already
+            // sits in the factory-reset result.
             let reason = match e {
                 InitramfsError::FactoryReset(inner) => inner.to_string(),
                 other => other.to_string(),
@@ -219,8 +213,7 @@ fn wipe_partitions(
 /// Fold a wipe failure into the status the reformat/restore path produced.
 ///
 /// The caller asked for the data to be wiped and it was not, so the outcome is
-/// Error even when the rest of the reset succeeded. The note goes into `error`
-/// ahead of an existing message; `context` keeps the retry and restore notes.
+/// Error even when the rest of the reset succeeded.
 fn apply_wipe_note(status: FactoryResetStatus, wipe_note: Option<String>) -> FactoryResetStatus {
     let Some(note) = wipe_note else {
         return status;
@@ -290,10 +283,9 @@ fn mkfs_failed_note(reformat_failed: &[PartitionName]) -> String {
     format!("{}: mkfs failed twice", names.join(","))
 }
 
-/// Reformat + restore. `data` and/or `etc` may already be wiped — by the wipe
-/// step for modes 2 and 3, and by the first reformat here — and the tmpfs
-/// backup discarded. Callers must treat any `Err` from this function as
-/// data-loss, not a safe no-op abort.
+/// Reformat + restore. `data` and/or `etc` may already be wiped and the backup
+/// discarded. Callers must treat any `Err` from this function as data-loss, not
+/// a safe no-op abort.
 fn run_destructive_phase(
     layout: &PartitionLayout,
     rootfs: &Path,
@@ -443,10 +435,9 @@ fn destructive_phase_failure_status(e: InitramfsError, paths: Vec<String>) -> Fa
 }
 
 /// Status code for a reset that never reached the destructive phase, either
-/// because the trigger was unusable or because it failed before the first
-/// reformat. The config problems are distinguished so ODS/cloud can tell a bad
-/// request from a real failure. `RestoreFailed` cannot arrive here: `restore_all` accumulates
-/// per-path failures as `PartialFailure` and returns `Ok`.
+/// because the trigger was unusable or because it failed before the wipe. The
+/// config problems are distinguished so ODS/cloud can tell a bad request from a
+/// real failure.
 fn failure_status_code(e: &InitramfsError) -> FactoryResetStatusCode {
     match e {
         InitramfsError::FactoryReset(FactoryResetError::InvalidConfig(_)) => {
@@ -1267,7 +1258,6 @@ mod tests {
 
         #[test]
         fn a_trigger_without_a_usable_mode_is_invalid() {
-            // None of these names a reset the init could run.
             for trigger in [
                 r#"{ mode: "1""#,
                 "{}",

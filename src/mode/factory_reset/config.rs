@@ -15,9 +15,6 @@ const KEY_PRESERVE: &str = "preserve";
 /// Validated factory-reset mode. A value outside the supported range is
 /// rejected when the trigger is parsed, so an unsupported mode never reaches
 /// the reset sequence. The discriminant is the on-wire mode number.
-///
-/// `Mode1` reformats only. `Mode2` overwrites `etc` and `data` with random
-/// data before the reformat, `Mode3` discards all their blocks.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetMode {
@@ -47,11 +44,11 @@ pub struct FactoryResetConfig {
 impl FactoryResetConfig {
     /// Parse the trigger value read from the boot environment.
     ///
-    /// The error decides the reported status, so the two groups are kept
-    /// apart: anything about `mode` — unparsable json included, since then
-    /// there is no mode either — is `InvalidConfig` and reports `Invalid`,
-    /// while an unusable `preserve` reports `ConfigError`. `preserve` is
-    /// mandatory; an empty array is how a caller asks to keep nothing.
+    /// `mode` problems and `preserve` problems use different error variants
+    /// because they report different statuses; unparsable json counts as a
+    /// `mode` problem, since then there is no mode either. `preserve` is
+    /// mandatory; an empty array asks to keep nothing beyond the mandatory
+    /// path.
     pub fn parse(json: &str) -> Result<Self> {
         let trigger: Value = serde_json::from_str(json).map_err(|e| {
             FactoryResetError::InvalidConfig(format!("Failed to parse factory-reset JSON: {e}"))
@@ -85,9 +82,7 @@ impl FactoryResetConfig {
     }
 }
 
-/// Why a json value did not yield a list of strings. The caller turns this
-/// into its own error variant, since the same shape means `Invalid` for the
-/// trigger's mode-bearing object and `ConfigError` for a preserve list.
+/// Why a json value did not yield a list of strings.
 enum NotAStringArray {
     Missing,
     NotAnArray,

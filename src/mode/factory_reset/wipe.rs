@@ -5,10 +5,7 @@ use std::path::Path;
 
 use crate::error::{FactoryResetError, InitramfsError, Result};
 
-/// Chunk size for the mode-2 random overwrite.
 const WIPE_CHUNK_SIZE: usize = 1024 * 1024;
-
-/// Log and flush the mode-2 overwrite once per this many written bytes.
 const WIPE_PROGRESS_INTERVAL: u64 = 1024 * 1024 * 1024;
 
 const URANDOM_PATH: &str = "/dev/urandom";
@@ -71,8 +68,6 @@ fn open_device(device: &Path) -> Result<File> {
         .map_err(|e| wipe_failed(device, format!("cannot open device: {e}")))
 }
 
-/// Size of a block device: seeking to its end reports it, which keeps this
-/// testable against a temp file.
 fn device_size(device: &Path, file: &File) -> Result<u64> {
     let mut handle = file;
     let size = handle
@@ -85,9 +80,7 @@ fn device_size(device: &Path, file: &File) -> Result<u64> {
 /// Overwrite the first `len` bytes of `target` with data from `/dev/urandom`,
 /// syncing and logging every `progress_interval` bytes.
 ///
-/// Split from `wipe_random` so the loop can be tested against a temp file.
-/// The last chunk is clamped to the remaining length — a write past the end of
-/// a block device fails.
+/// Split from `wipe_random` so a test can set `progress_interval`.
 fn overwrite_with_random(
     target: &mut File,
     len: u64,
@@ -106,8 +99,8 @@ fn overwrite_with_random(
         written += chunk as u64;
 
         if written >= next_step {
-            // Flush at every step, so a power loss can expose the old content
-            // of at most one interval of already overwritten blocks.
+            // Flush every interval, so after a power loss at most one interval
+            // of blocks still holds the old content.
             target.sync_all()?;
             log::info!("wipe progress: {written}/{len} bytes");
             next_step = next_step.saturating_add(progress_interval);
@@ -116,8 +109,6 @@ fn overwrite_with_random(
     target.sync_all()
 }
 
-/// Bytes to write next: a whole chunk, or what is left of `len`.
-///
 /// Clamping happens in u64. Casting the remainder to `usize` first truncates
 /// on a 32-bit target, where a remainder that is a multiple of 4 GiB becomes a
 /// zero-length chunk the loop never gets past.
@@ -218,9 +209,6 @@ mod tests {
 
     #[test]
     fn wipe_random_writes_random_data_not_a_constant() {
-        // What mode 2 is for: the old content is replaced by something an
-        // attacker cannot predict. A loop that forgot to read /dev/urandom
-        // would still replace every byte — with zeros.
         let len = BLOCK_LEN;
         let first = filled(len);
         let second = filled(len);
@@ -244,8 +232,8 @@ mod tests {
 
     #[test]
     fn wipe_discard_reports_a_device_that_cannot_discard() {
-        // a regular file rejects the ioctl, which is the same path hardware
-        // without discard support takes
+        // a regular file gives ENOTTY, hardware without discard gives
+        // EOPNOTSUPP; only the mapping to WipeFailed is shared
         let file = filled(BLOCK_LEN);
 
         let err = wipe_discard(file.path()).unwrap_err();
@@ -272,6 +260,8 @@ mod tests {
 
     #[test]
     fn chunk_len_clamps_without_truncating() {
+        // usize is 64 bit on the host, so this cannot fail here — it documents
+        // the case. The 32-bit clippy run from the README is the real guard.
         for (len, written) in [
             (FOUR_GIB, 0),
             (FOUR_GIB + BLOCK_LEN as u64, BLOCK_LEN as u64),
