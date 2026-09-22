@@ -60,9 +60,10 @@ pub enum BootMode {
 impl BootMode {
     /// Detect the boot mode from the boot environment.
     ///
-    /// A set `factory-reset` bootloader env key returns `FactoryReset`, whether
-    /// or not its value can be used. Falls back to `Normal` when the env cannot
-    /// be read. Never blocks boot.
+    /// A `factory-reset` bootloader env key with a non-blank value returns
+    /// `FactoryReset`, whether or not that value can be used. A blank value and
+    /// an env that cannot be read both fall back to `Normal`. Never blocks
+    /// boot.
     pub fn detect(_bl: Option<&dyn BootEnv>) -> Result<Self> {
         #[cfg(feature = "factory-reset")]
         if let Some(bl) = _bl {

@@ -1,7 +1,7 @@
 # Factory Reset Modes 2 and 3 — Design
 
 **Date:** 2026-08-11
-**Status:** Implemented (PR #25)
+**Status:** In review (PR #25)
 
 ## 1. Overview
 
