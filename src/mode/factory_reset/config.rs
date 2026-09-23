@@ -15,9 +15,6 @@ const KEY_PRESERVE: &str = "preserve";
 /// Validated factory-reset mode. A value outside the supported range is
 /// rejected when the trigger is parsed, so an unsupported mode never reaches
 /// the reset sequence. The discriminant is the on-wire mode number.
-///
-/// `Mode1` reformats only. `Mode2` overwrites `etc` and `data` with random
-/// data before the reformat, `Mode3` discards all their blocks.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetMode {
@@ -47,23 +44,24 @@ pub struct FactoryResetConfig {
 impl FactoryResetConfig {
     /// Parse the trigger value read from the boot environment.
     ///
-    /// The error decides the reported status, so the two groups are kept
-    /// apart: anything about `mode` — unparsable json included, since then
-    /// there is no mode either — is `InvalidConfig` and reports `Invalid`,
-    /// while an unusable `preserve` reports `ConfigError`. `preserve` is
-    /// mandatory; an empty array is how a caller asks to keep nothing.
-    pub fn parse(json: &str) -> Result<Self> {
+    /// `mode` problems and `preserve` problems use different error variants
+    /// because they report different statuses; unparsable json counts as a
+    /// `mode` problem, since then there is no mode either. `preserve` is
+    /// mandatory; an empty array asks to keep nothing beyond the mandatory
+    /// path.
+    pub fn parse(json: &str) -> std::result::Result<Self, FactoryResetError> {
         let trigger: Value = serde_json::from_str(json).map_err(|e| {
             FactoryResetError::InvalidConfig(format!("Failed to parse factory-reset JSON: {e}"))
         })?;
 
-        let mode = trigger
-            .get(KEY_MODE)
-            .and_then(Value::as_u64)
-            .and_then(|mode| u32::try_from(mode).ok())
-            .ok_or_else(|| {
-                FactoryResetError::InvalidConfig(format!("no numeric '{KEY_MODE}' in the trigger"))
-            })?;
+        let mode = match trigger.get(KEY_MODE) {
+            None => Err(format!("the trigger has no '{KEY_MODE}'")),
+            Some(value) => value
+                .as_u64()
+                .and_then(|mode| u32::try_from(mode).ok())
+                .ok_or_else(|| format!("'{KEY_MODE}' is not a supported mode number: {value}")),
+        }
+        .map_err(FactoryResetError::InvalidConfig)?;
         let mode = ResetMode::try_from(mode).map_err(FactoryResetError::InvalidConfig)?;
 
         let preserve = string_array(&trigger, KEY_PRESERVE).map_err(|e| match e {
@@ -85,9 +83,7 @@ impl FactoryResetConfig {
     }
 }
 
-/// Why a json value did not yield a list of strings. The caller turns this
-/// into its own error variant, since the same shape means `Invalid` for the
-/// trigger's mode-bearing object and `ConfigError` for a preserve list.
+/// Why a json value did not yield a list of strings.
 enum NotAStringArray {
     Missing,
     NotAnArray,
@@ -139,10 +135,18 @@ pub fn build_preserve_list(config: &FactoryResetConfig, rootfs: &Path) -> Result
     let config_file = rootfs.join(FACTORY_RESET_CONFIG_FILE);
     let key_config: Option<Value> = if has_non_app_keys {
         let content = std::fs::read_to_string(&config_file).map_err(|e| {
-            FactoryResetError::Io(std::io::Error::new(
-                e.kind(),
-                format!("Failed to read {}: {e}", config_file.display()),
-            ))
+            // A key that names a file which is not there is the same kind of
+            // problem as a key missing inside it, and reports the same status.
+            // Any other read failure stays an I/O error: the request was
+            // usable, the storage was not, and that is worth retrying.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                FactoryResetError::MissingField(format!("{} does not exist", config_file.display()))
+            } else {
+                FactoryResetError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to read {}: {e}", config_file.display()),
+                ))
+            }
         })?;
         let value: Value = serde_json::from_str(&content).map_err(|e| {
             FactoryResetError::InvalidPreserve(format!(
@@ -228,14 +232,17 @@ fn collect_application_paths(rootfs: &Path, list: &mut Vec<String>) -> Result<()
 
         let paths = string_array(&value, KEY_PATHS).map_err(|e| {
             let file = path.display();
-            let reason = match e {
-                NotAStringArray::Missing => format!("no '{KEY_PATHS}' key"),
-                NotAStringArray::NotAnArray => format!("'{KEY_PATHS}' must be an array"),
-                NotAStringArray::NotOnlyStrings => {
-                    format!("'{KEY_PATHS}' must contain only strings")
+            match e {
+                NotAStringArray::Missing => {
+                    FactoryResetError::MissingField(format!("{file}: no '{KEY_PATHS}' key"))
                 }
-            };
-            FactoryResetError::InvalidPreserve(format!("{file}: {reason}"))
+                NotAStringArray::NotAnArray => FactoryResetError::InvalidPreserve(format!(
+                    "{file}: '{KEY_PATHS}' must be an array"
+                )),
+                NotAStringArray::NotOnlyStrings => FactoryResetError::InvalidPreserve(format!(
+                    "{file}: '{KEY_PATHS}' must contain only strings"
+                )),
+            }
         })?;
         for preserve_path in paths {
             validate_preserve_path(preserve_path)?;
@@ -430,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn build_preserve_list_applications_without_usable_paths_is_an_error() {
+    fn build_preserve_list_applications_without_usable_paths_is_a_config_error() {
         // A file the caller put there to keep something, which does not say
         // what to keep. Skipping it would wipe those paths and still report
         // success.
@@ -450,13 +457,9 @@ mod tests {
                 preserve: vec!["applications".into()],
             };
             let error = build_preserve_list(&cfg, temp.path()).unwrap_err();
-            assert!(
-                matches!(
-                    error,
-                    crate::error::InitramfsError::FactoryReset(FactoryResetError::InvalidPreserve(
-                        _
-                    ))
-                ),
+            assert_eq!(
+                crate::mode::factory_reset::failure_status_code(&error),
+                crate::runtime::FactoryResetStatusCode::ConfigError,
                 "{content}"
             );
         }
@@ -517,11 +520,31 @@ mod tests {
     }
 
     #[test]
-    fn build_preserve_list_missing_config_for_custom_key_maps_to_io() {
-        // A non-application key needs factory-reset.json; when it is absent the
-        // read fails with NotFound, which must map to Io (not InvalidConfig) so
-        // the ODS status is not mislabeled.
+    fn build_preserve_list_missing_config_for_custom_key_is_a_config_error() {
+        // A non-application key needs factory-reset.json. An absent file is the
+        // same kind of problem as an absent key inside it, so both report
+        // ConfigError rather than one of them reading as an I/O failure.
         let temp = TempDir::new().unwrap();
+        let cfg = FactoryResetConfig {
+            mode: ResetMode::Mode1,
+            preserve: vec!["network".into()],
+        };
+        let error = build_preserve_list(&cfg, temp.path()).unwrap_err();
+        assert_eq!(
+            crate::mode::factory_reset::failure_status_code(&error),
+            crate::runtime::FactoryResetStatusCode::ConfigError
+        );
+    }
+
+    #[test]
+    fn build_preserve_list_unreadable_config_stays_an_io_error() {
+        // Only an absent factory-reset.json is a config problem. A path that
+        // exists but cannot be read is a storage failure the caller can retry,
+        // so it must not be folded into the same status.
+        let temp = TempDir::new().unwrap();
+        // the config file is itself a directory → read_to_string returns Err(io)
+        fs::create_dir_all(temp.path().join(FACTORY_RESET_CONFIG_FILE)).unwrap();
+
         let cfg = FactoryResetConfig {
             mode: ResetMode::Mode1,
             preserve: vec!["network".into()],
@@ -531,6 +554,10 @@ mod tests {
             error,
             crate::error::InitramfsError::FactoryReset(FactoryResetError::Io(_))
         ));
+        assert_eq!(
+            crate::mode::factory_reset::failure_status_code(&error),
+            crate::runtime::FactoryResetStatusCode::Error
+        );
     }
 
     #[test]

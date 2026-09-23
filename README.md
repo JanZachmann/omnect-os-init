@@ -4,8 +4,9 @@ Rust-based init process for omnect-os initramfs.
 
 ## Overview
 
-Replaces 14 bash-based initramfs scripts (~1500 LOC) with a single Rust binary
-acting as `/init` in the initramfs. Runs as PID 1 before `switch_root`.
+A single binary acting as `/init` in the initramfs, in place of the shell scripts that
+used to do this. Runs as PID 1: it prepares the partitions, the boot environment and the
+runtime state for `omnect-device-service`, then hands over with `switch_root`.
 
 Implemented functionality:
 
@@ -62,8 +63,8 @@ flowchart TD
     APPLY -->|Fatal| FEB
     APPLY -->|"OK\nDegraded: ods.degraded_boot=true"| FBDETECT["compute_first_boot()\nset_update_pending()"]
 
-    FBDETECT --> ISETUP["init_setup::run()\nresize-data preflight\nif feature = resize-data"]
-    ISETUP -->|FsckRequiresReboot| FEB
+    FBDETECT --> ISETUP["init_setup::run()\nextra_bootargs sync — always\nresize-data preflight if feature = resize-data"]
+    ISETUP -->|"FsckRequiresReboot\nExtraBootArgsUpdated"| FEB
     ISETUP -->|"ResizeData error\nContinueDegraded — warn"| BMODE{"BootMode::detect()"}
     ISETUP -->|"Fatal (non-resize)"| FEB
     ISETUP -->|OK| BMODE
@@ -96,7 +97,7 @@ flowchart TD
     OVL -->|OK| LINKS["create_fs_links()\ndrain_fsck_env() — env → JSON, then clear\ncreate_ods_runtime_files()"]
     OVL -->|Fail| FEB
 
-    LINKS -->|OK| FBM["write_first_boot_marker()\nif first_boot ∧ resize_ok ∧ env_available\nbest-effort — warn on fail"]
+    LINKS -->|OK| FBM["write_first_boot_marker()\nif first_boot ∧ resize_ok ∧ extra_bootargs_ok ∧ env_available\nbest-effort — warn on fail"]
     LINKS -->|Fail| FEB
 
     FBM --> SR["switch_root → systemd"]
@@ -160,21 +161,28 @@ including degraded boot.
 **Notes on factory reset (`FRESET` block)**
 
 Enabled by the `factory-reset` feature. `BootMode::detect()` reads the `factory-reset`
-bootloader env key; any present value dispatches to `mode::factory_reset::run()` instead of
-`mode::normal::run()`. A value the init cannot use is cleared and reported there — status 1
-for a problem with `mode`, status 3 for a problem with `preserve` — rather than booting on
-in silence, which would leave the caller waiting for a result forever. The reset sequence (mount → backup → wipe → reformat →
-mount → restore) always completes with a `FactoryResetStatus` recorded in the ODS status JSON —
-success or error — and then falls through into the same `mode::normal::run()` path a
-normal boot takes (`MREM` onward), so a failed or unsupported reset never blocks the
-device from booting: `FactoryResetError` is classified as `ContinueDegraded`.
+bootloader env key; any non-blank value dispatches to `mode::factory_reset::run()` instead of
+`mode::normal::run()`. A blank value is not a request to reset. A trigger can be cleared two
+ways — by unsetting the key, or by writing an empty value — and the two backends disagree about
+the second: `fw_printenv` reports an empty variable as unset, while `grub-editenv` still lists
+the key. On GRUB a cleared trigger can therefore come back as a present but empty value, so
+treating blank as no trigger makes both backends behave the same and keeps such a device from
+being answered with a reset failure nobody asked for. A value the init cannot use is cleared and
+reported there — status 1 when it does not name a mode the init can run, unparsable json
+included, status 3 when the problem is `preserve` — rather than booting on in silence, which
+would leave the caller waiting for a result forever. The reset sequence (mount → backup → wipe →
+reformat → mount → restore) always completes with a `FactoryResetStatus` recorded in the ODS
+status JSON — success or error — and then falls through into the same `mode::normal::run()` path
+a normal boot takes (`MREM` onward), so a failed or unsupported reset never blocks the device
+from booting: `FactoryResetError` is classified as `ContinueDegraded`.
 
 **Factory reset — wipe modes (`FWIPE`)**
 
-The trigger must name a `mode` of 1 to 3 and carry a `preserve` array; an empty array keeps
-nothing. A file in `/etc/omnect/factory-reset.d` is read for its `paths` array, and one
-without a usable `paths` array fails the reset — skipping it would wipe the paths it was
-meant to keep and still report success.
+The trigger must name a `mode` of 1 to 3 and carry a `preserve` array. `/etc/omnect/factory-reset.d/`
+is preserved in every case, so an empty array keeps that directory and nothing else. When
+`preserve` contains `applications`, every `*.json` file in that directory is read for its
+`paths` array, and one without a usable `paths` array fails the reset — skipping it would
+wipe the paths it was meant to keep and still report success.
 
 The wipe runs once the backup is in initramfs RAM and before the reformat. Mode 2 writes
 data from `/dev/urandom`, mode 3 uses the `BLKDISCARD` ioctl, which the hardware has to
@@ -217,16 +225,18 @@ single failure is `Warning`, two failures are `Error` — an early sign of faili
 ## Building
 
 ```bash
-# Debug build (bootloader type and partition table must both be specified)
-cargo build --features grub,<gpt|dos>     # x86-64 EFI targets
-cargo build --features uboot,<gpt|dos>    # ARM targets
+# A bootloader and a partition table are both mandatory; build.rs rejects
+# any other combination
+cargo build --features grub,gpt      # x86-64 EFI targets
+cargo build --features uboot,dos     # ARM targets
 
-# Release build (optimized for size)
-cargo build --release --features grub,<gpt|dos>
-cargo build --release --features uboot,<gpt|dos>
+# Release build (optimized for size); U-Boot targets use gpt or dos
+cargo build --release --features grub,gpt
+cargo build --release --features uboot,gpt
+cargo build --release --features uboot,dos
 
 # With additional optional features
-cargo build --release --features "grub,<gpt|dos>,persistent-var-log"
+cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 ```
 
 ## Features
@@ -258,7 +268,8 @@ cargo build --release --features "grub,<gpt|dos>,persistent-var-log"
 
 ```bash
 # All four valid base combinations (bootloader × partition table)
-# test-utils is required to include the degraded_boot integration tests
+# test-utils is required for the degraded_boot integration test; factory_reset
+# needs the factory-reset feature as well, see the next block
 cargo test --features grub,gpt,test-utils
 cargo test --features grub,dos,test-utils
 cargo test --features uboot,gpt,test-utils
@@ -310,8 +321,8 @@ cargo test --features grub,gpt,test-utils -- --nocapture
 is not a supported configuration — no combination above builds it that way,
 and no gate covers it.
 
-The rpi3 machine is 32-bit ARM, where `usize` is 4 bytes and a cast from a
-64-bit byte count silently truncates. The test run above is host-only and
+Some U-Boot targets are 32-bit ARM, where `usize` is 4 bytes and a cast from
+a 64-bit byte count silently truncates. The test run above is host-only and
 cannot see that, so compile and lint for a 32-bit target as well (`cargo check`
 and `cargo clippy` need no cross-linker):
 

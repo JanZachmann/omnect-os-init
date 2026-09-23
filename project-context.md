@@ -40,7 +40,7 @@ src/
 │   ├── factory_reset/       # Factory reset (feature = factory-reset)
 │   │   ├── mod.rs           # Reset sequence, status assembly, trigger rejection
 │   │   ├── config.rs        # Trigger parsing, preserve list from etc/omnect
-│   │   ├── backup_restore.rs # Preserve-list backup to tmpfs and restore
+│   │   ├── backup_restore.rs # Preserve-list backup to initramfs RAM and restore
 │   │   └── wipe.rs          # Mode 2 random overwrite, mode 3 BLKDISCARD
 │   └── flash/               # Flash modes (feature = flash-mode)
 │       ├── mod.rs           # Dispatch, terminal action, log capture and persistence
@@ -134,7 +134,7 @@ src/
 - **Exit behavior:**
   - Release image + normal error: infinite loop (prevent reboot loops)
   - Release image + degraded boot (bootloader unavailable): continue booting; set `degraded_boot: true` in ODS JSON
-  - Debug image + degraded boot: abort immediately before preflight; spawn debug shell
+  - Debug image + degraded boot: abort immediately before init setup; spawn debug shell
   - `FsckRequiresReboot`: always triggers a reboot regardless of degraded state
 
 ## 6. Key Patterns
@@ -156,15 +156,15 @@ src/
 ### BootMode variants
 The `BootMode` enum (`src/mode/mod.rs`) has the following implemented variants:
 - `Normal` — standard boot path; also used when the bootloader is unavailable (degraded boot)
+- `FactoryReset(FactoryResetTrigger)` — backup → wipe (modes 2 and 3) → reformat → restore
+  (feature `factory-reset`). The trigger is carried even when its value is unusable, as
+  `FactoryResetTrigger::Rejected`, so the value is cleared and the failure reported instead
+  of the boot continuing in silence.
 
 Data partition resize (feature = `resize-data`) is handled as an init setup step in
 `src/init_setup/resize_data.rs`, not as a separate `BootMode` variant. It runs before
 `BootMode::detect()` and handles both the live-bootloader (guard check) and degraded-boot
 (no guard, resize runs every boot) cases.
-
-`FactoryReset(FactoryResetTrigger)` is implemented (feature `factory-reset`). The trigger
-is carried even when its value is unusable, as `FactoryResetTrigger::Rejected`, so the
-value is cleared and the failure reported instead of the boot continuing in silence.
 
 `Flash(FlashConfig)` is implemented for mode 1 (feature `flash-mode`, pulled in by
 `flash-mode-1`): it clones the running disk onto another block device and powers off

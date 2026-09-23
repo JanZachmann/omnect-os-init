@@ -51,7 +51,7 @@ required-features = ["test-utils"]
 
 [[test]]
 name = "factory_reset"
-required-features = ["test-utils"]
+required-features = ["factory-reset", "test-utils"]
 
 [[test]]
 name = "flash_modes"

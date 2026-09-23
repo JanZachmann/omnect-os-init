@@ -51,7 +51,7 @@ impl<'a> BootContext<'a> {
 #[derive(Debug)]
 pub enum FactoryResetTrigger {
     Accepted(factory_reset::config::FactoryResetConfig),
-    Rejected(crate::error::InitramfsError),
+    Rejected(crate::error::FactoryResetError),
 }
 
 /// The detected boot mode to execute.
@@ -128,10 +128,10 @@ fn build_flash_config(
 impl BootMode {
     /// Detect the boot mode from the boot environment.
     ///
-    /// A set `flash-mode` selects `Flash`; a set `factory-reset` selects
-    /// `FactoryReset`, whether or not its value can be used — an unusable one
-    /// is carried as `FactoryResetTrigger::Rejected`, so it is cleared and
-    /// reported.
+    /// A set `flash-mode` selects `Flash`; a `factory-reset` with a non-blank
+    /// value selects `FactoryReset`, whether or not that value can be used — an
+    /// unusable one is carried as `FactoryResetTrigger::Rejected`, so it is
+    /// cleared and reported. A blank value is no trigger.
     /// Both triggers at once is refused — they act on different disks and
     /// single-mode dispatch cannot perform both, so dropping one silently would
     /// be the worse failure. Both triggers are cleared before that refusal is
@@ -151,11 +151,11 @@ impl BootMode {
                     Some(mode) => {
                         #[cfg(feature = "factory-reset")]
                         match _bl.get_env(BootEnvKey::FactoryReset) {
-                            Ok(Some(_)) => {
+                            Ok(Some(json)) if !json.trim().is_empty() => {
                                 clear_flash_and_reset_triggers(_bl);
                                 return Err(crate::error::FlashError::ConflictingTriggers.into());
                             }
-                            Ok(None) => {}
+                            Ok(_) => {}
                             Err(e) => {
                                 log::warn!(
                                     "factory-reset: failed to read env while checking for a flash conflict, booting normally: {e}"
@@ -178,6 +178,12 @@ impl BootMode {
 
             #[cfg(feature = "factory-reset")]
             match _bl.get_env(BootEnvKey::FactoryReset) {
+                // A trigger can be cleared by unsetting the key or by writing
+                // an empty value. The backends disagree about the second:
+                // fw_printenv reports an empty variable as unset, grub-editenv
+                // still lists the key. Treat blank as no trigger so both behave
+                // the same.
+                Ok(Some(json)) if json.trim().is_empty() => {}
                 Ok(Some(json)) => match factory_reset::config::FactoryResetConfig::parse(&json) {
                     Ok(config) => {
                         return Ok(Self::FactoryReset(FactoryResetTrigger::Accepted(config)));
@@ -261,6 +267,18 @@ mod tests {
                         BootMode::FactoryReset(FactoryResetTrigger::Rejected(_))
                     ),
                     "trigger {trigger} must be rejected, not ignored"
+                );
+            }
+        }
+
+        #[test]
+        fn detect_normal_when_the_trigger_is_blank() {
+            for trigger in ["", " ", "\n"] {
+                let mut mock = create_mock_bootloader().with_env(BootEnvKey::FactoryReset, trigger);
+                let mode = BootMode::detect(Some(&mut mock)).unwrap();
+                assert!(
+                    matches!(mode, BootMode::Normal),
+                    "a blank trigger must not start a reset: {trigger:?}"
                 );
             }
         }

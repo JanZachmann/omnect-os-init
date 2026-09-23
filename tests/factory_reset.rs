@@ -1,4 +1,5 @@
-//! Integration tests for factory-reset: ODS JSON contract and detect fallback.
+//! Integration tests for factory-reset: the ODS JSON contract and the mode
+//! a trigger dispatches to.
 
 #![cfg(feature = "factory-reset")]
 
