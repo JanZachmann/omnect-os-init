@@ -68,9 +68,11 @@ impl BootMode {
         #[cfg(feature = "factory-reset")]
         if let Some(bl) = _bl {
             match bl.get_env(BootEnvKey::FactoryReset) {
-                // Devices provisioned before this init carry the key set to an
-                // empty value, and GRUB reports that as a present key where
-                // U-Boot reports `None`. It is not a request to reset.
+                // A trigger can be cleared by unsetting the key or by writing
+                // an empty value. The backends disagree about the second:
+                // fw_printenv reports an empty variable as unset, grub-editenv
+                // still lists the key. Treat blank as no trigger so both behave
+                // the same.
                 Ok(Some(json)) if json.trim().is_empty() => {}
                 Ok(Some(json)) => match factory_reset::config::FactoryResetConfig::parse(&json) {
                     Ok(config) => {
