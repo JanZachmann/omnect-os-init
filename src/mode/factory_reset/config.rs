@@ -137,6 +137,8 @@ pub fn build_preserve_list(config: &FactoryResetConfig, rootfs: &Path) -> Result
         let content = std::fs::read_to_string(&config_file).map_err(|e| {
             // A key that names a file which is not there is the same kind of
             // problem as a key missing inside it, and reports the same status.
+            // Any other read failure stays an I/O error: the request was
+            // usable, the storage was not, and that is worth retrying.
             if e.kind() == std::io::ErrorKind::NotFound {
                 FactoryResetError::MissingField(format!("{} does not exist", config_file.display()))
             } else {
@@ -531,6 +533,30 @@ mod tests {
         assert_eq!(
             crate::mode::factory_reset::failure_status_code(&error),
             crate::runtime::FactoryResetStatusCode::ConfigError
+        );
+    }
+
+    #[test]
+    fn build_preserve_list_unreadable_config_stays_an_io_error() {
+        // Only an absent factory-reset.json is a config problem. A path that
+        // exists but cannot be read is a storage failure the caller can retry,
+        // so it must not be folded into the same status.
+        let temp = TempDir::new().unwrap();
+        // the config file is itself a directory → read_to_string returns Err(io)
+        fs::create_dir_all(temp.path().join(FACTORY_RESET_CONFIG_FILE)).unwrap();
+
+        let cfg = FactoryResetConfig {
+            mode: ResetMode::Mode1,
+            preserve: vec!["network".into()],
+        };
+        let error = build_preserve_list(&cfg, temp.path()).unwrap_err();
+        assert!(matches!(
+            error,
+            crate::error::InitramfsError::FactoryReset(FactoryResetError::Io(_))
+        ));
+        assert_eq!(
+            crate::mode::factory_reset::failure_status_code(&error),
+            crate::runtime::FactoryResetStatusCode::Error
         );
     }
 

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::error::FactoryResetError;
 
-type WipeResult<T> = std::result::Result<T, FactoryResetError>;
+pub(crate) type WipeResult<T> = std::result::Result<T, FactoryResetError>;
 
 const WIPE_CHUNK_SIZE: usize = 1024 * 1024;
 const WIPE_PROGRESS_INTERVAL: u64 = 1024 * 1024 * 1024;
@@ -278,8 +278,8 @@ mod tests {
 
     #[test]
     fn chunk_len_clamps_without_truncating() {
-        // usize is 64 bit on the host, so this cannot fail here — it documents
-        // the case. The 32-bit clippy run from the README is the real guard.
+        // usize is 64 bit on the host, so only a 32-bit run of this test can
+        // fail it.
         for (len, written) in [
             (FOUR_GIB, 0),
             (FOUR_GIB + BLOCK_LEN as u64, BLOCK_LEN as u64),

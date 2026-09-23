@@ -23,7 +23,7 @@ use crate::mode::factory_reset::{
     backup_restore::{backup_all, restore_all},
     config::{FactoryResetConfig, ResetMode, build_preserve_list},
     reformat::reformat_ext4,
-    wipe::{wipe_discard, wipe_random},
+    wipe::{WipeResult, wipe_discard, wipe_random},
 };
 
 const FACTORY_RESET_BACKUP_DIR: &str = "/tmp/factory_reset/backup";
@@ -55,10 +55,6 @@ pub fn run(mut ctx: BootContext<'_>, trigger: FactoryResetTrigger) -> Result<()>
 
 /// Clear the trigger, run `reset` when the trigger was usable, and record the
 /// outcome in `ods_status`.
-///
-/// Split from `run` so the answer a trigger gets is testable on its own: a
-/// trigger the init cannot use must still be cleared and reported, or the
-/// caller waits for a result while the same warning repeats on every boot.
 fn answer_trigger(
     boot_env: &mut crate::bootloader::BootEnvState,
     ods_status: &mut OdsStatus,
@@ -95,12 +91,22 @@ fn answer_trigger(
     ods_status.set_factory_reset(status);
 }
 
+/// Text for the status `error` field. The field already sits in the
+/// factory-reset result, so the outer `Factory reset error:` wrapper is
+/// dropped — every writer of the field produces the same shape.
+fn error_text(e: &InitramfsError) -> String {
+    match e {
+        InitramfsError::FactoryReset(inner) => inner.to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// Status for a reset that never reached the destructive phase: nothing was
 /// touched, so `data_wiped` is false and no path was preserved.
 fn aborted_status(e: &InitramfsError) -> FactoryResetStatus {
     FactoryResetStatus {
         status: failure_status_code(e),
-        error: Some(e.to_string()),
+        error: Some(error_text(e)),
         context: None,
         paths: vec![],
         data_wiped: false,
@@ -159,27 +165,29 @@ fn run_reset(
         FactoryResetError::MountError("etc partition not found in layout".to_string())
     })?;
 
+    let rebuild = || match run_destructive_phase(
+        layout,
+        rootfs,
+        &mut mounts,
+        ods_status,
+        ReformatTargets {
+            data_dev,
+            etc_dev,
+            preserve_list: &preserve_list,
+            backed_up: &backed_up,
+            backup_dir: &backup_dir,
+        },
+    ) {
+        Ok(pair) => pair,
+        Err(e) => (destructive_phase_failure_status(e, preserve_list), None),
+    };
+
     Ok(wipe_and_rebuild(
         config.mode,
         data_dev,
         etc_dev,
         &mut RealWipeOps,
-        || match run_destructive_phase(
-            layout,
-            rootfs,
-            &mut mounts,
-            ods_status,
-            ReformatTargets {
-                data_dev,
-                etc_dev,
-                preserve_list: &preserve_list,
-                backed_up: &backed_up,
-                backup_dir: &backup_dir,
-            },
-        ) {
-            Ok(pair) => pair,
-            Err(e) => (destructive_phase_failure_status(e, preserve_list), None),
-        },
+        rebuild,
     ))
 }
 
@@ -202,18 +210,18 @@ fn wipe_and_rebuild(
 
 /// Injectable abstraction over the wipe side effects, see `ReformatRetryOps`.
 trait WipeOps {
-    fn wipe_random(&mut self, device: &Path) -> std::result::Result<(), FactoryResetError>;
-    fn wipe_discard(&mut self, device: &Path) -> std::result::Result<(), FactoryResetError>;
+    fn wipe_random(&mut self, device: &Path) -> WipeResult<()>;
+    fn wipe_discard(&mut self, device: &Path) -> WipeResult<()>;
 }
 
 struct RealWipeOps;
 
 impl WipeOps for RealWipeOps {
-    fn wipe_random(&mut self, device: &Path) -> std::result::Result<(), FactoryResetError> {
+    fn wipe_random(&mut self, device: &Path) -> WipeResult<()> {
         wipe_random(device)
     }
 
-    fn wipe_discard(&mut self, device: &Path) -> std::result::Result<(), FactoryResetError> {
+    fn wipe_discard(&mut self, device: &Path) -> WipeResult<()> {
         wipe_discard(device)
     }
 }
@@ -227,8 +235,7 @@ fn wipe_partitions(
     etc_dev: &Path,
     ops: &mut dyn WipeOps,
 ) -> Option<String> {
-    type Wipe = fn(&mut dyn WipeOps, &Path) -> std::result::Result<(), FactoryResetError>;
-    let wipe: Wipe = match mode {
+    let wipe: fn(&mut dyn WipeOps, &Path) -> WipeResult<()> = match mode {
         ResetMode::Mode1 => return None,
         ResetMode::Mode2 => |ops, device| ops.wipe_random(device),
         ResetMode::Mode3 => |ops, device| ops.wipe_discard(device),
@@ -465,7 +472,7 @@ fn destructive_phase_failure_status(e: InitramfsError, paths: Vec<String>) -> Fa
     );
     FactoryResetStatus {
         status: FactoryResetStatusCode::Error,
-        error: Some(e.to_string()),
+        error: Some(error_text(&e)),
         context: None,
         paths,
         data_wiped: true,
@@ -1114,27 +1121,38 @@ mod tests {
         const DATA_DEV: &str = "/dev/sda7";
         const ETC_DEV: &str = "/dev/sda6";
 
+        /// Call log shared between the ops mock and a test's own steps, so
+        /// the order between a wipe and what follows it is one list.
+        #[derive(Clone, Default)]
+        struct CallLog(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+
+        impl CallLog {
+            fn push(&self, entry: String) {
+                self.0.borrow_mut().push(entry);
+            }
+
+            fn entries(&self) -> Vec<String> {
+                self.0.borrow().clone()
+            }
+        }
+
         // Records every wiped device with the wipe kind, and fails for the
         // devices listed in `fail`.
         struct ScriptedWipeOps {
-            calls: Vec<(&'static str, PathBuf)>,
+            log: CallLog,
             fail: Vec<PathBuf>,
         }
 
         impl ScriptedWipeOps {
             fn failing_on(devices: &[&str]) -> Self {
                 Self {
-                    calls: vec![],
+                    log: CallLog::default(),
                     fail: devices.iter().map(PathBuf::from).collect(),
                 }
             }
 
-            fn record(
-                &mut self,
-                kind: &'static str,
-                device: &Path,
-            ) -> std::result::Result<(), FactoryResetError> {
-                self.calls.push((kind, device.to_path_buf()));
+            fn record(&mut self, kind: &str, device: &Path) -> WipeResult<()> {
+                self.log.push(format!("{kind} {}", device.display()));
                 if self.fail.iter().any(|d| d == device) {
                     return Err(FactoryResetError::WipeFailed {
                         device: device.to_path_buf(),
@@ -1146,16 +1164,17 @@ mod tests {
         }
 
         impl WipeOps for ScriptedWipeOps {
-            fn wipe_random(&mut self, device: &Path) -> std::result::Result<(), FactoryResetError> {
+            fn wipe_random(&mut self, device: &Path) -> WipeResult<()> {
                 self.record("random", device)
             }
 
-            fn wipe_discard(
-                &mut self,
-                device: &Path,
-            ) -> std::result::Result<(), FactoryResetError> {
+            fn wipe_discard(&mut self, device: &Path) -> WipeResult<()> {
                 self.record("discard", device)
             }
+        }
+
+        fn wiped(kind: &str, devices: &[&str]) -> Vec<String> {
+            devices.iter().map(|d| format!("{kind} {d}")).collect()
         }
 
         fn wipe(mode: ResetMode, ops: &mut ScriptedWipeOps) -> Option<String> {
@@ -1163,49 +1182,49 @@ mod tests {
         }
 
         #[test]
+        fn real_ops_map_each_mode_to_its_own_wipe() {
+            // The only link from ResetMode to the real functions; swapping the
+            // two bodies leaves every other test in this module green.
+            use std::io::Write;
+            const FILLER: [u8; 4096] = [0xAA; 4096];
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(&FILLER).unwrap();
+            let mut ops = RealWipeOps;
+
+            ops.wipe_random(file.path()).unwrap();
+            assert_ne!(std::fs::read(file.path()).unwrap(), FILLER.to_vec());
+
+            // a regular file cannot discard, which is the mode-3 path
+            let err = ops.wipe_discard(file.path()).unwrap_err();
+            assert!(err.to_string().contains("BLKDISCARD failed"), "{err}");
+        }
+
+        #[test]
         fn mode1_does_not_wipe() {
             let mut ops = ScriptedWipeOps::failing_on(&[]);
             assert_eq!(wipe(ResetMode::Mode1, &mut ops), None);
-            assert!(ops.calls.is_empty());
+            assert!(ops.log.entries().is_empty());
         }
 
         #[test]
         fn mode2_overwrites_both_partitions_with_random_data() {
             let mut ops = ScriptedWipeOps::failing_on(&[]);
             assert_eq!(wipe(ResetMode::Mode2, &mut ops), None);
-            assert_eq!(
-                ops.calls,
-                vec![
-                    ("random", PathBuf::from(ETC_DEV)),
-                    ("random", PathBuf::from(DATA_DEV)),
-                ]
-            );
+            assert_eq!(ops.log.entries(), wiped("random", &[ETC_DEV, DATA_DEV]));
         }
 
         #[test]
         fn mode3_discards_both_partitions() {
             let mut ops = ScriptedWipeOps::failing_on(&[]);
             assert_eq!(wipe(ResetMode::Mode3, &mut ops), None);
-            assert_eq!(
-                ops.calls,
-                vec![
-                    ("discard", PathBuf::from(ETC_DEV)),
-                    ("discard", PathBuf::from(DATA_DEV)),
-                ]
-            );
+            assert_eq!(ops.log.entries(), wiped("discard", &[ETC_DEV, DATA_DEV]));
         }
 
         #[test]
         fn etc_wipe_failure_still_wipes_data() {
             let mut ops = ScriptedWipeOps::failing_on(&[ETC_DEV]);
             let note = wipe(ResetMode::Mode3, &mut ops).expect("failure must produce a note");
-            assert_eq!(
-                ops.calls,
-                vec![
-                    ("discard", PathBuf::from(ETC_DEV)),
-                    ("discard", PathBuf::from(DATA_DEV)),
-                ]
-            );
+            assert_eq!(ops.log.entries(), wiped("discard", &[ETC_DEV, DATA_DEV]));
             assert!(note.starts_with("etc: "), "{note}");
             assert!(!note.contains("Factory reset error"), "{note}");
             assert!(note.contains(ETC_DEV), "{note}");
@@ -1268,70 +1287,28 @@ mod tests {
             assert_eq!(status.context.as_deref(), Some("1 of 2 paths restored"));
         }
 
-        /// Records the wipe calls and the rebuild in one list, so a test can
-        /// assert the order between them.
-        struct LoggingWipeOps {
-            log: std::rc::Rc<std::cell::RefCell<Vec<String>>>,
-            fail: Vec<PathBuf>,
-        }
-
-        impl LoggingWipeOps {
-            fn record(
-                &mut self,
-                kind: &str,
-                device: &Path,
-            ) -> std::result::Result<(), FactoryResetError> {
-                self.log
-                    .borrow_mut()
-                    .push(format!("{kind} {}", device.display()));
-                if self.fail.iter().any(|d| d == device) {
-                    return Err(FactoryResetError::WipeFailed {
-                        device: device.to_path_buf(),
-                        reason: "no discard support".into(),
-                    });
-                }
-                Ok(())
-            }
-        }
-
-        impl WipeOps for LoggingWipeOps {
-            fn wipe_random(&mut self, device: &Path) -> std::result::Result<(), FactoryResetError> {
-                self.record("random", device)
-            }
-
-            fn wipe_discard(
-                &mut self,
-                device: &Path,
-            ) -> std::result::Result<(), FactoryResetError> {
-                self.record("discard", device)
-            }
-        }
-
         /// Run the composition with a rebuild that logs itself and returns
-        /// `rebuilt`. Yields the resulting status and the full call order.
+        /// `rebuilt` plus `signal`. Yields the outcome and the full call order.
         fn rebuild_after_wipe(
             mode: ResetMode,
             failing: &[&str],
             rebuilt: FactoryResetStatus,
-        ) -> (FactoryResetStatus, Vec<String>) {
-            let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-            let mut ops = LoggingWipeOps {
-                log: std::rc::Rc::clone(&log),
-                fail: failing.iter().map(PathBuf::from).collect(),
-            };
-            let rebuild_log = std::rc::Rc::clone(&log);
-            let (status, _) = wipe_and_rebuild(
+            signal: Option<ResetFailureSignal>,
+        ) -> (FactoryResetStatus, Option<ResetFailureSignal>, Vec<String>) {
+            let mut ops = ScriptedWipeOps::failing_on(failing);
+            let log = ops.log.clone();
+            let rebuild_log = ops.log.clone();
+            let (status, out_signal) = wipe_and_rebuild(
                 mode,
                 Path::new(DATA_DEV),
                 Path::new(ETC_DEV),
                 &mut ops,
                 || {
-                    rebuild_log.borrow_mut().push("rebuild".to_string());
-                    (rebuilt, None)
+                    rebuild_log.push("rebuild".to_string());
+                    (rebuilt, signal)
                 },
             );
-            let order = log.borrow().clone();
-            (status, order)
+            (status, out_signal, log.entries())
         }
 
         fn success() -> FactoryResetStatus {
@@ -1340,27 +1317,37 @@ mod tests {
 
         #[test]
         fn the_wipe_runs_before_the_rebuild() {
-            let (_, order) = rebuild_after_wipe(ResetMode::Mode2, &[], success());
-            assert_eq!(
-                order,
-                vec![
-                    format!("random {ETC_DEV}"),
-                    format!("random {DATA_DEV}"),
-                    "rebuild".to_string(),
-                ]
-            );
+            let (_, _, order) = rebuild_after_wipe(ResetMode::Mode2, &[], success(), None);
+            let mut expected = wiped("random", &[ETC_DEV, DATA_DEV]);
+            expected.push("rebuild".to_string());
+            assert_eq!(order, expected);
         }
 
         #[test]
         fn mode1_rebuilds_without_wiping() {
-            let (status, order) = rebuild_after_wipe(ResetMode::Mode1, &[], success());
+            let (status, _, order) = rebuild_after_wipe(ResetMode::Mode1, &[], success(), None);
             assert_eq!(order, vec!["rebuild".to_string()]);
             assert_eq!(status.status, FactoryResetStatusCode::Success);
         }
 
         #[test]
+        fn the_rebuild_signal_is_carried_out() {
+            // wipe_and_rebuild must hand the exhausted-mount record back, or
+            // persist_exhausted_signal never writes it to the boot env.
+            let signal = ResetFailureSignal {
+                partition: PartitionName::Etc,
+                reason: "mkfs retry exhausted".into(),
+            };
+            let (_, out, _) = rebuild_after_wipe(ResetMode::Mode2, &[], success(), Some(signal));
+            let out = out.expect("the rebuild's signal must reach the caller");
+            assert_eq!(out.partition, PartitionName::Etc);
+            assert_eq!(out.reason, "mkfs retry exhausted");
+        }
+
+        #[test]
         fn a_wipe_failure_reaches_the_status_a_successful_rebuild_reported() {
-            let (status, order) = rebuild_after_wipe(ResetMode::Mode3, &[ETC_DEV], success());
+            let (status, _, order) =
+                rebuild_after_wipe(ResetMode::Mode3, &[ETC_DEV], success(), None);
             assert_eq!(order.len(), 3, "both devices and the rebuild: {order:?}");
             assert_eq!(status.status, FactoryResetStatusCode::Error);
             assert!(
@@ -1572,8 +1559,11 @@ mod tests {
         fn a_trigger_that_cannot_be_cleared_is_still_reported() {
             // set_env failing must not swallow the answer; the reset repeats
             // next boot, but the caller learns the outcome of this one.
-            let mut env =
-                BootEnvState::Available(Box::new(MockBootEnv::new().with_set_env_error()));
+            let mut env = BootEnvState::Available(Box::new(
+                MockBootEnv::new()
+                    .with_env(BootEnvKey::FactoryReset, TRIGGER)
+                    .with_set_env_error(),
+            ));
             let mut ods = OdsStatus::new();
 
             answer_trigger(
@@ -1585,8 +1575,40 @@ mod tests {
                 |_, _| unreachable!("a rejected trigger must not start a reset"),
             );
 
+            assert!(trigger_still_set(&env), "the clear must have failed here");
             let status = ods.factory_reset.expect("the caller needs an answer");
             assert_eq!(status.status, FactoryResetStatusCode::ConfigError);
+        }
+
+        #[test]
+        fn a_reset_still_runs_when_the_trigger_cannot_be_cleared() {
+            // The "proceeding anyway" path: a failed clear costs a repeat on
+            // the next boot, it must not cancel the reset the caller asked for.
+            let mut env = BootEnvState::Available(Box::new(
+                MockBootEnv::new()
+                    .with_env(BootEnvKey::FactoryReset, TRIGGER)
+                    .with_set_env_error(),
+            ));
+            let mut ods = OdsStatus::new();
+            let mut reset_ran = false;
+
+            answer_trigger(
+                &mut env,
+                &mut ods,
+                FactoryResetTrigger::Accepted(FactoryResetConfig::parse(TRIGGER).unwrap()),
+                |_, _| {
+                    reset_ran = true;
+                    Ok((
+                        restored_status(&[], &[], RestoreResult::Success, &["/p".to_string()]),
+                        None,
+                    ))
+                },
+            );
+
+            assert!(reset_ran, "the reset must run even if the clear failed");
+            assert!(trigger_still_set(&env));
+            let status = ods.factory_reset.expect("the caller needs an answer");
+            assert_eq!(status.status, FactoryResetStatusCode::Success);
         }
     }
 

@@ -161,15 +161,16 @@ including degraded boot.
 
 Enabled by the `factory-reset` feature. `BootMode::detect()` reads the `factory-reset`
 bootloader env key; any non-blank value dispatches to `mode::factory_reset::run()` instead of
-`mode::normal::run()`. A blank value is not a request to reset — GRUB reports a key set to an
-empty value as a present one, and the shell init cleared the key that way. A value the init cannot use is cleared and reported there — status 1
-when it does not name a mode the init can run, unparsable json included, status 3 when the
-problem is `preserve` — rather than booting on
-in silence, which would leave the caller waiting for a result forever. The reset sequence (mount → backup → wipe → reformat →
-mount → restore) always completes with a `FactoryResetStatus` recorded in the ODS status JSON —
-success or error — and then falls through into the same `mode::normal::run()` path a
-normal boot takes (`MREM` onward), so a failed or unsupported reset never blocks the
-device from booting: `FactoryResetError` is classified as `ContinueDegraded`.
+`mode::normal::run()`. A blank value is not a request to reset: devices provisioned before this
+init carry the key set to an empty value, and GRUB reports that as a present key. A value the
+init cannot use is cleared and reported there — status 1 when it does not name a mode the init
+can run, unparsable json included, status 3 when the problem is `preserve` — rather than booting
+on in silence, which would leave the caller waiting for a result forever. The reset sequence
+(mount → backup → wipe → reformat → mount → restore) always completes with a
+`FactoryResetStatus` recorded in the ODS status JSON — success or error — and then falls through
+into the same `mode::normal::run()` path a normal boot takes (`MREM` onward), so a failed or
+unsupported reset never blocks the device from booting: `FactoryResetError` is classified as
+`ContinueDegraded`.
 
 **Factory reset — wipe modes (`FWIPE`)**
 
@@ -259,8 +260,8 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 
 ```bash
 # All four valid base combinations (bootloader × partition table)
-# test-utils is required: the degraded_boot and factory_reset integration
-# tests do not build without it
+# test-utils is required for the degraded_boot integration test; factory_reset
+# needs the factory-reset feature as well, see the next block
 cargo test --features grub,gpt,test-utils
 cargo test --features grub,dos,test-utils
 cargo test --features uboot,gpt,test-utils
