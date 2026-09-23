@@ -92,8 +92,9 @@ fn answer_trigger(
 }
 
 /// Text for the status `error` field. The field already sits in the
-/// factory-reset result, so the outer `Factory reset error:` wrapper is
-/// dropped — every writer of the field produces the same shape.
+/// factory-reset result, so only the `FactoryReset` wrapper is stripped; any
+/// other subsystem keeps its prefix, which is what says where the failure
+/// came from.
 fn error_text(e: &InitramfsError) -> String {
     match e {
         InitramfsError::FactoryReset(inner) => inner.to_string(),
@@ -1182,9 +1183,10 @@ mod tests {
         }
 
         #[test]
-        fn real_ops_map_each_mode_to_its_own_wipe() {
-            // The only link from ResetMode to the real functions; swapping the
-            // two bodies leaves every other test in this module green.
+        fn real_ops_call_the_wipe_that_matches_the_method() {
+            // The only link between the trait methods and the real functions;
+            // swapping the two bodies leaves every other test green. Which
+            // method a mode picks is pinned by the mode2/mode3 tests.
             use std::io::Write;
             const FILLER: [u8; 4096] = [0xAA; 4096];
             let mut file = tempfile::NamedTempFile::new().unwrap();
@@ -1373,6 +1375,48 @@ mod tests {
             assert_eq!(untouched.status, status.status);
             assert_eq!(untouched.error, status.error);
             assert_eq!(untouched.context, status.context);
+        }
+    }
+
+    #[cfg(feature = "factory-reset")]
+    mod error_text_tests {
+        use super::*;
+
+        const REASON: &str = "no mode";
+
+        fn config_error() -> InitramfsError {
+            FactoryResetError::InvalidConfig(REASON.to_string()).into()
+        }
+
+        #[test]
+        fn the_factory_reset_wrapper_is_stripped_from_the_error_field() {
+            let e = config_error();
+            assert!(
+                e.to_string().starts_with("Factory reset error: "),
+                "the wrapper has to be there for this test to mean anything: {e}"
+            );
+
+            let expected = format!("Invalid factory-reset config: {REASON}");
+            assert_eq!(aborted_status(&e).error.as_deref(), Some(expected.as_str()));
+            assert_eq!(
+                destructive_phase_failure_status(e, vec![]).error.as_deref(),
+                Some(expected.as_str())
+            );
+        }
+
+        #[test]
+        fn another_subsystem_keeps_its_prefix() {
+            // The prefix names where the failure came from, which the
+            // factory-reset one cannot do inside a factory-reset result.
+            let e = InitramfsError::Filesystem(FilesystemError::MountFailed {
+                src_path: PathBuf::from("/dev/sda6"),
+                target: PathBuf::from("/mnt/etc"),
+                reason: "busy".to_string(),
+            });
+
+            let error = aborted_status(&e).error.expect("error");
+
+            assert!(error.starts_with("Filesystem error: "), "{error}");
         }
     }
 

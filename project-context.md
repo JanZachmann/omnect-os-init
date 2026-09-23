@@ -14,6 +14,7 @@ src/
 ├── lib.rs                   # Library exports + run_init() + apply_boot_env_decision()
 ├── error.rs                 # Error type hierarchy
 ├── early_init.rs            # Mount /dev, /proc, /sys, /run before logging
+├── recovery.rs              # Recovery policy: error class → reboot / halt / shell / continue
 ├── bootloader/
 │   ├── mod.rs               # BootEnv trait, BootEnvState, classify_boot_env()
 │   ├── grub.rs              # GRUB implementation (grub-editenv)
@@ -57,8 +58,9 @@ src/
 ```
 
 ## 3. Build & Test Commands
-- **Build:** `cargo build` / `cargo build --release`
-- **Check:** `cargo check`
+- **Build:** `cargo build --features <bootloader>,<table>` (build.rs rejects a build
+  without one of each, so a bare `cargo build` fails)
+- **Check:** `cargo check --features <bootloader>,<table>`
 - **Format:** `cargo fmt -- --check`
 - **Lint:** `cargo clippy --tests --features <grub|uboot> -- -D warnings -W clippy::items_after_statements -W clippy::items_after_test_module`
 - **Test:** `test-utils` must be included for the `degraded_boot` integration test; the
@@ -78,6 +80,13 @@ src/
   cargo test --features uboot,dos,release-image,test-utils
   cargo test --features grub,gpt,resize-data,release-image,test-utils
   cargo test --features uboot,gpt,resize-data,release-image,test-utils
+  ```
+  With `factory-reset`:
+  ```
+  cargo test --features grub,gpt,factory-reset,test-utils
+  cargo test --features grub,dos,factory-reset,test-utils
+  cargo test --features uboot,gpt,factory-reset,test-utils
+  cargo test --features uboot,dos,factory-reset,test-utils
   ```
 - **Audit:** `cargo audit`
 
