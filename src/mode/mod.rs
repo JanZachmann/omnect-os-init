@@ -155,7 +155,7 @@ impl BootMode {
                                 clear_flash_and_reset_triggers(_bl);
                                 return Err(crate::error::FlashError::ConflictingTriggers.into());
                             }
-                            Ok(_) => {}
+                            Ok(Some(_)) | Ok(None) => {}
                             Err(e) => {
                                 log::warn!(
                                     "factory-reset: failed to read env while checking for a flash conflict, booting normally: {e}"
@@ -362,6 +362,22 @@ mod tests {
             assert!(mock.set_env_calls.contains(&BootEnvKey::FactoryReset));
             assert_eq!(mock.get_env(BootEnvKey::FlashMode).unwrap(), None);
             assert_eq!(mock.get_env(BootEnvKey::FactoryReset).unwrap(), None);
+        }
+
+        #[cfg(all(feature = "flash-mode-1", feature = "factory-reset"))]
+        #[test]
+        fn detect_flashes_when_the_queued_factory_reset_is_blank() {
+            for blank in ["", " ", "\n"] {
+                let mut mock = create_mock_bootloader()
+                    .with_env(BootEnvKey::FlashMode, "1")
+                    .with_env(BootEnvKey::FlashModeDevPath, "/dev/mmcblk2")
+                    .with_env(BootEnvKey::FactoryReset, blank);
+                let mode = BootMode::detect(Some(&mut mock)).unwrap();
+                assert!(
+                    matches!(mode, BootMode::Flash(_)),
+                    "a blank reset key is no trigger, so there is nothing to conflict with: {blank:?}"
+                );
+            }
         }
 
         #[test]

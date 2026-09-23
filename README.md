@@ -228,7 +228,7 @@ single failure is `Warning`, two failures are `Error` — an early sign of faili
 # A bootloader and a partition table are both mandatory; build.rs rejects
 # any other combination
 cargo build --features grub,gpt      # x86-64 EFI targets
-cargo build --features uboot,dos     # ARM targets
+cargo build --features uboot,gpt     # ARM targets (dos applies too)
 
 # Release build (optimized for size); U-Boot targets use gpt or dos
 cargo build --release --features grub,gpt
