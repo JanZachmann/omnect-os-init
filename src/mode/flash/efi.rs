@@ -2,14 +2,15 @@
 //!
 //! A machine that boots via EFI needs its boot entry rebuilt to point at the
 //! freshly written loader. A machine that does not declare the `efi` feature
-//! skips this entirely. Ported from the legacy `flash_mode_efi_handling`.
+//! skips this entirely.
 
 use std::fs;
 use std::path::Path;
 use std::process::Command;
 
 use crate::error::FlashError;
-use crate::filesystem::{MountOptions, MountPoint, mount, umount};
+use crate::filesystem::MountOptions;
+use crate::mode::flash::with_mount;
 use crate::partition::layout::PARTITION_NUM_BOOT;
 
 const EFIBOOTMGR_CMD: &str = "/sbin/efibootmgr";
@@ -19,7 +20,6 @@ const EFI_LOADER_PATH: &str = r"\EFI\BOOT\bootx64.efi";
 const EFI_ENTRY_DUMP_FILE: &str = "EFI/BOOT/efibootmgr_entry";
 
 /// Scratch mount point for the boot partition while EFI entries are written.
-/// Matches the legacy scripts' mount point.
 const EFI_MOUNT_POINT: &str = "/tmp/boot";
 
 const EFIBOOTMGR_CREATE_FLAG: &str = "-c";
@@ -33,7 +33,6 @@ const EFIBOOTMGR_VERBOSE_FLAG: &str = "-v";
 
 const BOOT_ENTRY_LINE_PREFIX: &str = "Boot";
 const BOOT_ENTRY_ID_LEN: usize = 4;
-const BOOT_ENTRY_ACTIVE_MARKER: char = '*';
 
 /// Whether `machine_features` declares the `efi` feature.
 ///
@@ -61,25 +60,20 @@ pub fn entry_args(target_disk: &Path) -> Vec<String> {
     ]
 }
 
-/// The `Boot####` ids of every currently active entry in `efibootmgr`'s
-/// default listing, e.g. `["0000", "0002"]` for a listing containing
-/// `Boot0000* Windows` and `Boot0002* omnect_os`.
+/// The `Boot####` ids of every entry in `efibootmgr`'s default listing,
+/// active or not.
 ///
-/// Matches the legacy grep `^Boot[0-9a-fA-F]{4}\*`: only the four hex digits
-/// right after `Boot`, followed immediately by the active marker, count as
-/// an entry id. `BootCurrent:`, `BootOrder:` and similar summary lines never
-/// have hex digits in that position and are skipped.
+/// `BootCurrent:`, `BootOrder:` and similar summary lines have no four hex
+/// digits right after `Boot` and are skipped.
 fn boot_entry_ids(listing: &str) -> Vec<String> {
     listing
         .lines()
         .filter_map(|line| {
-            let rest = line.strip_prefix(BOOT_ENTRY_LINE_PREFIX)?;
-            let id = rest.get(..BOOT_ENTRY_ID_LEN)?;
-            if !id.bytes().all(|b| b.is_ascii_hexdigit()) {
-                return None;
-            }
-            rest[BOOT_ENTRY_ID_LEN..]
-                .starts_with(BOOT_ENTRY_ACTIVE_MARKER)
+            let id = line
+                .strip_prefix(BOOT_ENTRY_LINE_PREFIX)?
+                .get(..BOOT_ENTRY_ID_LEN)?;
+            id.bytes()
+                .all(|b| b.is_ascii_hexdigit())
                 .then(|| id.to_string())
         })
         .collect()
@@ -103,10 +97,8 @@ fn run_efibootmgr(args: &[String]) -> Result<String, FlashError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Delete every active EFI boot entry, omnect or not — a full rebuild is
-/// simpler than reconciling stale entries left by a previous flash or OS.
-/// Inactive entries are left alone, because `boot_entry_ids` requires the
-/// active marker.
+/// Delete every EFI boot entry, omnect or not — a full rebuild is simpler
+/// than reconciling stale entries left by a previous flash or OS.
 fn delete_existing_entries() -> Result<(), FlashError> {
     let listing = run_efibootmgr(&[])?;
     for id in boot_entry_ids(&listing) {
@@ -120,13 +112,12 @@ fn delete_existing_entries() -> Result<(), FlashError> {
 }
 
 /// Create the omnect boot entry and record the resulting `efibootmgr -v`
-/// listing on the boot partition, which callers must already have mounted at
-/// `EFI_MOUNT_POINT`.
-fn write_boot_entry(target_disk: &Path) -> Result<(), FlashError> {
+/// listing on the boot partition mounted at `boot_mount`.
+fn write_boot_entry(target_disk: &Path, boot_mount: &Path) -> Result<(), FlashError> {
     run_efibootmgr(&entry_args(target_disk))?;
 
     let dump = run_efibootmgr(&[EFIBOOTMGR_VERBOSE_FLAG.to_string()])?;
-    let dump_path = Path::new(EFI_MOUNT_POINT).join(EFI_ENTRY_DUMP_FILE);
+    let dump_path = boot_mount.join(EFI_ENTRY_DUMP_FILE);
     if let Some(parent) = dump_path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -137,9 +128,7 @@ fn write_boot_entry(target_disk: &Path) -> Result<(), FlashError> {
 
 /// Rebuild the EFI boot entry to point at a freshly flashed `target_disk`.
 ///
-/// A no-op when `machine_features` does not declare `efi`. Every active entry
-/// is deleted first, not only omnect's own — that is the behaviour this ports
-/// from the legacy scripts.
+/// A no-op when `machine_features` does not declare `efi`.
 pub fn handle(
     target_disk: &Path,
     boot_partition: &Path,
@@ -151,23 +140,12 @@ pub fn handle(
 
     delete_existing_entries()?;
 
-    fs::create_dir_all(EFI_MOUNT_POINT)?;
-    mount(MountPoint::new(
+    with_mount(
         boot_partition,
-        EFI_MOUNT_POINT,
+        Path::new(EFI_MOUNT_POINT),
         MountOptions::vfat(),
-    ))?;
-
-    // The mount above must not survive any failure below, so both the
-    // success and the error path go through the same unmount call.
-    let result = write_boot_entry(target_disk);
-    if let Err(e) = umount(Path::new(EFI_MOUNT_POINT)) {
-        if result.is_ok() {
-            return Err(FlashError::from(e));
-        }
-        log::warn!("also failed to unmount {EFI_MOUNT_POINT} after an EFI error: {e}");
-    }
-    result
+        |boot_mount| write_boot_entry(target_disk, boot_mount),
+    )
 }
 
 #[cfg(test)]
@@ -204,9 +182,10 @@ mod tests {
     }
 
     #[test]
-    fn boot_entry_ids_matches_only_active_hex_entries() {
+    fn boot_entry_ids_lists_every_entry_active_or_not() {
         let listing = "\
 BootCurrent: 0002
+BootNext: 0001
 Timeout: 1 seconds
 BootOrder: 0002,0000,0001
 Boot0000* Windows Boot Manager
@@ -215,7 +194,7 @@ Boot0002* omnect_os
 ";
         assert_eq!(
             boot_entry_ids(listing),
-            vec!["0000".to_string(), "0002".to_string()]
+            vec!["0000".to_string(), "0001".to_string(), "0002".to_string()]
         );
     }
 }

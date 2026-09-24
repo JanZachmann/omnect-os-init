@@ -1,8 +1,4 @@
-//! In-process replacements for the `dd` calls in the legacy flash scripts.
-//!
-//! Every one of them is a read and a write at a byte offset, so a seek plus a
-//! buffered copy covers all of them. Callers follow with `sync_all`, which the
-//! legacy scripts got for free when `dd` returned.
+//! Raw byte-range copies between block devices and files.
 
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
@@ -42,9 +38,8 @@ pub fn copy_range(
         .seek(SeekFrom::Start(src_offset))
         .map_err(|e| copy_failed(format!("seeking source: {e}")))?;
 
-    // Never `.create(true)`: the destination is an existing block device or
-    // file, and creating one where a typo expected a device would turn a
-    // mistake into a silent no-op that looks like success.
+    // The destination must already exist: a mistyped device path has to fail
+    // here instead of creating a regular file that makes the copy look done.
     let mut dst_file = OpenOptions::new()
         .write(true)
         .open(dst)
@@ -105,12 +100,6 @@ pub fn copy_range(
     }
 
     Ok(copied)
-}
-
-/// Flush every filesystem buffer to disk.
-pub fn sync_all() -> Result<(), FlashError> {
-    nix::unistd::sync();
-    Ok(())
 }
 
 #[cfg(test)]

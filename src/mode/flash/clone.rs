@@ -6,8 +6,7 @@
 //! `data` filesystems, and a default bootloader environment.
 //!
 //! There is no destructive write to the source, but three deliberate writes do
-//! reach it, each required and each matching the legacy scripts: clearing the
-//! flash triggers in the source bootloader environment, mounting the source
+//! reach it, each required: clearing the flash triggers in the source bootloader environment, mounting the source
 //! `data` partition read-write to persist the run log, and, on an EFI machine,
 //! rewriting the running machine's NVRAM boot entries.
 
@@ -18,11 +17,14 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::bootloader::sync_filesystems;
 use crate::config::build;
 use crate::error::FlashError;
+#[cfg(feature = "grub")]
+use crate::filesystem::MountOptions;
 use crate::filesystem::reformat_ext4;
 #[cfg(feature = "grub")]
-use crate::filesystem::{MountOptions, MountPoint, mount, umount};
+use crate::mode::flash::with_mount;
 use crate::mode::flash::{efi, rawio, sfdisk, unmount};
 use crate::partition::device::partition_sep_for;
 use crate::partition::layout::{
@@ -56,8 +58,6 @@ const BOOT_ENV_MOUNT_POINT: &str = "/tmp/clone-boot";
 #[cfg(feature = "uboot")]
 const UBOOT_ENV_SOURCE: &str = "/etc/omnect/uboot-env.bin";
 
-/// Also used by `sfdisk`, which names this constant when the size it carries
-/// cannot be scaled into a sector or byte count.
 pub(crate) const CONST_DATA_SIZE: &str = "DATA_SIZE";
 const CONST_BOOTLOADER_START: &str = "BOOTLOADER_START";
 const CONST_UBOOT_ENV1_START: &str = "UBOOT_ENV1_START";
@@ -70,8 +70,7 @@ const CONST_UBOOT_ENV_SIZE: &str = "UBOOT_ENV_SIZE";
 /// a source partition up in the layout.
 const LAYOUT_LOOKUP_OPERATION: &str = "lookup";
 
-/// Why a destination was refused. Shared with the tests, which assert on the
-/// condition an error reports rather than only on its presence.
+/// Why a destination was refused.
 const REASON_NO_DESTINATION: &str = "no destination given";
 const REASON_IDENTICAL_DISK: &str = "identical to the booted disk";
 const REASON_SOURCE_PARTITION: &str = "a partition of the booted disk";
@@ -221,7 +220,7 @@ pub fn validate_destination_path(destination: &Path, source: &Path) -> Result<()
     let source_name = resolved_source.to_string_lossy();
 
     if let Some(rest) = destination_name.strip_prefix(source_name.as_ref())
-        && unmount::is_disk_or_partition_suffix(rest)
+        && unmount::is_disk_or_partition_suffix(&resolved_source, rest)
     {
         let what = if rest.is_empty() {
             REASON_IDENTICAL_DISK
@@ -401,44 +400,39 @@ fn copy_grubenv(target: &Path) -> Result<(), FlashError> {
 /// Put the default GRUB environment on the clone's boot partition.
 #[cfg(feature = "grub")]
 fn write_boot_env(_constants: &Constants, destination: &Path) -> Result<(), FlashError> {
-    let boot = destination_partition(destination, PARTITION_NUM_BOOT);
-    fs::create_dir_all(BOOT_ENV_MOUNT_POINT)?;
-    mount(MountPoint::new(
-        &boot,
-        BOOT_ENV_MOUNT_POINT,
+    with_mount(
+        &destination_partition(destination, PARTITION_NUM_BOOT),
+        Path::new(BOOT_ENV_MOUNT_POINT),
         MountOptions::vfat(),
-    ))?;
+        |boot_mount| copy_grubenv(&boot_mount.join(GRUBENV_TARGET)),
+    )
+}
 
-    // The mount must not survive any failure below, so both the success and
-    // the error path go through the same unmount call.
-    let result = copy_grubenv(&Path::new(BOOT_ENV_MOUNT_POINT).join(GRUBENV_TARGET));
-    if let Err(e) = umount(Path::new(BOOT_ENV_MOUNT_POINT)) {
-        if result.is_ok() {
-            return Err(FlashError::from(e));
-        }
-        log::warn!("also failed to unmount {BOOT_ENV_MOUNT_POINT} after a boot-env error: {e}");
+/// The byte size of one U-Boot environment and the byte offset of every bank
+/// the machine reserves.
+#[cfg(feature = "uboot")]
+fn uboot_env_banks(constants: &Constants) -> Result<(u64, Vec<u64>), FlashError> {
+    let size_kb = constants
+        .uboot_env_size
+        .ok_or(FlashError::MissingBuildConstant(CONST_UBOOT_ENV_SIZE))?;
+    let first_kb = constants
+        .uboot_env1_start
+        .ok_or(FlashError::MissingBuildConstant(CONST_UBOOT_ENV1_START))?;
+
+    let mut offsets = vec![kb_to_bytes(first_kb, CONST_UBOOT_ENV1_START)?];
+    if let Some(second_kb) = constants.uboot_env2_start {
+        offsets.push(kb_to_bytes(second_kb, CONST_UBOOT_ENV2_START)?);
     }
-    result
+
+    Ok((kb_to_bytes(size_kb, CONST_UBOOT_ENV_SIZE)?, offsets))
 }
 
 /// Put the default U-Boot environment in every bank the machine reserves.
 #[cfg(feature = "uboot")]
 fn write_boot_env(constants: &Constants, destination: &Path) -> Result<(), FlashError> {
-    let size_kb = constants
-        .uboot_env_size
-        .ok_or(FlashError::MissingBuildConstant(CONST_UBOOT_ENV_SIZE))?;
-    let size = kb_to_bytes(size_kb, CONST_UBOOT_ENV_SIZE)?;
-    let first = constants
-        .uboot_env1_start
-        .ok_or(FlashError::MissingBuildConstant(CONST_UBOOT_ENV1_START))?;
+    let (size, offsets) = uboot_env_banks(constants)?;
 
-    let mut banks = vec![(CONST_UBOOT_ENV1_START, first)];
-    if let Some(second) = constants.uboot_env2_start {
-        banks.push((CONST_UBOOT_ENV2_START, second));
-    }
-
-    for (name, start_kb) in banks {
-        let offset = kb_to_bytes(start_kb, name)?;
+    for offset in offsets {
         log::info!(
             "writing {UBOOT_ENV_SOURCE} at {offset} bytes on {}",
             destination.display()
@@ -494,8 +488,8 @@ pub fn run_clone(ctx: &CloneCtx<'_>) -> Result<(), FlashError> {
 
     copy_bootloader_area(&constants, source, destination)?;
 
-    // Reformatting before the remaining copies keeps the legacy order. It is
-    // also what puts the clone into the first-boot condition.
+    // Empty `etc` and `data` filesystems are what put the clone into the
+    // first-boot condition.
     reformat_ext4(
         &destination_partition(destination, PARTITION_NUM_ETC),
         ETC_PARTITION_LABEL,
@@ -528,7 +522,8 @@ pub fn run_clone(ctx: &CloneCtx<'_>) -> Result<(), FlashError> {
     )?;
 
     log::info!("flash mode 1 finished");
-    rawio::sync_all()
+    sync_filesystems();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -658,7 +653,14 @@ mod tests {
     #[test]
     fn a_neighbouring_disk_passes_the_path_checks() {
         // The prefix match must not swallow a legitimate destination.
-        for (source, destination) in [("/dev/sda", "/dev/sdb"), ("/dev/sda", "/dev/sdab")] {
+        for (source, destination) in [
+            ("/dev/sda", "/dev/sdb"),
+            ("/dev/sda", "/dev/sdab"),
+            // A disk name ending in a digit takes a `p` before its partition
+            // number, so a bare digit here names another disk.
+            ("/dev/mmcblk1", "/dev/mmcblk10"),
+            ("/dev/nvme0n1", "/dev/nvme0n10"),
+        ] {
             assert!(
                 validate_destination_path(Path::new(destination), Path::new(source)).is_ok(),
                 "{destination} is not part of {source} and must pass"
@@ -675,6 +677,51 @@ mod tests {
         assert!(
             reason.contains(REASON_NO_DESTINATION),
             "an unset destination must be named as such, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_destination_present_when_the_wait_runs_out_counts_as_found() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(wait_for_block_device(file.path(), Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn a_destination_that_never_appears_times_out() {
+        let err = wait_for_block_device(Path::new("/nonexistent/destination"), Duration::ZERO)
+            .unwrap_err();
+        assert!(
+            matches!(err, FlashError::DestinationTimeout { .. }),
+            "got {err}"
+        );
+    }
+
+    #[cfg(feature = "uboot")]
+    fn uboot_constants(uboot_env2_start: Option<u64>) -> Constants {
+        Constants {
+            data_size: 524_288,
+            uboot_env1_start: Some(4096),
+            uboot_env2_start,
+            uboot_env_size: Some(64),
+            bootloader_start: None,
+        }
+    }
+
+    #[cfg(feature = "uboot")]
+    #[test]
+    fn uboot_env_size_and_offsets_are_scaled_from_kb_to_bytes() {
+        assert_eq!(
+            uboot_env_banks(&uboot_constants(Some(8192))).unwrap(),
+            (65_536, vec![4_194_304, 8_388_608])
+        );
+    }
+
+    #[cfg(feature = "uboot")]
+    #[test]
+    fn a_machine_without_a_second_env_bank_gets_one_write() {
+        assert_eq!(
+            uboot_env_banks(&uboot_constants(None)).unwrap(),
+            (65_536, vec![4_194_304])
         );
     }
 

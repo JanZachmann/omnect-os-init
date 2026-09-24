@@ -79,8 +79,9 @@ This matches the factory-reset precedent.
 Flash-mode detection happens right after the bootloader environment is opened,
 and `init_setup` is skipped when a flash mode is active.
 
-Current `run_init` order is: mount core partitions → open boot env → `init_setup`
-(extra-bootargs sync, then resize-data) → `BootMode::detect` → dispatch.
+Before this port, `run_init` ran: mount core partitions → open boot env →
+`init_setup` (extra-bootargs sync, then resize-data) → `BootMode::detect` →
+dispatch.
 
 `init_setup` acts on the running disk. Running it before a flash mode is wrong
 for a different reason per mode:
@@ -309,7 +310,7 @@ bootloader-environment write failure on the destination.
 pub enum BootMode {
     Normal,
     #[cfg(feature = "factory-reset")]
-    FactoryReset(factory_reset::config::FactoryResetConfig),
+    FactoryReset(FactoryResetTrigger),
     #[cfg(feature = "flash-mode")]
     Flash(flash::config::FlashConfig),
 }
@@ -348,11 +349,11 @@ overwrites. The reset request is destroyed, not deferred.
 
 ### 3.4 `src/lib.rs`
 
-`run_init` gains an early flash-mode check between the boot-env decision and
-`init_setup`:
+`BootMode::detect` moves between the boot-env decision and `init_setup`, and
+runs once:
 
-- flash mode active → dispatch directly, skipping `init_setup`;
-- otherwise → `init_setup` runs and dispatch happens where it does today.
+- `Flash` → dispatch directly, skipping `init_setup`;
+- any other mode → `init_setup` runs, then that mode is dispatched.
 
 The mode functions keep the existing signature convention: `run(ctx) ->
 Result<()>` whose `Ok` path never returns, the same contract
@@ -543,10 +544,11 @@ see §10.1.
 Applies on machines whose `MACHINE_FEATURES` contains `efi`. Ported from
 `flash_mode_efi_handling` in `common-sh`, unchanged:
 
-1. Delete every active EFI boot entry. `flash_mode_efi_handling` greps
-   `^Boot[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]\*`; the trailing `\*` is
-   the marker `efibootmgr` prints only on the currently active entry, so an
-   inactive one is left alone.
+1. Delete every EFI boot entry, active or not. `flash_mode_efi_handling` greps
+   with an unquoted `^Boot[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]\*`: the
+   shell turns `\*` into `*`, which `grep` reads as "zero or more" of the last
+   hex class, so every `Boot####` line matches, with or without the `*`
+   active marker.
 2. Mount the target boot partition — the destination's for mode 1, the running
    disk's for modes 2 and 3.
 3. Create an `omnect_os` entry pointing at `\EFI\BOOT\bootx64.efi` on partition 1
@@ -628,8 +630,8 @@ left half-written, which is unavoidable for a whole-disk flash.
 One capture mechanism for all three modes, mirrored to kmsg and the console as it
 runs. Persistence depends on whether a safe target exists:
 
-- **Mode 1** — the log is written to the **source** data partition,
-  unconditionally, as legacy does. Nothing in the sequence writes destructively
+- **Mode 1** — the log is written to the **source** data partition as
+  `flash-mode-1.log`, unconditionally, with the name and target legacy uses. Nothing in the sequence writes destructively
   to the source, so this is safe on both success and failure. Mode 1 mounts
   that partition itself for the write: nothing else does so on a flash boot.
   `mount_remaining_partitions` (which mounts `data` in the Normal path) runs
@@ -771,10 +773,10 @@ the EFI path has had no hardware run. Confirmation by the hardware CI on an EFI
 machine is therefore a condition for shipping this, not a note. If a machine
 still needs the second entry, restore it and record why here.
 
-### 10.3 Keep deleting every active EFI boot entry?
+### 10.3 Keep deleting every existing EFI boot entry?
 
-The current handling removes every active EFI boot entry on the machine before
-creating its own, including entries unrelated to omnect (§6 item 1).
+The current handling removes every EFI boot entry on the machine, active or
+not, before creating its own, including entries unrelated to omnect (§6 item 1).
 
 **Decided: keep — it is what ships today.**
 

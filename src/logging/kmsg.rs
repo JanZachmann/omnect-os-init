@@ -85,8 +85,6 @@ impl Log for KmsgLogger {
             let _ = kmsg.write_all(message.as_bytes());
         }
 
-        // Additive: a mode that asked for a capture gets a copy, everything
-        // else sees the kmsg write above and nothing more.
         crate::logging::capture_record(record);
     }
 

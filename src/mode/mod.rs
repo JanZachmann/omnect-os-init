@@ -131,7 +131,7 @@ impl BootMode {
     /// A set `flash-mode` selects `Flash`; a `factory-reset` with a non-blank
     /// value selects `FactoryReset`, whether or not that value can be used — an
     /// unusable one is carried as `FactoryResetTrigger::Rejected`, so it is
-    /// cleared and reported. A blank value is no trigger.
+    /// cleared and reported. A blank value of either key is no trigger.
     /// Both triggers at once is refused — they act on different disks and
     /// single-mode dispatch cannot perform both, so dropping one silently would
     /// be the worse failure. Both triggers are cleared before that refusal is
@@ -140,13 +140,16 @@ impl BootMode {
     ///
     /// A `flash-mode` value that selects nothing is logged and the device boots
     /// normally: an operator typo must not stop a device from booting.
-    /// Falls back to `Normal` when an env read fails, since a conflict cannot
-    /// be ruled out and the flash is the destructive, irreversible side. Never
-    /// blocks boot.
+    /// Falls back to `Normal` when a flash mode is set but the `factory-reset`
+    /// key cannot be read, since a conflict cannot be ruled out and the flash
+    /// is the destructive, irreversible side. Never blocks boot.
     pub fn detect(_bl: Option<&mut dyn BootEnv>) -> Result<Self> {
         if let Some(_bl) = _bl {
             #[cfg(feature = "flash-mode")]
             match _bl.get_env(BootEnvKey::FlashMode) {
+                // Blank is no trigger, for the same backend reason as the
+                // factory-reset key below.
+                Ok(Some(value)) if value.trim().is_empty() => {}
                 Ok(Some(value)) => match flash::config::parse_mode(&value) {
                     Some(mode) => {
                         #[cfg(feature = "factory-reset")]
@@ -172,7 +175,7 @@ impl BootMode {
                 },
                 Ok(None) => {}
                 Err(e) => {
-                    log::warn!("flash-mode: failed to read env, booting normally: {e}");
+                    log::warn!("flash-mode: failed to read env, treating it as unset: {e}");
                 }
             }
 
@@ -378,6 +381,20 @@ mod tests {
                     "a blank reset key is no trigger, so there is nothing to conflict with: {blank:?}"
                 );
             }
+        }
+
+        #[cfg(all(feature = "flash-mode-1", feature = "factory-reset"))]
+        #[test]
+        fn detect_normal_when_the_conflict_check_cannot_read_the_reset_key() {
+            // The flash-mode read succeeds, the factory-reset read fails: a
+            // conflict cannot be ruled out, so neither mode runs.
+            let mut mock = create_mock_bootloader()
+                .with_env(BootEnvKey::FlashMode, "1")
+                .with_env(BootEnvKey::FlashModeDevPath, "/dev/mmcblk2")
+                .with_get_env_error_after(1);
+            let mode = BootMode::detect(Some(&mut mock)).unwrap();
+            assert!(matches!(mode, BootMode::Normal));
+            assert!(mock.set_env_calls.is_empty());
         }
 
         #[test]

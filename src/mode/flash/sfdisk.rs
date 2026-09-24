@@ -12,9 +12,9 @@ use std::process::{Command, Stdio};
 
 use crate::error::FlashError;
 use crate::mode::flash::clone::CONST_DATA_SIZE;
-use crate::partition::layout::PARTITION_NUM_DATA;
 #[cfg(feature = "dos")]
 use crate::partition::layout::PARTITION_NUM_EXTENDED;
+use crate::partition::layout::{PARTITION_NUM_DATA, partition_suffix};
 
 pub const SFDISK_CMD: &str = "/sbin/sfdisk";
 const SFDISK_DUMP_FLAG: &str = "-d";
@@ -301,16 +301,11 @@ fn find_partition_line(lines: &[String], partition_num: u32) -> Option<usize> {
 /// Parse the partition number out of a dump line's device path, e.g.
 /// `/dev/mmcblk0p7 : start=...` -> `7`.
 fn partition_number(line: &str) -> Option<u32> {
-    let token = line
-        .trim_start()
-        .strip_prefix(DEVICE_LINE_PREFIX)?
-        .split_whitespace()
-        .next()?;
-    let digit_start = token
-        .rfind(|c: char| !c.is_ascii_digit())
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    token[digit_start..].parse().ok()
+    let device = line.split_whitespace().next()?;
+    if !device.starts_with(DEVICE_LINE_PREFIX) {
+        return None;
+    }
+    partition_suffix(Path::new(device))
 }
 
 /// Read a `field=value` pair out of a dump line, up to the next comma.

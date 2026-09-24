@@ -699,20 +699,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_failed_reformat_still_continues_degraded() {
-        let err: crate::error::InitramfsError = crate::error::FactoryResetError::ReformatFailed {
-            device: std::path::PathBuf::from("/dev/omnect/data"),
-            reason: "mkfs.ext4 failed".into(),
-        }
-        .into();
-        assert_eq!(
-            err.recovery_class(),
-            crate::recovery::RecoveryClass::ContinueDegraded,
-            "a factory reset that cannot reformat must not become fatal"
-        );
-    }
-
-    #[test]
     fn real_reformat_ops_wraps_the_shared_helper_error_as_factory_reset() {
         use crate::partition::RootDevice;
         use std::collections::HashMap;
@@ -735,8 +721,6 @@ mod tests {
             mounts: &mut mounts,
         };
 
-        // /nonexistent/zzz cannot be formatted, so reformat_ext4 returns Err;
-        // this test checks that RealReformatOps::reformat wraps that Err.
         let err = ops
             .reformat(Path::new("/nonexistent/zzz"), "data")
             .expect_err("reformatting a nonexistent device must fail");

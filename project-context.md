@@ -162,9 +162,9 @@ The `BootMode` enum (`src/mode/mod.rs`) has the following implemented variants:
   of the boot continuing in silence.
 
 Data partition resize (feature = `resize-data`) is handled as an init setup step in
-`src/init_setup/resize_data.rs`, not as a separate `BootMode` variant. It runs before
-`BootMode::detect()` and handles both the live-bootloader (guard check) and degraded-boot
-(no guard, resize runs every boot) cases.
+`src/init_setup/resize_data.rs`, not as a separate `BootMode` variant. It runs after
+`BootMode::detect()`, is skipped for a flash mode, and handles both the live-bootloader
+(guard check) and degraded-boot (no guard, resize runs every boot) cases.
 
 `Flash(FlashConfig)` is implemented for mode 1 (feature `flash-mode`, pulled in by
 `flash-mode-1`): it clones the running disk onto another block device and powers off

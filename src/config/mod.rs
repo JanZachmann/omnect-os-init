@@ -99,8 +99,7 @@ fn load_machine_features() -> String {
 /// Parses `MACHINE_FEATURES="<space-separated features>"` out of the
 /// contents of an `/etc/os-release`-shaped file.
 ///
-/// A missing key or a line without a quoted value yields an empty string,
-/// matching the legacy `awk -F'"' '{print $2}'` extraction used to read it.
+/// A missing key or a line without a quoted value yields an empty string.
 pub fn parse_machine_features(os_release: &str) -> String {
     os_release
         .lines()
@@ -168,8 +167,6 @@ mod tests {
 
     #[test]
     fn machine_features_unquoted_value_is_empty() {
-        // Mirrors the legacy `awk -F'"'` extraction: without quotes there is
-        // no field 2, so the line is treated as unparsable.
         let os_release = "MACHINE_FEATURES=efi usbhost\n";
         assert_eq!(parse_machine_features(os_release), "");
     }

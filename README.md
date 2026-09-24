@@ -63,16 +63,22 @@ flowchart TD
     APPLY -->|Fatal| FEB
     APPLY -->|"OK\nDegraded: ods.degraded_boot=true"| FBDETECT["compute_first_boot()\nset_update_pending()"]
 
-    FBDETECT --> ISETUP["init_setup::run()\nextra_bootargs sync — always\nresize-data preflight if feature = resize-data"]
+    FBDETECT --> BMODE{"BootMode::detect()"}
+    BMODE -->|"Fatal: flash and factory reset\nboth queued (both cleared)"| FEB
+    BMODE -->|"Flash(config)\nfeature = flash-mode"| FLASH
+    BMODE -->|"Normal / FactoryReset"| ISETUP["init_setup::run()\nextra_bootargs sync — always\nresize-data preflight if feature = resize-data"]
+
+    FLASH["flash::run()\nclear flash triggers → clone (mode 1)\nrun log → source data partition"]
+    FLASH -->|OK| POWEROFF(["⏻ poweroff"])
+    FLASH -->|Fatal| FEB
+
     ISETUP -->|"FsckRequiresReboot\nExtraBootArgsUpdated"| FEB
-    ISETUP -->|"ResizeData error\nContinueDegraded — warn"| BMODE{"BootMode::detect()"}
+    ISETUP -->|"ResizeData error\nContinueDegraded — warn"| DISPATCH{"dispatch mode"}
     ISETUP -->|"Fatal (non-resize)"| FEB
-    ISETUP -->|OK| BMODE
+    ISETUP -->|OK| DISPATCH
 
-    BMODE -->|Fatal| FEB
-
-    BMODE -->|Normal| MREM["mount_remaining_partitions()\ndata · factory · cert + fsck\npersist_fsck_results — always"]
-    BMODE -->|"FactoryReset(trigger)\nfeature = factory-reset"| FCLEAR
+    DISPATCH -->|Normal| MREM["mount_remaining_partitions()\ndata · factory · cert + fsck\npersist_fsck_results — always"]
+    DISPATCH -->|"FactoryReset(trigger)\nfeature = factory-reset"| FCLEAR
 
     subgraph FRESET["factory_reset::run() — always ContinueDegraded"]
         direction TB
@@ -115,7 +121,7 @@ flowchart TD
     classDef halt fill:#7a1a1a,color:#fff,stroke:#4d0d0d
     classDef shell fill:#7a4a1a,color:#fff,stroke:#4d2d0d
 
-    class SUCCESS success
+    class SUCCESS,POWEROFF success
     class REBOOT reboot
     class HALT1,HALT2 halt
     class ESHELL,DSHELL shell
@@ -126,6 +132,7 @@ flowchart TD
 | Symbol | Outcome | Trigger |
 |--------|---------|---------|
 | ✅ | `switch_root` — systemd takes over | Normal completion |
+| ⏻ | Power off | Flash mode 1 finished; the clone can be moved to its own device |
 | 🔁 | Reboot | `FsckRequiresReboot` (unconditional); or any fatal error while `omnect_validate_update` is set — triggers bootloader OTA rollback |
 | 🔴 | Halt (kmsg loop, infinite) | Fatal error · release image · no OTA in flight |
 | 🐚 | Debug shell (bash → sh fallback, respawning) | Fatal error · debug image · no OTA in flight |
@@ -297,16 +304,9 @@ cargo test --features uboot,dos,release-image,test-utils
 cargo test --features grub,gpt,resize-data,release-image,test-utils
 cargo test --features uboot,gpt,resize-data,release-image,test-utils
 
-# Flash mode 1 (already covered above too: flash-mode-1 is in the default
-# feature set, so every "base" combination already includes it — these list
-# it explicitly against every bootloader × partition-table pair, plus the
-# one combination that also needs factory-reset to compile the
-# conflicting-trigger refusal path)
-cargo test --features grub,gpt,flash-mode-1,test-utils
-cargo test --features grub,dos,flash-mode-1,test-utils
-cargo test --features uboot,gpt,flash-mode-1,test-utils
-cargo test --features uboot,dos,flash-mode-1,test-utils
-cargo test --features uboot,gpt,flash-mode-1,factory-reset,test-utils
+# flash-mode-1 is in the default feature set, so every combination above
+# already builds and tests it; the factory-reset ones also cover the refusal
+# of a flash mode queued together with a factory reset.
 
 # Without any flash feature: flash-mode-1 is in the default set, so
 # --no-default-features is required to exclude it; --features alone is

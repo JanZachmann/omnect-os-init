@@ -155,7 +155,7 @@ pub(crate) const PARTITION_NUM_DATA: u32 = 8;
 ///
 /// Uses the *trailing* digit run, not the first digit found, so that devices
 /// like `mmcblk0p2` (which contain digits in the base name) are handled correctly.
-fn partition_suffix(path: &std::path::Path) -> Option<u32> {
+pub(crate) fn partition_suffix(path: &std::path::Path) -> Option<u32> {
     let s = path.file_name().and_then(|s| s.to_str())?;
     let digit_start = s
         .rfind(|c: char| !c.is_ascii_digit())

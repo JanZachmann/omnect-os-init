@@ -75,8 +75,6 @@ mod tests {
     #[cfg(feature = "flash-mode-1")]
     #[test]
     fn parse_devpath_takes_the_value_verbatim() {
-        // Both legacy backends already return a bare value, so the `cut -d= -f2`
-        // the legacy script applies here is dead code and is not ported.
         assert_eq!(
             parse_devpath(Some("/dev/mmcblk2")).unwrap(),
             PathBuf::from("/dev/mmcblk2")
