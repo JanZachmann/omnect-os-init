@@ -2,7 +2,7 @@
 //!
 //! This module provides logging to /dev/kmsg with kernel log levels.
 
-mod capture;
+pub(crate) mod capture;
 mod kmsg;
 
 pub(crate) use self::capture::capture_record;

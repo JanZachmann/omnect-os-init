@@ -49,7 +49,7 @@ src/
 │       ├── clone.rs         # Mode 1 orchestration (feature = flash-mode-1)
 │       ├── sfdisk.rs        # Partition-table dump parsing and rewriting (feature = flash-mode-1)
 │       ├── rawio.rs         # In-process replacement for every `dd` call (feature = flash-mode-1)
-│       └── unmount.rs       # /sysroot teardown and /proc/mounts sweep (feature = flash-mode-1)
+│       └── unmount.rs       # /sysroot teardown (feature = flash-mode-1)
 ├── partition/
 │   ├── mod.rs               # Public API
 │   ├── device.rs            # Root device detection (GRUB: blkid/fsuuid, U-Boot: root=)

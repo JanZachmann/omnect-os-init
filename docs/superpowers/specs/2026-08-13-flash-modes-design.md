@@ -137,7 +137,7 @@ src/mode/flash/
   clone.rs      mode 1 orchestration                                     flash-mode-1
   sfdisk.rs     partition-table dump parsing and rewriting      (pure)   flash-mode-1
   rawio.rs      in-process replacement for every `dd` call               flash-mode-1
-  unmount.rs    `/sysroot` teardown and `/proc/mounts` sweep             flash-mode-1
+  unmount.rs    `/sysroot` teardown                                      flash-mode-1
   net.rs        interface up, dhcpcd, dropbear                           flash-mode-2/3
   bmap.rs       bmaptool wrapper                                         flash-mode-2/3
   scp.rs        mode 2 orchestration                                     flash-mode-2
@@ -146,9 +146,10 @@ src/mode/flash/
 
 The right column is the gating feature (§3.6). `rawio.rs` and `unmount.rs` were
 not anticipated in the original design; both hold logic modes 2 and 3 are
-expected to reuse (the byte-offset copy, and the `/sysroot`-plus-`/proc/mounts`
-teardown of §5.1), but each is gated on `flash-mode-1` for now, since mode 1 is
-the only mode implemented so far. Widening the gate is expected once mode 2 or
+expected to reuse (the byte-offset copy, and the `/sysroot` teardown that §5.1
+extends with a `/proc/mounts` sweep), but each is gated on `flash-mode-1` for
+now, since mode 1 is the only mode implemented so far. The sweep is added with
+mode 2, its first caller. Widening the gate is expected once mode 2 or
 3 lands.
 
 External tools are invoked through `std::process::Command` with named `const`
@@ -232,6 +233,11 @@ image is usrmerged — `/bin -> usr/bin` and `/sbin -> usr/sbin` — so the
 `efibootmgr` is absent from the verified image, which has no `efi` in
 `MACHINE_FEATURES` — consistent with the recipe gating and with §6 applying only
 on EFI machines.
+
+The verified image is the one built with the legacy scripts. The Rust
+initramfs recipe names only the `e2fsprogs` sub-packages it needs for the other
+boot paths, so it has to install `e2fsprogs` (for `e2image`) and, on EFI
+machines, `efibootmgr` itself (§12).
 
 The remaining tools stay external because no pure-Rust equivalent exists at a
 dependency weight an initramfs can carry: `sfdisk` (partition tables),
@@ -394,22 +400,26 @@ work tracked in §12 rather than part of the port.
 
 ### 4.1 Sequence
 
-1. Read `flash-mode-devpath`. Clear `flash-mode` and `flash-mode-devpath`.
+1. Read `flash-mode-devpath`. Clear `flash-mode` and `flash-mode-devpath`. A
+   missing, blank or unreadable devpath does not stop detection; its reason is
+   carried to the mode, which fails with it inside the log capture, so the
+   persisted log says why no destination was used.
 2. Validate the required build-time constants: `DATA_SIZE` always; on U-Boot
    also `UBOOT_ENV1_START` and `UBOOT_ENV_SIZE`. `UBOOT_ENV1_START` is also
    required whenever `BOOTLOADER_START` is set, independently of the
    bootloader feature, because step 8 computes the bootloader-area copy
    length as `UBOOT_ENV1_START - BOOTLOADER_START`. `UBOOT_ENV2_START` is
    optional (§10.7).
-3. Reject an empty destination, and one equal to the source or to a partition
-   of it, on the value as given. These need no device node, so they run ahead
-   of the wait and report a misconfiguration at once instead of after the full
-   timeout.
-4. Wait for the destination block device, bounded (§7). Then resolve the
-   destination path — once, here, because resolving needs the node to exist —
-   and use the resolved path for every step that follows. Repeat the checks of
-   step 3 on it, so an alias spelling of the running disk is caught too, and
-   reject a destination that is not a block device.
+3. Wait for the destination block device, bounded (§7). A destination that
+   belongs to the source always exists already, so the wait returns at once
+   for it; only a path that names no device at all waits the full timeout.
+4. Resolve the destination path — once, here, because resolving needs the node
+   to exist — and use the resolved path for every step that follows. Reject a
+   destination that is not a block device, and one whose device number is the
+   source disk's or whose parent disk (read from `/sys/dev/block`) is the
+   source disk. Comparing device numbers catches every alias spelling of the
+   running disk. A destination sysfs does not list is refused, because a
+   partition of the source cannot be ruled out.
 5. `sync`, then unmount `/sysroot` completely — the boot partition first, then the
    rootfs. Both are mounted by `mount_core_partitions` on both bootloaders. The
    boot unmount is needed so the raw copy of the boot partition reads a
@@ -859,7 +869,8 @@ only smoke-tested. Real end-to-end coverage stays in Concourse CI on hardware.
 | scp instruction text includes the acquired IP | unit | `src/mode/flash/scp.rs` |
 | Detection: both triggers set → both cleared, then refused | unit | `src/mode/mod.rs` |
 | Detection: mode 2 flag-file trigger, present and absent | integration | `tests/flash_modes.rs` |
-| Clear-first ordering, asserted via `set_env_calls` | integration | `tests/flash_modes.rs` |
+| Clear-first ordering: a failing mode still leaves its triggers cleared | unit | `src/mode/flash/mod.rs` |
+| Destination refusal by device number, parent disk from a fake sysfs tree | unit | `src/mode/flash/clone.rs` |
 | Boot-env read failure falls back to Normal boot | integration | `tests/flash_modes.rs` |
 
 `tests/flash_modes.rs` follows `tests/factory_reset.rs` and uses the existing
@@ -869,9 +880,11 @@ only smoke-tested. Real end-to-end coverage stays in Concourse CI on hardware.
 
 Implemented separately, listed here so nothing is lost:
 
-- pass `OMNECT_PART_OFFSET_BOOT`, `OMNECT_PART_SIZE_BOOT` and
-  `OMNECT_FLASH_MODE_2_DIRECT_FLASHING` into the `omnect-os-init` build
-  environment, the same way the existing five constants are passed;
+- export the five mode 1 constants of §2.7 into the `omnect-os-init` build
+  environment (`omnect-os-init.inc`). Without them every constant is `None`,
+  and mode 1 fails with a missing build constant before it writes anything;
+- for mode 2, pass `OMNECT_PART_OFFSET_BOOT`, `OMNECT_PART_SIZE_BOOT` and
+  `OMNECT_FLASH_MODE_2_DIRECT_FLASHING` the same way;
 - map `DISTRO_FEATURES` `flash-mode-2` and `flash-mode-3` onto the corresponding
   Cargo features;
 - gate mode 1 the same way: map `DISTRO_FEATURES` `flash-mode-1` onto the Cargo
@@ -885,12 +898,11 @@ Implemented separately, listed here so nothing is lost:
 - `util-linux-uuidgen` can be dropped from the initramfs once the port ships:
   `uuidgen` is called from `flash-mode-1` and nowhere else, and the Rust port
   generates the UUID itself (§2.8);
-- **no other package changes needed.** Verified against `buildhistory` for a built
-  `omnect-os-initramfs`: every tool the three modes need is already installed
-  (§2.8). In particular `e2image` ships in the base `e2fsprogs` package at
-  `/usr/sbin/e2image`, which `PACKAGE_INSTALL` already pulls in, so the fact that
-  the recipe names only `e2fsprogs`, `e2fsprogs-mke2fs` and `e2fsprogs-tune2fs` is
-  not a gap.
+- install `e2fsprogs` and, on EFI machines, `efibootmgr` in the Rust
+  initramfs image. `e2image` ships in the base `e2fsprogs` package, and the
+  Rust image names only the `e2fsprogs-e2fsck`, `-mke2fs` and `-tune2fs`
+  sub-packages; `buildhistory` for a Rust-init `omnect-os-initramfs` has no
+  `e2image` (§2.8).
 
 ## 13. Interactions
 

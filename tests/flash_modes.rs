@@ -19,7 +19,7 @@ fn a_set_flash_mode_selects_the_flash_boot_mode() {
         panic!("a set flash-mode must select the flash mode");
     };
     assert_eq!(config.mode, FlashMode::Mode1);
-    assert_eq!(config.devpath.as_deref(), Some(Path::new("/dev/mmcblk2")));
+    assert_eq!(config.devpath.as_deref(), Ok(Path::new("/dev/mmcblk2")));
 }
 
 #[test]

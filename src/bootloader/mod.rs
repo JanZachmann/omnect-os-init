@@ -289,6 +289,9 @@ pub struct MockBootEnv {
     fsck: std::collections::HashMap<PartitionName, FsckRecord>,
     /// Keys passed to set_env, in call order. Used by tests to verify set_env was/wasn't called.
     pub set_env_calls: Vec<BootEnvKey>,
+    /// The same keys, shared so a test can read them after the mock was
+    /// moved into a `Box<dyn BootEnv>`.
+    shared_set_env_calls: std::sync::Arc<std::sync::Mutex<Vec<BootEnvKey>>>,
     /// When true, `get_env` returns an error instead of looking up the key.
     get_env_errors: bool,
     /// When set, `get_env` succeeds for this many calls, then errors. Lets a
@@ -296,6 +299,8 @@ pub struct MockBootEnv {
     get_env_ok_calls: Option<usize>,
     /// Count of `get_env` calls seen, for `get_env_ok_calls`.
     get_env_seen: std::sync::atomic::AtomicUsize,
+    /// Keys whose `get_env` returns an error while every other key reads fine.
+    get_env_error_keys: Vec<BootEnvKey>,
     /// When true, `set_env` returns an error instead of setting the key.
     set_env_errors: bool,
     /// When set, `set_env` stores this fixed value instead of the given one,
@@ -332,6 +337,11 @@ impl MockBootEnv {
         self
     }
 
+    pub fn with_get_env_error_for(mut self, key: BootEnvKey) -> Self {
+        self.get_env_error_keys.push(key);
+        self
+    }
+
     pub fn with_set_env_error(mut self) -> Self {
         self.set_env_errors = true;
         self
@@ -352,6 +362,12 @@ impl MockBootEnv {
         self
     }
 
+    /// A handle to this mock's `set_env` call log, readable even after the
+    /// mock has been moved and dropped.
+    pub fn shared_set_env_calls(&self) -> std::sync::Arc<std::sync::Mutex<Vec<BootEnvKey>>> {
+        std::sync::Arc::clone(&self.shared_set_env_calls)
+    }
+
     /// A handle to this mock's `save_fsck_status` call log, readable even
     /// after the mock has been moved and dropped.
     pub fn saved_fsck_calls(
@@ -367,7 +383,10 @@ impl BootEnv for MockBootEnv {
         let seen = self
             .get_env_seen
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.get_env_errors || self.get_env_ok_calls.is_some_and(|ok| seen >= ok) {
+        if self.get_env_errors
+            || self.get_env_ok_calls.is_some_and(|ok| seen >= ok)
+            || self.get_env_error_keys.contains(&key)
+        {
             return Err(crate::error::BootEnvError::CommandFailed {
                 command: "mock".into(),
                 reason: "injected error".into(),
@@ -384,6 +403,7 @@ impl BootEnv for MockBootEnv {
             });
         }
         self.set_env_calls.push(key);
+        self.shared_set_env_calls.lock().unwrap().push(key);
         let to_store = match &self.set_env_normalize {
             Some(forced) => Some(forced.clone()),
             None => value.map(|v| v.to_string()),

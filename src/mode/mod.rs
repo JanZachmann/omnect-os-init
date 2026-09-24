@@ -92,8 +92,9 @@ fn clear_flash_and_reset_triggers(bl: &mut dyn BootEnv) {
 
 /// Build the config for a recognised flash mode.
 ///
-/// The devpath is read best-effort: an unusable value is not fatal here
-/// because validating it is the mode's own job, not detection's.
+/// An unusable devpath is carried in the config rather than raised: detection
+/// runs before the mode starts its log capture, and the mode is where the
+/// reason has to reach the persisted log.
 #[cfg(feature = "flash-mode")]
 fn build_flash_config(
     _bl: &mut dyn BootEnv,
@@ -101,21 +102,8 @@ fn build_flash_config(
 ) -> flash::config::FlashConfig {
     #[cfg(feature = "flash-mode-1")]
     let devpath = match _bl.get_env(BootEnvKey::FlashModeDevPath) {
-        Ok(value) => match flash::config::parse_devpath(value.as_deref()) {
-            Ok(path) => Some(path),
-            Err(e) => {
-                log::warn!(
-                    "flash-mode-devpath: unusable value, continuing without a destination: {e}"
-                );
-                None
-            }
-        },
-        Err(e) => {
-            log::warn!(
-                "flash-mode-devpath: failed to read env, continuing without a destination: {e}"
-            );
-            None
-        }
+        Ok(value) => flash::config::parse_devpath(value.as_deref()),
+        Err(e) => Err(format!("failed to read env: {e}")),
     };
 
     flash::config::FlashConfig {
@@ -140,9 +128,9 @@ impl BootMode {
     ///
     /// A `flash-mode` value that selects nothing is logged and the device boots
     /// normally: an operator typo must not stop a device from booting.
-    /// Falls back to `Normal` when a flash mode is set but the `factory-reset`
-    /// key cannot be read, since a conflict cannot be ruled out and the flash
-    /// is the destructive, irreversible side. Never blocks boot.
+    /// Falls back to `Normal` when either trigger key cannot be read while a
+    /// flash mode may be set, since a conflict cannot be ruled out and both
+    /// modes are destructive. Never blocks boot.
     pub fn detect(_bl: Option<&mut dyn BootEnv>) -> Result<Self> {
         if let Some(_bl) = _bl {
             #[cfg(feature = "flash-mode")]
@@ -175,7 +163,8 @@ impl BootMode {
                 },
                 Ok(None) => {}
                 Err(e) => {
-                    log::warn!("flash-mode: failed to read env, treating it as unset: {e}");
+                    log::warn!("flash-mode: failed to read env, booting normally: {e}");
+                    return Ok(Self::Normal);
                 }
             }
 
@@ -318,7 +307,7 @@ mod tests {
             assert_eq!(config.mode, crate::mode::flash::config::FlashMode::Mode1);
             assert_eq!(
                 config.devpath.as_deref(),
-                Some(std::path::Path::new("/dev/mmcblk2"))
+                Ok(std::path::Path::new("/dev/mmcblk2"))
             );
             // The success path clears nothing: clearing is the mode's own first step.
             assert!(mock.set_env_calls.is_empty());
@@ -397,11 +386,36 @@ mod tests {
             assert!(mock.set_env_calls.is_empty());
         }
 
+        #[cfg(feature = "factory-reset")]
         #[test]
         fn detect_normal_when_the_flash_mode_key_cannot_be_read() {
-            let mut mock = create_mock_bootloader().with_get_env_error();
+            // The reset key reads fine, but a flash mode set next to it cannot
+            // be ruled out, so the reset must not run either.
+            let mut mock = create_mock_bootloader()
+                .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#)
+                .with_get_env_error_for(BootEnvKey::FlashMode);
             let mode = BootMode::detect(Some(&mut mock)).unwrap();
             assert!(matches!(mode, BootMode::Normal));
+            assert!(mock.set_env_calls.is_empty());
+        }
+
+        #[cfg(feature = "flash-mode-1")]
+        #[test]
+        fn detect_carries_the_reason_an_unusable_destination_was_dropped() {
+            let mut unset = create_mock_bootloader().with_env(BootEnvKey::FlashMode, "1");
+            let mut unreadable = create_mock_bootloader()
+                .with_env(BootEnvKey::FlashMode, "1")
+                .with_get_env_error_for(BootEnvKey::FlashModeDevPath);
+            for (mock, expected) in [
+                (&mut unset, "not set"),
+                (&mut unreadable, "failed to read env"),
+            ] {
+                let Ok(BootMode::Flash(config)) = BootMode::detect(Some(mock)) else {
+                    panic!("an unusable destination must still select the flash mode");
+                };
+                let reason = config.devpath.unwrap_err();
+                assert!(reason.contains(expected), "got: {reason}");
+            }
         }
     }
 }

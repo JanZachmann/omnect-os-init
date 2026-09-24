@@ -92,13 +92,14 @@ pub(crate) fn take_capture() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The capture is process-global, so every test that switches it on and off
+/// holds this lock.
+#[cfg(test)]
+pub(crate) static SERIALIZE: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The capture is process-global, so the tests that switch it on and off
-    /// run one at a time.
-    static SERIALIZE: Mutex<()> = Mutex::new(());
 
     fn log_at_info(message: &str) {
         capture_record(

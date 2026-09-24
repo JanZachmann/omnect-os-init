@@ -11,11 +11,13 @@
 //! rewriting the running machine's NVRAM boot entries.
 
 use std::fs;
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
+
+use nix::sys::stat::{major, makedev, minor};
 
 use crate::bootloader::sync_filesystems;
 use crate::config::build;
@@ -71,10 +73,14 @@ const CONST_UBOOT_ENV_SIZE: &str = "UBOOT_ENV_SIZE";
 const LAYOUT_LOOKUP_OPERATION: &str = "lookup";
 
 /// Why a destination was refused.
-const REASON_NO_DESTINATION: &str = "no destination given";
 const REASON_IDENTICAL_DISK: &str = "identical to the booted disk";
 const REASON_SOURCE_PARTITION: &str = "a partition of the booted disk";
 const REASON_NOT_A_BLOCK_DEVICE: &str = "not a block device";
+const REASON_UNKNOWN_DISK: &str = "the disk it belongs to is unknown to sysfs";
+
+/// Block devices by device number, each a link to the device's sysfs
+/// directory.
+const SYS_DEV_BLOCK: &str = "/sys/dev/block";
 
 /// The roles the clone writes, and therefore the destination partitions that
 /// have to exist once the rewritten table has been applied. A DOS extended
@@ -186,74 +192,79 @@ pub fn destination_partition(destination: &Path, num: u32) -> PathBuf {
     destination_device(destination).partition_path(num)
 }
 
-/// Resolve a path as far as the filesystem allows, keeping it as given when
-/// it cannot be resolved. An unresolvable path still has to take part in the
-/// source comparison; the block-device check rejects it afterwards.
-fn resolve(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// Refuse a destination that is empty, that is the disk the device booted
-/// from, or that is one of that disk's partitions.
-///
-/// Both sides of the comparison are resolved first, so a symlink or an alias
-/// spelling of the running disk is caught too. Writing a partition table into
-/// a partition of the running disk would damage the source before the next
-/// step could notice, so the partition case is refused here rather than left
-/// to the block-device checks.
-///
-/// Cheap enough to run before the device wait, which is what lets an unset
-/// destination be reported by name instead of after the full timeout.
-pub fn validate_destination_path(destination: &Path, source: &Path) -> Result<(), FlashError> {
-    let invalid = |reason: String| FlashError::InvalidDestination {
-        device: destination.to_path_buf(),
-        reason,
-    };
-
-    if destination.as_os_str().is_empty() {
-        return Err(invalid(REASON_NO_DESTINATION.to_string()));
-    }
-
-    let resolved_destination = resolve(destination);
-    let resolved_source = resolve(source);
-    let destination_name = resolved_destination.to_string_lossy();
-    let source_name = resolved_source.to_string_lossy();
-
-    if let Some(rest) = destination_name.strip_prefix(source_name.as_ref())
-        && unmount::is_disk_or_partition_suffix(&resolved_source, rest)
-    {
-        let what = if rest.is_empty() {
-            REASON_IDENTICAL_DISK
-        } else {
-            REASON_SOURCE_PARTITION
-        };
-        return Err(invalid(format!("{what} {}", source.display())));
-    }
-
-    Ok(())
-}
-
-/// Everything `validate_destination_path` refuses, plus a destination that is
-/// not a block device.
-///
-/// The path checks are repeated rather than assumed: before the device wait
-/// they can only compare the spellings, because `canonicalize` fails on a node
-/// that does not exist yet. Run here, on a destination the wait has seen, they
-/// resolve for real.
-pub fn validate_destination(destination: &Path, source: &Path) -> Result<(), FlashError> {
-    validate_destination_path(destination, source)?;
-
-    let invalid = |reason: String| FlashError::InvalidDestination {
-        device: destination.to_path_buf(),
-        reason,
-    };
-
-    let metadata = fs::metadata(destination).map_err(|e| invalid(format!("cannot stat: {e}")))?;
+/// The device number of `path`, which has to be a block device.
+fn block_devnum(path: &Path) -> Result<u64, String> {
+    let metadata = fs::metadata(path).map_err(|e| format!("cannot stat: {e}"))?;
     if !metadata.file_type().is_block_device() {
-        return Err(invalid(REASON_NOT_A_BLOCK_DEVICE.to_string()));
+        return Err(REASON_NOT_A_BLOCK_DEVICE.to_string());
     }
+    Ok(metadata.rdev())
+}
 
-    Ok(())
+/// The device number of the whole disk `devnum` sits on: `devnum` itself for
+/// a disk, the parent disk for a partition. `None` when sysfs does not list it.
+fn whole_disk_devnum(sys_dev_block: &Path, devnum: u64) -> Option<u64> {
+    let node = sys_dev_block.join(format!("{}:{}", major(devnum), minor(devnum)));
+    if !node.exists() {
+        return None;
+    }
+    if !node.join("partition").exists() {
+        return Some(devnum);
+    }
+    // The kernel resolves `..` after following the link, so this reads the
+    // `dev` file of the parent disk's directory.
+    let parent = fs::read_to_string(node.join("../dev")).ok()?;
+    let (parent_major, parent_minor) = parent.trim().split_once(':')?;
+    Some(makedev(
+        parent_major.parse().ok()?,
+        parent_minor.parse().ok()?,
+    ))
+}
+
+/// Why a destination on `destination_disk` is refused for `source`, if it is.
+fn refusal(destination: u64, destination_disk: Option<u64>, source: u64) -> Option<&'static str> {
+    if destination == source {
+        return Some(REASON_IDENTICAL_DISK);
+    }
+    match destination_disk {
+        None => Some(REASON_UNKNOWN_DISK),
+        Some(disk) if disk == source => Some(REASON_SOURCE_PARTITION),
+        Some(_) => None,
+    }
+}
+
+/// Refuse a destination that is not a block device, that is the disk the
+/// device booted from, or that is one of that disk's partitions.
+///
+/// Device numbers are compared, so every spelling of the booted disk is
+/// caught. Writing a partition table into a partition of the running disk
+/// would damage the source before the next step could notice.
+pub fn validate_destination(destination: &Path, source: &Path) -> Result<(), FlashError> {
+    validate_devices(Path::new(SYS_DEV_BLOCK), destination, source)
+}
+
+fn validate_devices(
+    sys_dev_block: &Path,
+    destination: &Path,
+    source: &Path,
+) -> Result<(), FlashError> {
+    let invalid = |reason: String| FlashError::InvalidDestination {
+        device: destination.to_path_buf(),
+        reason,
+    };
+
+    let destination_dev = block_devnum(destination).map_err(invalid)?;
+    let source_dev = block_devnum(source)
+        .map_err(|reason| invalid(format!("the booted disk {}: {reason}", source.display())))?;
+
+    match refusal(
+        destination_dev,
+        whole_disk_devnum(sys_dev_block, destination_dev),
+        source_dev,
+    ) {
+        Some(reason) => Err(invalid(format!("{reason} {}", source.display()))),
+        None => Ok(()),
+    }
 }
 
 /// Poll for `destination` until it exists or `timeout` has passed.
@@ -460,18 +471,18 @@ pub fn run_clone(ctx: &CloneCtx<'_>) -> Result<(), FlashError> {
         ctx.destination.display()
     );
 
-    // Ahead of the wait, and on the value as given: an unset or source-owned
-    // destination is a misconfiguration the operator should hear about at
-    // once, not after the full timeout has run down.
-    validate_destination_path(ctx.destination, source)?;
+    // A destination owned by the source always exists already, so the wait
+    // returns at once for it and the refusal below is not delayed.
     wait_for_block_device(ctx.destination, DEST_DEVICE_WAIT)?;
 
-    // The single point of resolution, and it belongs here: `canonicalize`
-    // needs the node to exist, so an alias can only be resolved once the wait
-    // has seen it. Everything below addresses the destination by the resolved
-    // path, because `destination_partition` appends a partition index to it
-    // and an alias such as a by-id link names no partition of its own.
-    let destination = resolve(ctx.destination);
+    // Everything below addresses the destination by the resolved path,
+    // because `destination_partition` appends a partition index to it and an
+    // alias such as a by-id link names no partition of its own.
+    let destination =
+        fs::canonicalize(ctx.destination).map_err(|e| FlashError::InvalidDestination {
+            device: ctx.destination.to_path_buf(),
+            reason: format!("cannot resolve: {e}"),
+        })?;
     let destination = destination.as_path();
     log::info!("destination resolved to {}", destination.display());
 
@@ -595,88 +606,83 @@ mod tests {
         );
     }
 
-    /// The `reason` of an `InvalidDestination`, or a panic naming what came
-    /// back instead.
-    fn refusal_reason(result: Result<(), FlashError>) -> String {
-        match result {
-            Err(FlashError::InvalidDestination { reason, .. }) => reason,
-            other => panic!("expected the destination to be refused, got {other:?}"),
-        }
+    const SDA: u64 = makedev(8, 0);
+    const SDA2: u64 = makedev(8, 2);
+    const SDB: u64 = makedev(8, 16);
+
+    #[test]
+    fn the_booted_disk_itself_is_refused() {
+        assert_eq!(refusal(SDA, Some(SDA), SDA), Some(REASON_IDENTICAL_DISK));
     }
 
     #[test]
-    fn a_destination_equal_to_the_source_is_refused() {
-        let src = Path::new("/dev/mmcblk0");
-        let reason = refusal_reason(validate_destination(src, src));
-        assert!(
-            reason.contains(REASON_IDENTICAL_DISK),
-            "the refusal must name the identical-disk condition, got: {reason}"
+    fn a_partition_of_the_booted_disk_is_refused() {
+        assert_eq!(refusal(SDA2, Some(SDA), SDA), Some(REASON_SOURCE_PARTITION));
+    }
+
+    #[test]
+    fn another_disk_is_accepted() {
+        assert_eq!(refusal(SDB, Some(SDB), SDA), None);
+    }
+
+    #[test]
+    fn a_destination_sysfs_does_not_list_is_refused() {
+        assert_eq!(refusal(SDB, None, SDA), Some(REASON_UNKNOWN_DISK));
+    }
+
+    /// A sysfs tree with `mmcblk1` (179:0) and its partition `mmcblk1p2`
+    /// (179:2) linked from `dev/block`, the way the kernel lays it out.
+    fn fake_sys_dev_block() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let disk = root.path().join("devices/block/mmcblk1");
+        let partition = disk.join("mmcblk1p2");
+        fs::create_dir_all(&partition).unwrap();
+        fs::write(disk.join("dev"), "179:0\n").unwrap();
+        fs::write(partition.join("dev"), "179:2\n").unwrap();
+        fs::write(partition.join("partition"), "2\n").unwrap();
+
+        let by_number = root.path().join("dev/block");
+        fs::create_dir_all(&by_number).unwrap();
+        std::os::unix::fs::symlink(&disk, by_number.join("179:0")).unwrap();
+        std::os::unix::fs::symlink(&partition, by_number.join("179:2")).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_partition_maps_onto_its_parent_disk() {
+        let sys = fake_sys_dev_block();
+        let by_number = sys.path().join("dev/block");
+        assert_eq!(
+            whole_disk_devnum(&by_number, makedev(179, 2)),
+            Some(makedev(179, 0))
         );
     }
 
     #[test]
-    fn an_alias_spelling_of_the_source_is_resolved_and_refused() {
-        // A symlink is the spelling an operator is most likely to reach for,
-        // and only resolving both sides catches it.
-        let dir = tempfile::tempdir().unwrap();
-        let disk = dir.path().join("disk");
-        let alias = dir.path().join("alias");
-        std::fs::write(&disk, b"").unwrap();
-        std::os::unix::fs::symlink(&disk, &alias).unwrap();
-
-        let reason = refusal_reason(validate_destination(&alias, &disk));
-        assert!(
-            reason.contains(REASON_IDENTICAL_DISK),
-            "a symlink to the booted disk must be refused as the disk itself, got: {reason}"
+    fn a_disk_maps_onto_itself() {
+        let sys = fake_sys_dev_block();
+        let by_number = sys.path().join("dev/block");
+        assert_eq!(
+            whole_disk_devnum(&by_number, makedev(179, 0)),
+            Some(makedev(179, 0))
         );
     }
 
     #[test]
-    fn a_partition_of_the_source_is_refused_before_anything_is_written() {
-        // Applying a partition table to a partition of the running disk would
-        // damage the source, so this must not reach the block-device check.
-        for (source, destination) in [
-            ("/dev/sda", "/dev/sda2"),
-            ("/dev/mmcblk0", "/dev/mmcblk0p2"),
-        ] {
-            let reason = refusal_reason(validate_destination_path(
-                Path::new(destination),
-                Path::new(source),
-            ));
-            assert!(
-                reason.contains(REASON_SOURCE_PARTITION),
-                "{destination} must be refused as a partition of {source}, got: {reason}"
-            );
-        }
+    fn a_device_sysfs_does_not_list_has_no_disk() {
+        let sys = fake_sys_dev_block();
+        let by_number = sys.path().join("dev/block");
+        assert_eq!(whole_disk_devnum(&by_number, makedev(179, 8)), None);
     }
 
     #[test]
-    fn a_neighbouring_disk_passes_the_path_checks() {
-        // The prefix match must not swallow a legitimate destination.
-        for (source, destination) in [
-            ("/dev/sda", "/dev/sdb"),
-            ("/dev/sda", "/dev/sdab"),
-            // A disk name ending in a digit takes a `p` before its partition
-            // number, so a bare digit here names another disk.
-            ("/dev/mmcblk1", "/dev/mmcblk10"),
-            ("/dev/nvme0n1", "/dev/nvme0n10"),
-        ] {
-            assert!(
-                validate_destination_path(Path::new(destination), Path::new(source)).is_ok(),
-                "{destination} is not part of {source} and must pass"
-            );
-        }
-    }
-
-    #[test]
-    fn an_unset_destination_is_refused_by_the_checks_that_run_before_the_wait() {
-        let reason = refusal_reason(validate_destination_path(
-            Path::new(""),
-            Path::new("/dev/sda"),
-        ));
+    fn a_destination_that_is_not_a_block_device_is_refused() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let err = validate_destination(file.path(), Path::new("/dev/sda")).unwrap_err();
         assert!(
-            reason.contains(REASON_NO_DESTINATION),
-            "an unset destination must be named as such, got: {reason}"
+            matches!(&err, FlashError::InvalidDestination { reason, .. }
+                if reason == REASON_NOT_A_BLOCK_DEVICE),
+            "got {err}"
         );
     }
 

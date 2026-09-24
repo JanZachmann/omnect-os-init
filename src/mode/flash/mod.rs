@@ -74,16 +74,16 @@ pub(crate) fn with_mount<T>(
 
 /// The destination mode 1 was given.
 ///
-/// Detection reports an unusable `flash-mode-devpath` and selects the mode
-/// anyway, so the absence has to become an error here.
+/// Detection selects the mode even for an unusable `flash-mode-devpath`, so
+/// the reason becomes an error here, inside the log capture.
 #[cfg(feature = "flash-mode-1")]
 fn destination(flash_config: &config::FlashConfig) -> Result<&Path, FlashError> {
     flash_config
         .devpath
         .as_deref()
-        .ok_or_else(|| FlashError::InvalidEnvValue {
+        .map_err(|reason| FlashError::InvalidEnvValue {
             key: config::DEVPATH_KEY,
-            reason: "no destination device to clone onto".to_string(),
+            reason: reason.to_string(),
         })
 }
 
@@ -198,6 +198,64 @@ mod tests {
         assert_eq!(mock.get_env(BootEnvKey::FlashMode).unwrap(), None);
     }
 
+    #[cfg(feature = "flash-mode-1")]
+    #[test]
+    fn a_failing_mode_still_leaves_its_triggers_cleared() {
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        use crate::bootloader::BootEnvState;
+        use crate::config::Config;
+        use crate::error::InitramfsError;
+        use crate::partition::RootDevice;
+        use crate::runtime::OdsStatus;
+
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let mock = MockBootEnv::new()
+            .with_env(BootEnvKey::FlashMode, "1")
+            .with_env(BootEnvKey::FlashModeDevPath, " ");
+        let cleared = mock.shared_set_env_calls();
+        let config = Config::default();
+        // No data partition, so the run log is dropped instead of mounted.
+        let layout = PartitionLayout {
+            partitions: HashMap::new(),
+            device: RootDevice {
+                base: PathBuf::from("/dev/sda"),
+                partition_sep: "",
+                root_partition: PathBuf::from("/dev/sda2"),
+            },
+        };
+        let ctx = BootContext::new(
+            &config,
+            &layout,
+            Path::new("/nonexistent/rootfs"),
+            BootEnvState::Available(Box::new(mock)),
+            OdsStatus::default(),
+        );
+        let flash_config = config::FlashConfig {
+            mode: config::FlashMode::Mode1,
+            devpath: Err("not set".to_string()),
+        };
+
+        // Fails before any device is touched, so the power off is never reached.
+        let err = run(ctx, flash_config).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                InitramfsError::Flash(FlashError::InvalidEnvValue { .. })
+            ),
+            "got {err}"
+        );
+        assert_eq!(
+            *cleared.lock().unwrap(),
+            vec![BootEnvKey::FlashMode, BootEnvKey::FlashModeDevPath],
+            "a failed run must not leave a trigger that re-enters on the next boot"
+        );
+    }
+
     #[test]
     fn the_log_mount_point_stays_outside_the_rootfs_mount() {
         // Mode 1 unmounts the rootfs before it writes anything, so a target
@@ -221,17 +279,16 @@ mod tests {
 
     #[cfg(feature = "flash-mode-1")]
     #[test]
-    fn a_missing_destination_is_reported_as_an_unusable_env_value() {
-        // Detection logs an unusable devpath and still selects the mode, so the
-        // mode itself has to turn the absence into an error.
+    fn a_missing_destination_is_reported_with_its_reason() {
         let flash_config = config::FlashConfig {
             mode: config::FlashMode::Mode1,
-            devpath: None,
+            devpath: Err("not set".to_string()),
         };
         let err = destination(&flash_config).unwrap_err();
         assert!(
-            matches!(err, FlashError::InvalidEnvValue { key, .. } if key == config::DEVPATH_KEY),
-            "the absent destination must be named by its env key, got: {err}"
+            matches!(&err, FlashError::InvalidEnvValue { key, reason }
+                if *key == config::DEVPATH_KEY && reason == "not set"),
+            "the absent destination must be named by its env key and reason, got: {err}"
         );
     }
 }
