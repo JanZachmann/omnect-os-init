@@ -271,6 +271,32 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 > `flash-mode-1` is in the default feature set, so it is already enabled in the
 > `cargo build` examples above; add `--no-default-features` to build without it.
 
+## Runtime Dependencies
+
+The init calls these tools and reads these files from the initramfs image. The
+image recipe has to install them, or the step that needs them fails at run
+time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
+
+| Tool or file | Needed by | Yocto package |
+|--------------|-----------|---------------|
+| `fsck` | `core` | `util-linux-fsck` |
+| `fsck.ext4` backend (`e2fsck`) | `core` | `e2fsprogs-e2fsck` |
+| `fsck.vfat` backend | `core` (boot partition) | `dosfstools` |
+| `blkid` | `core` | `util-linux-blkid` |
+| `gzip`, `gunzip` | `core` (fsck output in the bootloader env) | `busybox` |
+| `base64`, `cp` | `core` | `coreutils` |
+| `sh`, `bash` | emergency and debug shell | `bash` |
+| `grub-editenv` | `grub` | `grub-editenv` |
+| `fw_printenv`, `fw_setenv` | `uboot` | `libubootenv-bin` |
+| `mkfs.ext4`, `tune2fs` | `factory-reset`, `flash-mode-1` | `e2fsprogs-mke2fs`, `e2fsprogs-tune2fs` |
+| `sync` | `factory-reset`, `resize-data` | `busybox` |
+| `sgdisk`, `parted`, `resize2fs` | `resize-data` | `gptfdisk`, `parted`, `e2fsprogs-resize2fs` |
+| `sfdisk` | `flash-mode-1` | `util-linux-sfdisk` |
+| `e2image` | `flash-mode-1` | `e2fsprogs` |
+| `efibootmgr` | `flash-mode-1` on EFI machines | `efibootmgr` |
+| `/etc/omnect/grubenv.in` | `flash-mode-1` with `grub` | `grub-env` |
+| `/etc/omnect/uboot-env.bin` | `flash-mode-1` with `uboot` | image recipe (`add_uboot_env`) |
+
 ## Testing
 
 ```bash
