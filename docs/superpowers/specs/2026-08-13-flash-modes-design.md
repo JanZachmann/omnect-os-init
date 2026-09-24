@@ -891,8 +891,14 @@ Implemented separately, listed here so nothing is lost:
   feature and drop `flash-mode-1` from `default`, so a machine that wants disk
   cloning has to ask for it. This changes what ships, so it is recipe work rather
   than part of the port;
-- keep `FLASH_MODE_X_PACKAGES` plus `dropbear` and `curl` gated as they are
-  today, and keep the `omnect_user` class inherited for mode 2;
+- when mode 2 or 3 is ported, add `FLASH_MODE_X_PACKAGES` plus `dropbear`
+  (mode 2) and `curl` (mode 3) back to the Rust initramfs image, gated by the
+  same distro features as the legacy image, and keep the `omnect_user` class
+  inherited for mode 2. The Rust image does not install them while the modes
+  are not ported;
+- when mode 2 or 3 is ported, remove the "does not implement flash mode N yet"
+  note from that mode's section in the meta-omnect `README.md`, and check its
+  console output example and behaviour notes against the port
 - retire `init.d/87-flash_mode_{1,2,3}` and the `sed` substitutions in
   `omnect-os-initramfs-scripts.bb` once the Rust path ships;
 - `util-linux-uuidgen` can be dropped from the initramfs once the port ships:
