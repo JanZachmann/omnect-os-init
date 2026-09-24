@@ -4,8 +4,9 @@ Rust-based init process for omnect-os initramfs.
 
 ## Overview
 
-Replaces 14 bash-based initramfs scripts (~1500 LOC) with a single Rust binary
-acting as `/init` in the initramfs. Runs as PID 1 before `switch_root`.
+A single binary acting as `/init` in the initramfs, in place of the shell scripts that
+used to do this. Runs as PID 1: it prepares the partitions, the boot environment and the
+runtime state for `omnect-device-service`, then hands over with `switch_root`.
 
 Implemented functionality:
 
@@ -18,7 +19,7 @@ Implemented functionality:
 - **ODS integration**: Runtime files for `omnect-device-service`
 - **fs-links**: Symlink creation from `etc/omnect/fs-link.json` and `etc/omnect/fs-link.d/`
 - **switch\_root**: MS_MOVE + chroot + exec systemd (`pivot_root(2)` is not used; ramfs does not support it)
-- **Factory reset (mode 1)**: Selective-preserve backup → reformat `data`/`etc` → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
+- **Factory reset (modes 1-3)**: Selective-preserve backup → wipe `data`/`etc` (modes 2 and 3 only) → reformat → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
 
 Not yet implemented (planned):
 
@@ -61,8 +62,8 @@ flowchart TD
     APPLY -->|Fatal| FEB
     APPLY -->|"OK\nDegraded: ods.degraded_boot=true"| FBDETECT["compute_first_boot()\nset_update_pending()"]
 
-    FBDETECT --> ISETUP["init_setup::run()\nresize-data preflight\nif feature = resize-data"]
-    ISETUP -->|FsckRequiresReboot| FEB
+    FBDETECT --> ISETUP["init_setup::run()\nextra_bootargs sync — always\nresize-data preflight if feature = resize-data"]
+    ISETUP -->|"FsckRequiresReboot\nExtraBootArgsUpdated"| FEB
     ISETUP -->|"ResizeData error\nContinueDegraded — warn"| BMODE{"BootMode::detect()"}
     ISETUP -->|"Fatal (non-resize)"| FEB
     ISETUP -->|OK| BMODE
@@ -70,14 +71,16 @@ flowchart TD
     BMODE -->|Fatal| FEB
 
     BMODE -->|Normal| MREM["mount_remaining_partitions()\ndata · factory · cert + fsck\npersist_fsck_results — always"]
-    BMODE -->|"FactoryReset(config)\nfeature = factory-reset"| FCLEAR
+    BMODE -->|"FactoryReset(trigger)\nfeature = factory-reset"| FCLEAR
 
     subgraph FRESET["factory_reset::run() — always ContinueDegraded"]
         direction TB
         FCLEAR["clear factory-reset\nbootloader var (best-effort)"] --> FMOUNT["mount factory(ro) + etc(rw) + data(rw)\n+ overlays"]
+        FCLEAR -->|"trigger unusable"| FSTATUS
         FMOUNT --> FBACKUP["build_preserve_list()\nbackup_all() → /tmp/factory_reset/backup"]
         FBACKUP --> FUMOUNT1["umount"]
-        FUMOUNT1 --> FFORMAT["reformat_and_mount_with_retry()\nmkfs data/etc (1 retry each, warn on fail)\nthen mount once — the deciding step"]
+        FUMOUNT1 --> FWIPE["wipe_partitions()\nmode 2: random overwrite · mode 3: discard\nmode 1: skipped · failure never aborts"]
+        FWIPE --> FFORMAT["reformat_and_mount_with_retry()\nmkfs data/etc (1 retry each, warn on fail)\nthen mount once — the deciding step"]
         FFORMAT -->|"mount ok"| FRESTORE["restore_all()"]
         FFORMAT -->|"mount fails on data/etc"| FSIGNAL["record failure signal\n→ bootloader env (in run())"]
         FRESTORE --> FUMOUNT2["umount"]
@@ -93,7 +96,7 @@ flowchart TD
     OVL -->|OK| LINKS["create_fs_links()\ndrain_fsck_env() — env → JSON, then clear\ncreate_ods_runtime_files()"]
     OVL -->|Fail| FEB
 
-    LINKS -->|OK| FBM["write_first_boot_marker()\nif first_boot ∧ resize_ok ∧ env_available\nbest-effort — warn on fail"]
+    LINKS -->|OK| FBM["write_first_boot_marker()\nif first_boot ∧ resize_ok ∧ extra_bootargs_ok ∧ env_available\nbest-effort — warn on fail"]
     LINKS -->|Fail| FEB
 
     FBM --> SR["switch_root → systemd"]
@@ -157,12 +160,35 @@ including degraded boot.
 **Notes on factory reset (`FRESET` block)**
 
 Enabled by the `factory-reset` feature. `BootMode::detect()` reads the `factory-reset`
-bootloader env key; a present, valid-JSON value dispatches to `mode::factory_reset::run()`
-instead of `mode::normal::run()`. The reset sequence (mount → backup → reformat → mount →
-restore) always completes with a `FactoryResetStatus` recorded in the ODS status JSON —
-success or error — and then falls through into the same `mode::normal::run()` path a
-normal boot takes (`MREM` onward), so a failed or unsupported reset never blocks the
-device from booting: `FactoryResetError` is classified as `ContinueDegraded`.
+bootloader env key; any non-blank value dispatches to `mode::factory_reset::run()` instead of
+`mode::normal::run()`. A blank value is not a request to reset. A trigger can be cleared two
+ways — by unsetting the key, or by writing an empty value — and the two backends disagree about
+the second: `fw_printenv` reports an empty variable as unset, while `grub-editenv` still lists
+the key. On GRUB a cleared trigger can therefore come back as a present but empty value, so
+treating blank as no trigger makes both backends behave the same and keeps such a device from
+being answered with a reset failure nobody asked for. A value the init cannot use is cleared and
+reported there — status 1 when it does not name a mode the init can run, unparsable json
+included, status 3 when the problem is `preserve` — rather than booting on in silence, which
+would leave the caller waiting for a result forever. The reset sequence (mount → backup → wipe →
+reformat → mount → restore) always completes with a `FactoryResetStatus` recorded in the ODS
+status JSON — success or error — and then falls through into the same `mode::normal::run()` path
+a normal boot takes (`MREM` onward), so a failed or unsupported reset never blocks the device
+from booting: `FactoryResetError` is classified as `ContinueDegraded`.
+
+**Factory reset — wipe modes (`FWIPE`)**
+
+The trigger must name a `mode` of 1 to 3 and carry a `preserve` array. `/etc/omnect/factory-reset.d/`
+is preserved in every case, so an empty array keeps that directory and nothing else. When
+`preserve` contains `applications`, every `*.json` file in that directory is read for its
+`paths` array, and one without a usable `paths` array fails the reset — skipping it would
+wipe the paths it was meant to keep and still report success.
+
+The wipe runs once the backup is in initramfs RAM and before the reformat. Mode 2 writes
+data from `/dev/urandom`, mode 3 uses the `BLKDISCARD` ioctl, which the hardware has to
+support. A failure never aborts the reset — the other partition is still wiped and
+reformat + restore still run, so the device stays usable — but the result is reported as
+`Error` with a note in the status `error` field, because the wipe the caller asked for did
+not happen.
 
 **Factory reset — reformat/mount retry (`FFORMAT`)**
 
@@ -198,16 +224,18 @@ single failure is `Warning`, two failures are `Error` — an early sign of faili
 ## Building
 
 ```bash
-# Debug build (bootloader type must be specified)
-cargo build --features grub     # x86-64 EFI targets
-cargo build --features uboot    # ARM targets
+# A bootloader and a partition table are both mandatory; build.rs rejects
+# any other combination
+cargo build --features grub,gpt      # x86-64 EFI targets
+cargo build --features uboot,dos     # ARM targets
 
-# Release build (optimized for size)
-cargo build --release --features grub
-cargo build --release --features uboot
+# Release build (optimized for size); U-Boot targets use gpt or dos
+cargo build --release --features grub,gpt
+cargo build --release --features uboot,gpt
+cargo build --release --features uboot,dos
 
 # With additional optional features
-cargo build --release --features "grub,persistent-var-log"
+cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 ```
 
 ## Features
@@ -223,7 +251,7 @@ cargo build --release --features "grub,persistent-var-log"
 | `release-image` | Release error handling: loop on fatal error; continue in degraded boot | Implemented |
 | `resize-data` | Data partition auto-resize on first boot | Implemented |
 | `test-utils` | Expose `MockBootEnv` for integration tests (never enabled in production) | Test only |
-| `factory-reset` | Factory reset support (mode 1: selective-preserve backup → reformat → restore) | Implemented |
+| `factory-reset` | Factory reset support (modes 1-3: selective-preserve backup → wipe → reformat → restore) | Implemented |
 | `flash-mode-1` | Disk cloning | Planned |
 | `flash-mode-2` | Network flashing | Planned |
 | `flash-mode-3` | HTTP/HTTPS flashing | Planned |
@@ -235,11 +263,18 @@ cargo build --release --features "grub,persistent-var-log"
 
 ```bash
 # All four valid base combinations (bootloader × partition table)
-# test-utils is required to include the degraded_boot integration tests
+# test-utils is required for the degraded_boot integration test; factory_reset
+# needs the factory-reset feature as well, see the next block
 cargo test --features grub,gpt,test-utils
 cargo test --features grub,dos,test-utils
 cargo test --features uboot,gpt,test-utils
 cargo test --features uboot,dos,test-utils
+
+# With factory-reset feature
+cargo test --features grub,gpt,factory-reset,test-utils
+cargo test --features grub,dos,factory-reset,test-utils
+cargo test --features uboot,gpt,factory-reset,test-utils
+cargo test --features uboot,dos,factory-reset,test-utils
 
 # With resize-data feature
 cargo test --features grub,gpt,resize-data,test-utils
@@ -259,6 +294,21 @@ cargo test --features uboot,gpt,resize-data,release-image,test-utils
 
 # Verbose output
 cargo test --features grub,gpt,test-utils -- --nocapture
+```
+
+Some U-Boot targets are 32-bit ARM, where `usize` is 4 bytes and a cast from
+a 64-bit byte count silently truncates. The test run above is host-only and
+cannot see that, so compile and lint for a 32-bit target as well (`cargo check`
+and `cargo clippy` need no cross-linker):
+
+```bash
+rustup target add armv7-unknown-linux-gnueabihf
+cargo clippy --target armv7-unknown-linux-gnueabihf --tests \
+  --features uboot,dos,factory-reset,test-utils -- -D warnings
+
+# Narrowing casts, reviewed by hand — not part of the gate, it also flags safe ones
+cargo clippy --target armv7-unknown-linux-gnueabihf \
+  --features uboot,dos,factory-reset -- -W clippy::cast_possible_truncation
 ```
 
 ## License

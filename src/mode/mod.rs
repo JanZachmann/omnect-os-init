@@ -39,27 +39,48 @@ impl<'a> BootContext<'a> {
     }
 }
 
+/// A factory-reset trigger that was set in the boot environment.
+///
+/// A trigger the init cannot use still has to be answered: it is cleared and
+/// its failure is reported, so the caller learns the reset did not run
+/// instead of waiting for a result that never arrives.
+#[cfg(feature = "factory-reset")]
+pub enum FactoryResetTrigger {
+    Accepted(factory_reset::config::FactoryResetConfig),
+    Rejected(crate::error::FactoryResetError),
+}
+
 /// The detected boot mode to execute.
 pub enum BootMode {
     Normal,
     #[cfg(feature = "factory-reset")]
-    FactoryReset(factory_reset::config::FactoryResetConfig),
+    FactoryReset(FactoryResetTrigger),
 }
 
 impl BootMode {
     /// Detect the boot mode from the boot environment.
     ///
-    /// When the `factory-reset` bootloader env key is set and contains valid
-    /// JSON, returns `FactoryReset`. Falls back to `Normal` on any env-read
-    /// or JSON parse error — never blocks boot.
+    /// A `factory-reset` bootloader env key with a non-blank value returns
+    /// `FactoryReset`, whether or not that value can be used. A blank value and
+    /// an env that cannot be read both fall back to `Normal`. Never blocks
+    /// boot.
     pub fn detect(_bl: Option<&dyn BootEnv>) -> Result<Self> {
         #[cfg(feature = "factory-reset")]
         if let Some(bl) = _bl {
             match bl.get_env(BootEnvKey::FactoryReset) {
+                // A trigger can be cleared by unsetting the key or by writing
+                // an empty value. The backends disagree about the second:
+                // fw_printenv reports an empty variable as unset, grub-editenv
+                // still lists the key. Treat blank as no trigger so both behave
+                // the same.
+                Ok(Some(json)) if json.trim().is_empty() => {}
                 Ok(Some(json)) => match factory_reset::config::FactoryResetConfig::parse(&json) {
-                    Ok(config) => return Ok(Self::FactoryReset(config)),
+                    Ok(config) => {
+                        return Ok(Self::FactoryReset(FactoryResetTrigger::Accepted(config)));
+                    }
                     Err(e) => {
-                        log::warn!("factory-reset: invalid config JSON, booting normally: {e}");
+                        log::warn!("factory-reset: unusable trigger, reporting it: {e}");
+                        return Ok(Self::FactoryReset(FactoryResetTrigger::Rejected(e)));
                     }
                 },
                 Ok(None) => {}
@@ -108,21 +129,48 @@ mod tests {
             let mock = create_mock_bootloader()
                 .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
             let mode = BootMode::detect(Some(&mock)).unwrap();
-            assert!(matches!(mode, BootMode::FactoryReset(_)));
-            if let BootMode::FactoryReset(config) = mode {
-                assert_eq!(
-                    config.mode,
-                    crate::mode::factory_reset::config::ResetMode::Mode1
+            let BootMode::FactoryReset(FactoryResetTrigger::Accepted(config)) = mode else {
+                panic!("a usable trigger must be accepted");
+            };
+            assert_eq!(
+                config.mode,
+                crate::mode::factory_reset::config::ResetMode::Mode1
+            );
+            assert!(config.preserve.is_empty());
+        }
+
+        #[test]
+        fn detect_rejects_an_unusable_trigger_instead_of_ignoring_it() {
+            for trigger in [
+                "not-json",
+                r#"{ "mode": "#,
+                "{}",
+                r#"{"mode":4,"preserve":[]}"#,
+                r#"{"mode":1}"#,
+                r#"{"mode":1,"preserve":""}"#,
+            ] {
+                let mock = create_mock_bootloader().with_env(BootEnvKey::FactoryReset, trigger);
+                let mode = BootMode::detect(Some(&mock)).unwrap();
+                assert!(
+                    matches!(
+                        mode,
+                        BootMode::FactoryReset(FactoryResetTrigger::Rejected(_))
+                    ),
+                    "trigger {trigger} must be rejected, not ignored"
                 );
-                assert!(config.preserve.is_empty());
             }
         }
 
         #[test]
-        fn detect_normal_when_key_present_invalid_json() {
-            let mock = create_mock_bootloader().with_env(BootEnvKey::FactoryReset, "not-json");
-            let mode = BootMode::detect(Some(&mock)).unwrap();
-            assert!(matches!(mode, BootMode::Normal));
+        fn detect_normal_when_the_trigger_is_blank() {
+            for trigger in ["", " ", "\n"] {
+                let mock = create_mock_bootloader().with_env(BootEnvKey::FactoryReset, trigger);
+                let mode = BootMode::detect(Some(&mock)).unwrap();
+                assert!(
+                    matches!(mode, BootMode::Normal),
+                    "a blank trigger must not start a reset: {trigger:?}"
+                );
+            }
         }
 
         #[test]

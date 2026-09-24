@@ -1,10 +1,12 @@
-//! Integration tests for factory-reset: ODS JSON contract and detect fallback.
+//! Integration tests for factory-reset: the ODS JSON contract and the mode
+//! a trigger dispatches to.
 
 #![cfg(feature = "factory-reset")]
 
 use omnect_os_init::MockBootEnv;
 use omnect_os_init::bootloader::BootEnvKey;
-use omnect_os_init::mode::BootMode;
+use omnect_os_init::mode::factory_reset::config::ResetMode;
+use omnect_os_init::mode::{BootMode, FactoryResetTrigger};
 use omnect_os_init::runtime::{FactoryResetStatus, FactoryResetStatusCode, OdsStatus};
 
 #[test]
@@ -101,28 +103,35 @@ fn factory_reset_warning_status_serializes_as_four() {
 }
 
 #[test]
-fn detect_unsupported_mode_falls_back_to_normal() {
-    let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, r#"{"mode":2,"preserve":[]}"#);
-    let mode = BootMode::detect(Some(&mock)).unwrap();
-    assert!(
-        matches!(mode, BootMode::Normal),
-        "unsupported mode 2 must fall back to Normal"
-    );
-
-    let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, r#"{"mode":0,"preserve":[]}"#);
-    let mode = BootMode::detect(Some(&mock)).unwrap();
-    assert!(
-        matches!(mode, BootMode::Normal),
-        "unsupported mode 0 must fall back to Normal"
-    );
+fn detect_reports_an_unsupported_mode_instead_of_booting_normally() {
+    for mode_value in ["0", "4", "5"] {
+        let trigger = format!(r#"{{"mode":{mode_value},"preserve":[]}}"#);
+        let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, &trigger);
+        let mode = BootMode::detect(Some(&mock)).unwrap();
+        assert!(
+            matches!(
+                mode,
+                BootMode::FactoryReset(FactoryResetTrigger::Rejected(_))
+            ),
+            "unsupported mode {mode_value} must be reported, not ignored"
+        );
+    }
 }
 
 #[test]
 fn detect_supported_mode_selects_factory_reset() {
-    let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
-    let mode = BootMode::detect(Some(&mock)).unwrap();
-    assert!(
-        matches!(mode, BootMode::FactoryReset(_)),
-        "supported mode 1 must select FactoryReset"
-    );
+    for (mode_value, expected) in [
+        ("1", ResetMode::Mode1),
+        ("2", ResetMode::Mode2),
+        ("3", ResetMode::Mode3),
+    ] {
+        let trigger = format!(r#"{{"mode":{mode_value},"preserve":["applications"]}}"#);
+        let mock = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, &trigger);
+        let mode = BootMode::detect(Some(&mock)).unwrap();
+        let BootMode::FactoryReset(FactoryResetTrigger::Accepted(config)) = mode else {
+            panic!("supported mode {mode_value} must select FactoryReset");
+        };
+        assert_eq!(config.mode, expected, "mode {mode_value} mapped wrongly");
+        assert_eq!(config.preserve, vec!["applications".to_string()]);
+    }
 }

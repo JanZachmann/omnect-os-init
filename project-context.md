@@ -14,6 +14,7 @@ src/
 ├── lib.rs                   # Library exports + run_init() + apply_boot_env_decision()
 ├── error.rs                 # Error type hierarchy
 ├── early_init.rs            # Mount /dev, /proc, /sys, /run before logging
+├── recovery.rs              # Recovery policy: error class → reboot / halt / shell / continue
 ├── bootloader/
 │   ├── mod.rs               # BootEnv trait, BootEnvState, classify_boot_env()
 │   ├── grub.rs              # GRUB implementation (grub-editenv)
@@ -32,16 +33,23 @@ src/
 │   ├── mod.rs               # KmsgLogger initializer
 │   └── kmsg.rs              # /dev/kmsg writer with kernel log levels
 ├── mode/
-│   ├── mod.rs               # BootMode enum, BootContext, detect()
-│   └── normal.rs            # Normal boot handler (post-mount overlays → switch_root)
+│   ├── mod.rs               # BootMode enum, FactoryResetTrigger, BootContext, detect()
+│   ├── normal.rs            # Normal boot handler (post-mount overlays → switch_root)
+│   └── factory_reset/       # Factory reset (feature = factory-reset)
+│       ├── mod.rs           # Reset sequence, status assembly, trigger rejection
+│       ├── config.rs        # Trigger parsing, preserve list from etc/omnect
+│       ├── backup_restore.rs # Preserve-list backup to initramfs RAM and restore
+│       ├── reformat.rs      # mkfs.ext4 + tune2fs
+│       └── wipe.rs          # Mode 2 random overwrite, mode 3 BLKDISCARD
 ├── partition/
 │   ├── mod.rs               # Public API
 │   ├── device.rs            # Root device detection (GRUB: blkid/fsuuid, U-Boot: root=)
 │   ├── layout.rs            # GPT/DOS partition map builder
 │   └── symlinks.rs          # /dev/omnect/* symlink creation
-├── preflight/
-│   ├── mod.rs               # Preflight step runner
-│   └── resize_data.rs       # resize-data preflight: guard check + degraded-mode dispatch
+├── init_setup/
+│   ├── mod.rs               # Init setup step runner
+│   ├── extra_bootargs.rs    # omnect_extra_bootargs sync
+│   └── resize_data.rs       # resize-data step: guard check + degraded-mode dispatch
 └── runtime/
     ├── mod.rs               # Public API
     ├── fs_link.rs           # fs-link symlink creation
@@ -50,11 +58,13 @@ src/
 ```
 
 ## 3. Build & Test Commands
-- **Build:** `cargo build` / `cargo build --release`
-- **Check:** `cargo check`
+- **Build:** `cargo build --features <bootloader>,<table>` (build.rs rejects a build
+  without one of each, so a bare `cargo build` fails)
+- **Check:** `cargo check --features <bootloader>,<table>`
 - **Format:** `cargo fmt -- --check`
 - **Lint:** `cargo clippy --tests --features <grub|uboot> -- -D warnings -W clippy::items_after_statements -W clippy::items_after_test_module`
-- **Test:** `test-utils` must be included to run the degraded-boot integration tests. Run all 14 valid feature combinations:
+- **Test:** `test-utils` must be included for the `degraded_boot` integration test; the
+  `factory_reset` one additionally needs the `factory-reset` feature. Base combinations:
   ```
   cargo test --features grub,gpt,test-utils
   cargo test --features grub,dos,test-utils
@@ -71,6 +81,13 @@ src/
   cargo test --features grub,gpt,resize-data,release-image,test-utils
   cargo test --features uboot,gpt,resize-data,release-image,test-utils
   ```
+  With `factory-reset`:
+  ```
+  cargo test --features grub,gpt,factory-reset,test-utils
+  cargo test --features grub,dos,factory-reset,test-utils
+  cargo test --features uboot,gpt,factory-reset,test-utils
+  cargo test --features uboot,dos,factory-reset,test-utils
+  ```
 - **Audit:** `cargo audit`
 
 ## 4. Feature Flags
@@ -84,6 +101,7 @@ src/
 | `persistent-var-log` | Persistent `/var/log` mount |
 | `release-image` | Release behaviour: loop on fatal error; continue booting in degraded mode |
 | `resize-data` | Expand data partition + filesystem to fill disk on first boot |
+| `factory-reset` | Factory reset, modes 1-3: backup → wipe (2 and 3) → reformat → restore |
 | `test-utils` | Expose `MockBootEnv` for integration tests — never enabled in production builds |
 
 ## 5. Runtime Constraints
@@ -93,7 +111,7 @@ src/
 - **Exit behavior:**
   - Release image + normal error: infinite loop (prevent reboot loops)
   - Release image + degraded boot (bootloader unavailable): continue booting; set `degraded_boot: true` in ODS JSON
-  - Debug image + degraded boot: abort immediately before preflight; spawn debug shell
+  - Debug image + degraded boot: abort immediately before init setup; spawn debug shell
   - `FsckRequiresReboot`: always triggers a reboot regardless of degraded state
 
 ## 6. Key Patterns
@@ -115,18 +133,21 @@ src/
 ### BootMode variants
 The `BootMode` enum (`src/mode/mod.rs`) has the following implemented variants:
 - `Normal` — standard boot path; also used when the bootloader is unavailable (degraded boot)
+- `FactoryReset(FactoryResetTrigger)` — backup → wipe (modes 2 and 3) → reformat → restore
+  (feature `factory-reset`). The trigger is carried even when its value is unusable, as
+  `FactoryResetTrigger::Rejected`, so the value is cleared and the failure reported instead
+  of the boot continuing in silence.
 
-Data partition resize (feature = `resize-data`) is handled as a preflight step in
-`src/preflight/resize_data.rs`, not as a separate `BootMode` variant. It runs before
+Data partition resize (feature = `resize-data`) is handled as an init setup step in
+`src/init_setup/resize_data.rs`, not as a separate `BootMode` variant. It runs before
 `BootMode::detect()` and handles both the live-bootloader (guard check) and degraded-boot
 (no guard, resize runs every boot) cases.
 
 The following variants are planned:
-- `FactoryReset(FactoryResetConfig)` — wipes data partition, re-provisions device
 - `FlashMode(FlashKind)` — enables in-field OS flashing
 
 When implementing a new variant:
-1. Add the variant to `BootMode` and update `BootMode::detect()` to read the relevant bootloader env key. If the key is absent or the bootloader is unavailable, `detect()` must return `Normal` (degraded boot).
+1. Add the variant to `BootMode` and update `BootMode::detect()` to read the relevant bootloader env key. If the key is absent or the bootloader is unavailable, `detect()` must return `Normal` (degraded boot). A key that is present but unusable belongs to its own mode, which clears it and reports the failure — see `FactoryResetTrigger`.
 2. Add typed payload structs as needed (define them in `src/mode/mod.rs` near the `BootMode` enum).
 3. Add `BootEnvKey` entries for the detection keys.
 4. Add a handler module under `src/mode/` mirroring `src/mode/normal.rs`.

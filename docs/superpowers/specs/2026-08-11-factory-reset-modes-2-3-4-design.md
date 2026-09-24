@@ -1,7 +1,7 @@
 # Factory Reset Modes 2 and 3 — Design
 
 **Date:** 2026-08-11
-**Status:** In review (PR #23)
+**Status:** In review (PR #25)
 
 ## 1. Overview
 
@@ -59,14 +59,35 @@ of failing with status 1, and a mode-4 trigger is rejected as `Invalid`
 (status 1). ODS and omnect-ui drop `Mode4` from their mode type, so the value
 can no longer be sent from the cloud or the local UI — see section 4.
 
+**Correction (2026-09-21).** When this section was written the init did not
+report a rejected trigger at all: a value it could not parse — a mode outside
+the accepted range included — only produced a kmsg warning, the boot
+continued as Normal, no `factory_reset` object was written, and the trigger
+kept its value, so the warning repeated on every following boot. A mode-4
+trigger therefore did not come back as `Invalid`; it came back as silence,
+which is worse for the caller and which the on-device tests catch. The init
+now reports every trigger it cannot use and clears it, which is what this
+section describes. The reported status follows the rule the shell
+implementation used: anything about `mode` is `Invalid` (status 1), an
+unusable `preserve` is `ConfigError` (status 3).
+
+Two further deltas belong in this list, both restoring what the shell
+implementation did. `preserve` is mandatory — an empty array asks to keep
+nothing beyond the always-preserved `/etc/omnect/factory-reset.d/`, while a
+trigger without the key reports `ConfigError`
+instead of resetting with an empty preserve list. And a file in
+`factory-reset.d` without a usable `paths` array fails the reset with
+`ConfigError` instead of being skipped, because skipping it wipes the paths
+the caller asked to keep and still reports success.
+
 ## 2. Component Changes
 
 ### 2.1 `src/mode/factory_reset/config.rs`
 
 - `ResetMode` gains `Mode2 = 2` and `Mode3 = 3`.
-- `TryFrom<u32>` accepts 1–3; everything else stays rejected (status
-  `Invalid`). Mode stays number-only: the trigger already carries the mode as
-  a number in the on-device tests.
+- `TryFrom<u32>` accepts 1–3; everything else is rejected and reported as
+  status `Invalid`, see the correction in 1.2. Mode stays number-only: the
+  trigger already carries the mode as a number in the on-device tests.
 
 ### 2.2 New: `src/mode/factory_reset/wipe.rs`
 
@@ -75,16 +96,18 @@ can no longer be sent from the cloud or the local UI — see section 4.
 const WIPE_CHUNK_SIZE: usize = 1024 * 1024;
 ```
 
-- `wipe_random(device: &Path) -> Result<()>` — mode 2. Query the device size
-  (`BLKGETSIZE64` ioctl), then stream `/dev/urandom` in `WIPE_CHUNK_SIZE`
-  chunks over the whole device; log progress to kmsg every
-  `WIPE_PROGRESS_LOG_INTERVAL` bytes (named const, 1 GiB); sync at the end.
-- `wipe_discard(device: &Path) -> Result<()>` — mode 3. `BLKGETSIZE64` +
-  `BLKDISCARD` ioctls, defined via `nix` ioctl macros (nix 0.29 is already a
-  dependency; no new crates).
-- Testability split: the mode-2 overwrite loop takes an open file + length so
-  it is unit-testable against a temp file; `wipe_random` is the thin
-  block-device wrapper (size query + call).
+- `wipe_random(device: &Path) -> Result<()>` — mode 2. Take the device size
+  from a seek to its end, then stream `/dev/urandom` in `WIPE_CHUNK_SIZE`
+  chunks over the whole device; log progress to kmsg and flush every
+  `WIPE_PROGRESS_INTERVAL` bytes (named const, 1 GiB), and flush again at the
+  end. Reading the size with a seek instead of the `BLKGETSIZE64` ioctl keeps
+  the whole entry point testable against a temp file.
+- `wipe_discard(device: &Path) -> Result<()>` — mode 3. The `BLKDISCARD`
+  ioctl, defined via a `nix` ioctl macro (nix 0.29 is already a dependency;
+  no new crates).
+- Testability split: the mode-2 overwrite loop takes an open file, a length
+  and the progress interval, so a test can flush more than once. Taking the
+  size from a seek keeps `wipe_random` itself runnable against a temp file.
 - New error variant in `FactoryResetError`, e.g.
   `WipeFailed { device: PathBuf, reason: String }`.
 
@@ -106,8 +129,9 @@ mount → preserve list → backup → unmount
   the wipe reports `data_wiped: true` (a half-written random overwrite destroys
   data even if reformat never runs). Mode 1 keeps today's boundary
   (first reformat).
-- Wipe failures never abort: they become a wipe note (e.g.
-  `"wipe of data failed: <reason>"`), collected per device and joined with
+- Wipe failures never abort: they become a wipe note, `{partition}: {reason}`
+  with the reason carrying the device and the failing call, collected per
+  device and joined with
   the existing `CONTEXT_SEPARATOR`. The note ends up in `error`, see 2.4.
 - Injectable ops trait (same pattern as `ReformatRetryOps`) so the dispatch
   and continue-on-failure control flow is unit-testable without block
@@ -146,8 +170,9 @@ is untouched.
 - **`wipe.rs`:**
   - overwrite loop against a temp file: full length overwritten, content is
     not the previous content, no short-write truncation.
-  - `BLKDISCARD`/`BLKGETSIZE64` wrappers stay thin and untested (need a real
-    block device); their call sites are covered through the ops trait mock.
+  - `BLKDISCARD` cannot succeed without a real block device, so mode 3 is
+    covered by its failure paths (a regular file rejects the ioctl) and
+    through the ops trait mock at the call site.
 - **`mod.rs`:** mode 1 never calls wipe; wipe failure alone → Error status
   with the note in `error`; wipe failure + reformat retry → Error with the
   retry note still in `context`; wipe failure + restore partial failure →
@@ -166,9 +191,8 @@ is untouched.
   the table becomes wrong. Rewrite it to describe behaviour ("2 = overwrite
   with random data (slow)", "3 = discard all blocks (fast, needs hardware
   discard support)"), and drop the mode-4 row together with the custom-wipe
-  paragraph and its bbappend instructions, in the migration PR
-  omnect/meta-omnect#636, which removes the legacy scripts but does not touch
-  the README today.
+  paragraph and its bbappend instructions, in the integration PR
+  omnect/meta-omnect#697.
 - **Mode-4 removal (required, same release):** `Mode4` has to go from the
   mode type in omnect/omnect-device-service and omnect/omnect-ui as well.
   Removing it only here would leave both able to send a 4 that comes back as

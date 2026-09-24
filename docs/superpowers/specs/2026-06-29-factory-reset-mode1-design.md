@@ -1,5 +1,14 @@
 # Factory Reset Mode 1 — Design
 
+> **Correction (2026-09-21).** Two statements below have been superseded. A
+> trigger the init cannot parse no longer boots on as Normal: it is cleared and
+> reported (status 1 for a `mode` problem, status 3 for a `preserve` problem),
+> and `preserve` is mandatory rather than defaulted. A file in
+> `factory-reset.d` without a usable `paths` array now fails the reset instead
+> of being skipped. The payload of `BootMode::FactoryReset` is
+> `FactoryResetTrigger`, not `FactoryResetConfig`. See
+> `2026-08-11-factory-reset-modes-2-3-4-design.md` §1.2.
+
 **Date:** 2026-06-29
 **Status:** Approved
 

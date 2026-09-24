@@ -86,9 +86,11 @@ impl InitramfsError {
             Self::FactoryReset(
                 FactoryResetError::InvalidConfig(_)
                 | FactoryResetError::MissingField(_)
+                | FactoryResetError::InvalidPreserve(_)
                 | FactoryResetError::BackupFailed { .. }
                 | FactoryResetError::RestoreFailed { .. }
                 | FactoryResetError::ReformatFailed { .. }
+                | FactoryResetError::WipeFailed { .. }
                 | FactoryResetError::MountError(_)
                 | FactoryResetError::Io(_),
             ) => RecoveryClass::ContinueDegraded,
@@ -262,6 +264,9 @@ pub enum FactoryResetError {
     #[error("Missing field in factory-reset config: {0}")]
     MissingField(String),
 
+    #[error("Invalid preserve list: {0}")]
+    InvalidPreserve(String),
+
     #[error("Backup failed for {}: {reason}", path.display())]
     BackupFailed { path: PathBuf, reason: String },
 
@@ -270,6 +275,9 @@ pub enum FactoryResetError {
 
     #[error("Reformat failed for {}: {reason}", device.display())]
     ReformatFailed { device: PathBuf, reason: String },
+
+    #[error("Wipe failed for {}: {reason}", device.display())]
+    WipeFailed { device: PathBuf, reason: String },
 
     #[error("Mount error: {0}")]
     MountError(String),
@@ -292,6 +300,27 @@ mod recovery_class_tests {
             output: String::new(),
         });
         assert_eq!(err.recovery_class(), RecoveryClass::RebootToApply);
+    }
+
+    #[cfg(feature = "factory-reset")]
+    #[test]
+    fn factory_reset_wipe_and_preserve_errors_continue_degraded() {
+        let errors = [
+            InitramfsError::FactoryReset(FactoryResetError::WipeFailed {
+                device: std::path::PathBuf::from("/dev/sda7"),
+                reason: "no discard support".to_string(),
+            }),
+            InitramfsError::FactoryReset(FactoryResetError::InvalidPreserve(
+                "'paths' must be an array".to_string(),
+            )),
+        ];
+        for err in errors {
+            assert_eq!(
+                err.recovery_class(),
+                RecoveryClass::ContinueDegraded,
+                "{err}"
+            );
+        }
     }
 
     #[test]
