@@ -183,11 +183,22 @@ fn run_reset(
 
     Ok(wipe_and_rebuild(
         config.mode,
-        data_dev,
-        etc_dev,
+        WipeTargets {
+            data: data_dev,
+            etc: etc_dev,
+        },
         &mut RealWipeOps,
         rebuild,
     ))
+}
+
+/// The two partitions a reset wipes and rebuilds. A struct rather than two
+/// `&Path` arguments: the names travel with the devices, so a call site cannot
+/// hand `etc` to the `data` slot unnoticed.
+#[derive(Clone, Copy)]
+struct WipeTargets<'a> {
+    data: &'a Path,
+    etc: &'a Path,
 }
 
 /// Wipe (modes 2 and 3), then rebuild — reformat, mount and restore.
@@ -197,12 +208,11 @@ fn run_reset(
 /// its failure has to reach the status whatever the rebuild reported.
 fn wipe_and_rebuild(
     mode: ResetMode,
-    data_dev: &Path,
-    etc_dev: &Path,
+    targets: WipeTargets<'_>,
     wipe_ops: &mut dyn WipeOps,
     rebuild: impl FnOnce() -> (FactoryResetStatus, Option<ResetFailureSignal>),
 ) -> (FactoryResetStatus, Option<ResetFailureSignal>) {
-    let wipe_note = wipe_partitions(mode, data_dev, etc_dev, wipe_ops);
+    let wipe_note = wipe_partitions(mode, targets, wipe_ops);
     let (status, signal) = rebuild();
     (apply_wipe_note(status, wipe_note), signal)
 }
@@ -230,8 +240,7 @@ impl WipeOps for RealWipeOps {
 /// notes end up in the status `error` field.
 fn wipe_partitions(
     mode: ResetMode,
-    data_dev: &Path,
-    etc_dev: &Path,
+    targets: WipeTargets<'_>,
     ops: &mut dyn WipeOps,
 ) -> Option<String> {
     let wipe: fn(&mut dyn WipeOps, &Path) -> WipeResult<()> = match mode {
@@ -242,8 +251,8 @@ fn wipe_partitions(
 
     let mut notes: Vec<String> = Vec::new();
     for (partition, device) in [
-        (PartitionName::Etc, etc_dev),
-        (PartitionName::Data, data_dev),
+        (PartitionName::Etc, targets.etc),
+        (PartitionName::Data, targets.data),
     ] {
         if let Err(e) = wipe(ops, device) {
             warn!("factory reset: wipe of {partition} failed; continuing: {e}");
@@ -1237,8 +1246,15 @@ mod tests {
             devices.iter().map(|d| format!("{kind} {d}")).collect()
         }
 
+        fn targets() -> WipeTargets<'static> {
+            WipeTargets {
+                data: Path::new(DATA_DEV),
+                etc: Path::new(ETC_DEV),
+            }
+        }
+
         fn wipe(mode: ResetMode, ops: &mut ScriptedWipeOps) -> Option<String> {
-            wipe_partitions(mode, Path::new(DATA_DEV), Path::new(ETC_DEV), ops)
+            wipe_partitions(mode, targets(), ops)
         }
 
         #[test]
@@ -1359,16 +1375,10 @@ mod tests {
             let mut ops = ScriptedWipeOps::failing_on(failing);
             let log = ops.log.clone();
             let rebuild_log = ops.log.clone();
-            let (status, out_signal) = wipe_and_rebuild(
-                mode,
-                Path::new(DATA_DEV),
-                Path::new(ETC_DEV),
-                &mut ops,
-                || {
-                    rebuild_log.push("rebuild".to_string());
-                    (rebuilt, signal)
-                },
-            );
+            let (status, out_signal) = wipe_and_rebuild(mode, targets(), &mut ops, || {
+                rebuild_log.push("rebuild".to_string());
+                (rebuilt, signal)
+            });
             (status, out_signal, log.entries())
         }
 
