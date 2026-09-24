@@ -270,6 +270,7 @@ fn validate_devices(
 /// Poll for `destination` until it exists or `timeout` has passed.
 fn wait_for_block_device(destination: &Path, timeout: Duration) -> Result<(), FlashError> {
     let start = Instant::now();
+    let mut announced = false;
     loop {
         if destination.exists() {
             return Ok(());
@@ -280,10 +281,14 @@ fn wait_for_block_device(destination: &Path, timeout: Duration) -> Result<(), Fl
                 secs: timeout.as_secs(),
             });
         }
-        log::info!(
-            "waiting for the destination block device {}",
-            destination.display()
-        );
+        if !announced {
+            log::info!(
+                "waiting up to {}s for the destination block device {}",
+                timeout.as_secs(),
+                destination.display()
+            );
+            announced = true;
+        }
         thread::sleep(DEST_DEVICE_POLL_INTERVAL);
     }
 }
