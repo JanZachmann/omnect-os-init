@@ -190,3 +190,34 @@ On hardware (phyGATE Tauri-L):
 | Firmware | bind-mounted `/lib/firmware`, left mounted | `firmware_class.path`, restored before `switch_root` |
 | Errors | ignored | logged, never fatal |
 | Position | after the rootfs mount | after the rootfs mount |
+
+## 12. Alternatives considered
+
+1. **Keep the legacy approach** — bind-mount the rootfs `/lib/modules` and
+   `/lib/firmware` into the initramfs and run `modprobe imx_sdma`. It works,
+   but it needs `kmod` in the initramfs and leaves two mounts behind in the
+   initramfs that cannot be unmounted while the firmware load may still run.
+   `finit_module` and `firmware_class.path` give the same result without
+   either.
+2. **Load the module early in the rootfs** — a `modules-load.d` entry for
+   `imx_sdma`, so `systemd-modules-load.service` loads it before
+   `sysinit.target` instead of udev loading it later. No init code is needed,
+   and most services start after `sysinit.target`, so the gap gets much
+   smaller. It does not close: units that run before `sysinit.target` still
+   race, and the deferred `spi-imx` probe finishes asynchronously after the
+   module load. It also moves a boot-order guarantee from the initramfs,
+   where legacy had it, into rootfs configuration.
+3. **Build the driver into the kernel and put the firmware into the
+   initramfs** — `CONFIG_IMX_SDMA=y`. The firmware loader waits for the
+   initramfs to be unpacked, so a built-in driver finds the firmware there at
+   probe time, before `/init` runs. This removes the race completely, but it
+   changes the kernel for every i.MX8MM image, puts a second copy of the
+   firmware into the initramfs that has to stay in step with the rootfs
+   package, and needs a new decision about the firmware license, which is the
+   reason the driver is a module.
+4. **Do nothing** — every consumer orders itself on its device unit, as
+   `aziot-tpmd` does. This puts the burden on each application and on each
+   UART user, and it gives up a guarantee the legacy initramfs provided.
+
+This design keeps the legacy guarantee (the module is loaded before
+`switch_root`) at the cost of a small, feature-gated step in the init.
