@@ -1,16 +1,12 @@
 //! Flash mode 1: clone the running disk onto a second block device.
 //!
-//! The sequence is destructive on the destination only, so a failure costs the
-//! clone and nothing else. The clone leaves the destination in the state a
-//! freshly flashed image has: a shipped-size data partition, empty `etc` and
-//! `data` filesystems, and a default bootloader environment.
-//!
-//! There is no destructive write to the source, but three deliberate writes do
-//! reach it, each required: clearing the flash triggers in the source bootloader environment, mounting the source
-//! `data` partition read-write to persist the run log, and, on an EFI machine,
-//! rewriting the running machine's NVRAM boot entries.
+//! The clone leaves the destination in the state a freshly flashed image has:
+//! a shipped-size data partition, empty `etc` and `data` filesystems, and a
+//! default bootloader environment. On an EFI machine the sequence also
+//! rewrites the running machine's NVRAM boot entries.
 
 use std::fs;
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -20,7 +16,7 @@ use std::time::{Duration, Instant};
 use nix::sys::stat::{major, makedev, minor};
 
 use crate::bootloader::sync_filesystems;
-use crate::config::build;
+use crate::config::{BuildConstant, build};
 use crate::error::FlashError;
 #[cfg(feature = "grub")]
 use crate::filesystem::MountOptions;
@@ -28,23 +24,24 @@ use crate::filesystem::reformat_ext4;
 use crate::mode::flash::{efi, rawio, sfdisk, unmount};
 #[cfg(feature = "grub")]
 use crate::mode::flash::{scratch_mounts, with_mount};
-use crate::partition::device::partition_sep_for;
+use crate::partition::device::{partition_path, partition_sep_for};
 use crate::partition::layout::{
     PARTITION_NUM_BOOT, PARTITION_NUM_CERT, PARTITION_NUM_DATA, PARTITION_NUM_ETC,
     PARTITION_NUM_FACTORY, PARTITION_NUM_ROOT_A, PARTITION_NUM_ROOT_B,
 };
-use crate::partition::{PartitionLayout, PartitionName, RootDevice};
+use crate::partition::{PartitionLayout, PartitionName};
 
-/// Bound for the destination block device to show up. Inclusive: a device
-/// present on the last poll counts as found.
 const DEST_DEVICE_WAIT: Duration = Duration::from_secs(30);
 const DEST_DEVICE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 const E2IMAGE_CMD: &str = "/sbin/e2image";
 const E2IMAGE_RAW_FLAG: &str = "-ra";
 const E2IMAGE_PROGRESS_FLAG: &str = "-p";
+const E2IMAGE_READ_CHUNK: usize = 4096;
+/// How much of the `e2image` output is kept for the error.
+const E2IMAGE_TAIL_BYTES: usize = 4096;
+const E2IMAGE_REASON_LINES: usize = 3;
 
-/// ext4 volume labels the clone's `etc` and `data` filesystems get.
 const DATA_PARTITION_LABEL: &str = "data";
 const ETC_PARTITION_LABEL: &str = "etc";
 
@@ -56,32 +53,26 @@ const GRUBENV_TARGET: &str = "EFI/BOOT/grubenv";
 #[cfg(feature = "uboot")]
 const UBOOT_ENV_SOURCE: &str = "/etc/omnect/uboot-env.bin";
 
-pub(crate) const CONST_DATA_SIZE: &str = "DATA_SIZE";
-const CONST_BOOTLOADER_START: &str = "BOOTLOADER_START";
-const CONST_UBOOT_ENV1_START: &str = "UBOOT_ENV1_START";
-#[cfg(feature = "uboot")]
-const CONST_UBOOT_ENV2_START: &str = "UBOOT_ENV2_START";
-#[cfg(feature = "uboot")]
-const CONST_UBOOT_ENV_SIZE: &str = "UBOOT_ENV_SIZE";
+#[cfg(feature = "gpt")]
+const URANDOM_PATH: &str = "/dev/urandom";
+#[cfg(feature = "gpt")]
+const UUID_BYTES: usize = 16;
 
-/// Names the operation of a `FlashError::PartitionTable` raised while looking
-/// a source partition up in the layout.
 const LAYOUT_LOOKUP_OPERATION: &str = "lookup";
 
-/// Why a destination was refused.
 const REASON_IDENTICAL_DISK: &str = "identical to the booted disk";
 const REASON_SOURCE_PARTITION: &str = "a partition of the booted disk";
 const REASON_NOT_A_WHOLE_DISK: &str = "a partition, not a whole disk";
 const REASON_NOT_A_BLOCK_DEVICE: &str = "not a block device";
 const REASON_UNKNOWN_DISK: &str = "the disk it belongs to is unknown to sysfs";
+const REASON_NO_PARTITION_NODE: &str = "the applied partition table produced no block device here";
 
 /// Block devices by device number, each a link to the device's sysfs
 /// directory.
 const SYS_DEV_BLOCK: &str = "/sys/dev/block";
 
-/// The roles the clone writes, and therefore the destination partitions that
-/// have to exist once the rewritten table has been applied. A DOS extended
-/// container holds none of them, so its node is not required.
+/// A DOS extended container holds none of these roles, so its node is not
+/// required.
 const DEST_PARTITION_ROLES: [u32; 7] = [
     PARTITION_NUM_BOOT,
     PARTITION_NUM_ROOT_A,
@@ -92,104 +83,137 @@ const DEST_PARTITION_ROLES: [u32; 7] = [
     PARTITION_NUM_DATA,
 ];
 
-/// Everything mode 1 needs from the running disk and the image it came from.
-pub struct CloneCtx<'a> {
-    pub destination: &'a Path,
-    pub layout: &'a PartitionLayout,
-    pub rootfs: &'a Path,
-    pub machine_features: &'a str,
+pub(crate) struct CloneCtx<'a> {
+    pub(crate) destination: &'a Path,
+    pub(crate) layout: &'a PartitionLayout,
+    pub(crate) rootfs: &'a Path,
+    pub(crate) machine_features: &'a str,
 }
 
-/// The build-time constants mode 1 reads, once they are known to be present.
-pub struct Constants {
-    pub data_size: u64,
-    pub uboot_env1_start: Option<u64>,
-    pub uboot_env2_start: Option<u64>,
-    pub uboot_env_size: Option<u64>,
-    pub bootloader_start: Option<u64>,
+/// The build-time constants as `build.rs` generated them, KB-valued.
+struct BuildConstants {
+    data_size: Option<u64>,
+    bootloader_start: Option<u64>,
+    uboot_env1_start: Option<u64>,
+    #[cfg(feature = "uboot")]
+    uboot_env2_start: Option<u64>,
+    #[cfg(feature = "uboot")]
+    uboot_env_size: Option<u64>,
 }
 
-/// Read the build-time constants, failing on any the machine must define.
+impl BuildConstants {
+    fn from_build() -> Self {
+        Self {
+            data_size: build::DATA_SIZE,
+            bootloader_start: build::BOOTLOADER_START,
+            uboot_env1_start: build::UBOOT_ENV1_START,
+            #[cfg(feature = "uboot")]
+            uboot_env2_start: build::UBOOT_ENV2_START,
+            #[cfg(feature = "uboot")]
+            uboot_env_size: build::UBOOT_ENV_SIZE,
+        }
+    }
+}
+
+/// A byte range on a block device.
+#[derive(Debug, PartialEq, Eq)]
+struct ByteRange {
+    offset: u64,
+    len: u64,
+}
+
+#[cfg(feature = "uboot")]
+#[derive(Debug, PartialEq, Eq)]
+struct UbootEnv {
+    size: u64,
+    offsets: Vec<u64>,
+}
+
+/// The build-time constants mode 1 needs, validated and in bytes.
+#[derive(Debug, PartialEq, Eq)]
+struct Constants {
+    data_size_kb: u64,
+    /// The bootloader a machine keeps outside the boot partition.
+    bootloader_area: Option<ByteRange>,
+    #[cfg(feature = "uboot")]
+    uboot_env: UbootEnv,
+}
+
+fn kb_to_bytes(kb: u64, name: BuildConstant) -> Result<u64, FlashError> {
+    kb.checked_mul(rawio::KIB)
+        .ok_or_else(|| FlashError::InvalidBuildConstant {
+            name,
+            reason: format!("{kb} KB does not fit a byte offset"),
+        })
+}
+
+/// Validate the build-time constants before anything is written.
 ///
 /// `UBOOT_ENV2_START` stays optional: its absence is how a machine says it
 /// reserves no second environment bank.
-pub fn required_constants() -> Result<Constants, FlashError> {
-    let data_size = build::DATA_SIZE.ok_or(FlashError::MissingBuildConstant(CONST_DATA_SIZE))?;
+fn required_constants(raw: &BuildConstants) -> Result<Constants, FlashError> {
+    let data_size_kb = raw
+        .data_size
+        .ok_or(FlashError::MissingBuildConstant(BuildConstant::DataSize))?;
+
+    // The bootloader area reaches up to the first U-Boot environment.
+    let bootloader_area = match raw.bootloader_start {
+        None => None,
+        Some(start) => {
+            let end = raw
+                .uboot_env1_start
+                .ok_or(FlashError::MissingBuildConstant(
+                    BuildConstant::UbootEnv1Start,
+                ))?;
+            let len = end
+                .checked_sub(start)
+                .ok_or_else(|| FlashError::InvalidBuildConstant {
+                    name: BuildConstant::UbootEnv1Start,
+                    reason: format!("{end} KB lies below the bootloader area start {start} KB"),
+                })?;
+            Some(ByteRange {
+                offset: kb_to_bytes(start, BuildConstant::BootloaderStart)?,
+                len: kb_to_bytes(len, BuildConstant::UbootEnv1Start)?,
+            })
+        }
+    };
 
     #[cfg(feature = "uboot")]
-    if build::UBOOT_ENV_SIZE.is_none() {
-        return Err(FlashError::MissingBuildConstant(CONST_UBOOT_ENV_SIZE));
-    }
-
-    // Two independent conditions make the offset mandatory: U-Boot keeps its
-    // environment there, and a machine reserving a bootloader area needs it as
-    // that area's end. Both are checked here rather than where the area is
-    // copied, so a build missing the constant fails before the destination has
-    // been repartitioned.
-    if (cfg!(feature = "uboot") || build::BOOTLOADER_START.is_some())
-        && build::UBOOT_ENV1_START.is_none()
-    {
-        return Err(FlashError::MissingBuildConstant(CONST_UBOOT_ENV1_START));
-    }
+    let uboot_env = {
+        let size = raw.uboot_env_size.ok_or(FlashError::MissingBuildConstant(
+            BuildConstant::UbootEnvSize,
+        ))?;
+        let first = raw
+            .uboot_env1_start
+            .ok_or(FlashError::MissingBuildConstant(
+                BuildConstant::UbootEnv1Start,
+            ))?;
+        let mut offsets = vec![kb_to_bytes(first, BuildConstant::UbootEnv1Start)?];
+        if let Some(second) = raw.uboot_env2_start {
+            offsets.push(kb_to_bytes(second, BuildConstant::UbootEnv2Start)?);
+        }
+        UbootEnv {
+            size: kb_to_bytes(size, BuildConstant::UbootEnvSize)?,
+            offsets,
+        }
+    };
 
     Ok(Constants {
-        data_size,
-        uboot_env1_start: build::UBOOT_ENV1_START,
-        uboot_env2_start: build::UBOOT_ENV2_START,
-        uboot_env_size: build::UBOOT_ENV_SIZE,
-        bootloader_start: build::BOOTLOADER_START,
+        data_size_kb,
+        bootloader_area,
+        #[cfg(feature = "uboot")]
+        uboot_env,
     })
-}
-
-/// The length in KB of the bootloader area to copy, or `None` when the
-/// machine keeps no bootloader outside the boot partition.
-///
-/// The area reaches up to the first U-Boot environment, so a machine that
-/// declares a start without that offset is missing a constant rather than
-/// opting out.
-pub fn bootloader_area_len(
-    bootloader_start: Option<u64>,
-    uboot_env1_start: Option<u64>,
-) -> Result<Option<u64>, FlashError> {
-    let Some(start) = bootloader_start else {
-        return Ok(None);
-    };
-
-    let end = uboot_env1_start.ok_or(FlashError::MissingBuildConstant(CONST_UBOOT_ENV1_START))?;
-
-    let len = end
-        .checked_sub(start)
-        .ok_or_else(|| FlashError::InvalidBuildConstant {
-            name: CONST_UBOOT_ENV1_START,
-            reason: format!("{end} KB lies below the bootloader area start {start} KB"),
-        })?;
-
-    Ok(Some(len))
-}
-
-/// The destination addressed as a disk the clone's partition roles sit on.
-///
-/// The clone's rootfs always lands in rootA, which is what makes that the
-/// destination's root partition.
-fn destination_device(destination: &Path) -> RootDevice {
-    let mut device = RootDevice {
-        base: destination.to_path_buf(),
-        partition_sep: partition_sep_for(destination),
-        root_partition: PathBuf::new(),
-    };
-    device.root_partition = device.partition_path(PARTITION_NUM_ROOT_A);
-    device
 }
 
 /// The path of partition `num` on `destination`.
 ///
 /// The destination receives a copy of the source table, so every role sits at
 /// the same index on both disks.
-pub fn destination_partition(destination: &Path, num: u32) -> PathBuf {
-    destination_device(destination).partition_path(num)
+fn destination_partition(destination: &Path, num: u32) -> PathBuf {
+    partition_path(destination, partition_sep_for(destination), num)
 }
 
-/// The device number of `path`, which has to be a block device.
 fn block_devnum(path: &Path) -> Result<u64, String> {
     let metadata = fs::metadata(path).map_err(|e| format!("cannot stat: {e}"))?;
     if !metadata.file_type().is_block_device() {
@@ -231,13 +255,10 @@ fn refusal(destination: u64, destination_disk: Option<u64>, source: u64) -> Opti
     }
 }
 
-/// Refuse a destination that is not a block device, that is the disk the
-/// device booted from, or that is a partition of any disk.
-///
-/// Device numbers are compared, so every spelling of the booted disk is
-/// caught. Writing a partition table into a partition of the running disk
-/// would damage the source before the next step could notice.
-pub fn validate_destination(destination: &Path, source: &Path) -> Result<(), FlashError> {
+/// Device numbers are compared, so every alias of the booted disk is caught.
+/// Writing a partition table into a partition of the running disk would
+/// damage the source before the next step could notice.
+fn validate_destination(destination: &Path, source: &Path) -> Result<(), FlashError> {
     validate_devices(Path::new(SYS_DEV_BLOCK), destination, source)
 }
 
@@ -268,7 +289,6 @@ fn validate_devices(
     }
 }
 
-/// Poll for `destination` until it exists or `timeout` has passed.
 fn wait_for_block_device(destination: &Path, timeout: Duration) -> Result<(), FlashError> {
     let start = Instant::now();
     let mut announced = false;
@@ -279,7 +299,7 @@ fn wait_for_block_device(destination: &Path, timeout: Duration) -> Result<(), Fl
         if start.elapsed() >= timeout {
             return Err(FlashError::DestinationTimeout {
                 device: destination.to_path_buf(),
-                secs: timeout.as_secs(),
+                timeout,
             });
         }
         if !announced {
@@ -294,20 +314,19 @@ fn wait_for_block_device(destination: &Path, timeout: Duration) -> Result<(), Fl
     }
 }
 
-/// Fail unless every role the clone writes has a block device on the
-/// destination.
 fn verify_destination_partitions(destination: &Path) -> Result<(), FlashError> {
     for num in DEST_PARTITION_ROLES {
         let path = destination_partition(destination, num);
-        let is_block = fs::metadata(&path)
-            .map(|m| m.file_type().is_block_device())
-            .unwrap_or(false);
-        if !is_block {
-            return Err(FlashError::InvalidDestination {
-                device: path,
-                reason: "the applied partition table produced no block device here".to_string(),
-            });
-        }
+        let reason = match fs::metadata(&path) {
+            Ok(m) if m.file_type().is_block_device() => continue,
+            Ok(_) => REASON_NOT_A_BLOCK_DEVICE.to_string(),
+            Err(e) if e.kind() == ErrorKind::NotFound => REASON_NO_PARTITION_NODE.to_string(),
+            Err(e) => format!("cannot stat: {e}"),
+        };
+        return Err(FlashError::InvalidDestination {
+            device: path,
+            reason,
+        });
     }
     Ok(())
 }
@@ -323,89 +342,74 @@ fn source_partition(layout: &PartitionLayout, name: PartitionName) -> Result<&Pa
         })
 }
 
-/// Build-time offsets and sizes are KB-valued; block devices are addressed in
-/// bytes.
-fn kb_to_bytes(kb: u64, name: &'static str) -> Result<u64, FlashError> {
-    kb.checked_mul(rawio::KIB)
-        .ok_or_else(|| FlashError::InvalidBuildConstant {
-            name,
-            reason: format!("{kb} KB does not fit a byte offset"),
-        })
+/// The last few lines of `e2image` output, for the error.
+fn output_tail(output: &[u8]) -> String {
+    let text = String::from_utf8_lossy(output);
+    let lines: Vec<&str> = text
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(E2IMAGE_REASON_LINES)..].join("; ")
 }
 
-/// Copy the bootloader a machine keeps outside the boot partition, at the
-/// same offset on both disks.
-fn copy_bootloader_area(
-    constants: &Constants,
-    source: &Path,
-    destination: &Path,
-) -> Result<(), FlashError> {
-    let len_kb = bootloader_area_len(constants.bootloader_start, constants.uboot_env1_start)?;
-    let (Some(start_kb), Some(len_kb)) = (constants.bootloader_start, len_kb) else {
-        return Ok(());
-    };
+/// Run `e2image` with its output forwarded to the console and its tail kept.
+///
+/// Progress goes to stderr, some errors go to stdout, so both share one pipe.
+fn run_e2image(src: &Path, dst: &Path) -> Result<(), String> {
+    let (mut reader, writer) =
+        std::io::pipe().map_err(|e| format!("creating the output pipe: {e}"))?;
+    let writer_err = writer
+        .try_clone()
+        .map_err(|e| format!("creating the output pipe: {e}"))?;
 
-    let offset = kb_to_bytes(start_kb, CONST_BOOTLOADER_START)?;
-    let len = kb_to_bytes(len_kb, CONST_UBOOT_ENV1_START)?;
-
-    log::info!("copying the {len_kb} KB bootloader area at {offset} bytes");
-    rawio::copy_range(source, offset, destination, offset, Some(len))?;
-    Ok(())
-}
-
-/// Image the running rootfs into the clone's rootA.
-fn copy_rootfs(layout: &PartitionLayout, destination: &Path) -> Result<(), FlashError> {
-    let src = layout.root_current();
-    let dst = destination_partition(destination, PARTITION_NUM_ROOT_A);
-    log::info!("imaging {} onto {}", src.display(), dst.display());
-
-    let copy_failed = |reason: String| FlashError::CopyFailed {
-        src: src.clone(),
-        dst: dst.clone(),
-        reason,
-    };
-
-    // Inherited stdio: this is the longest step of the sequence, and the
-    // progress flag is only worth passing if the output reaches the console.
-    let status = Command::new(E2IMAGE_CMD)
+    // The temporary `Command` is dropped at the end of this statement, which
+    // closes the parent's write ends, so the read loop below sees EOF.
+    let mut child = Command::new(E2IMAGE_CMD)
         .args([E2IMAGE_RAW_FLAG, E2IMAGE_PROGRESS_FLAG])
-        .arg(&src)
-        .arg(&dst)
-        .status()
-        .map_err(|e| copy_failed(format!("failed to run {E2IMAGE_CMD}: {e}")))?;
+        .arg(src)
+        .arg(dst)
+        .stdout(writer)
+        .stderr(writer_err)
+        .spawn()
+        .map_err(|e| format!("failed to run {E2IMAGE_CMD}: {e}"))?;
 
+    let mut console = std::io::stderr();
+    let mut tail: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; E2IMAGE_READ_CHUNK];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                let _ = console.write_all(&chunk[..n]);
+                tail.extend_from_slice(&chunk[..n]);
+                let excess = tail.len().saturating_sub(E2IMAGE_TAIL_BYTES);
+                tail.drain(..excess);
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("failed to wait for {E2IMAGE_CMD}: {e}"))?;
     if !status.success() {
-        return Err(copy_failed(format!("{E2IMAGE_CMD} failed ({status})")));
+        return Err(format!(
+            "{E2IMAGE_CMD} failed ({status}): {}",
+            output_tail(&tail)
+        ));
     }
-
-    Ok(())
-}
-
-/// Give the clone's boot and rootA partitions identities of their own, so a
-/// host that sees both disks can tell them apart.
-#[cfg(feature = "gpt")]
-fn assign_fresh_partition_uuids(destination: &Path) -> Result<(), FlashError> {
-    for num in [PARTITION_NUM_BOOT, PARTITION_NUM_ROOT_A] {
-        let uuid = uuid::Uuid::new_v4().to_string();
-        log::info!(
-            "assigning partition {num} on {} the UUID {uuid}",
-            destination.display()
-        );
-        sfdisk::set_part_uuid(destination, num, &uuid)?;
-    }
-    Ok(())
-}
-
-/// A DOS partition table carries no per-partition UUID to assign.
-#[cfg(feature = "dos")]
-fn assign_fresh_partition_uuids(_destination: &Path) -> Result<(), FlashError> {
     Ok(())
 }
 
 #[cfg(feature = "grub")]
 fn copy_grubenv(target: &Path) -> Result<(), FlashError> {
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
+        fs::create_dir_all(parent).map_err(|source| FlashError::PathIo {
+            path: parent.to_path_buf(),
+            source,
+        })?;
     }
     fs::copy(GRUBENV_SOURCE, target).map_err(|e| FlashError::BootEnvWriteFailed {
         device: target.to_path_buf(),
@@ -414,61 +418,156 @@ fn copy_grubenv(target: &Path) -> Result<(), FlashError> {
     Ok(())
 }
 
-/// Put the default GRUB environment on the clone's boot partition.
-#[cfg(feature = "grub")]
-fn write_boot_env(_constants: &Constants, destination: &Path) -> Result<(), FlashError> {
-    with_mount(
-        &destination_partition(destination, PARTITION_NUM_BOOT),
-        Path::new(scratch_mounts::CLONE_BOOT),
-        MountOptions::vfat(),
-        |boot_mount| copy_grubenv(&boot_mount.join(GRUBENV_TARGET)),
-    )
+/// The side effects of the clone, so a test can pin their order.
+trait CloneOps: efi::EfiOps {
+    #[cfg(feature = "gpt")]
+    fn fresh_uuid(&mut self) -> Result<String, FlashError>;
+    /// Wait for `destination` and resolve it to the device node.
+    fn resolve_destination(&mut self, destination: &Path) -> Result<PathBuf, FlashError>;
+    fn validate_destination(&mut self, destination: &Path, source: &Path)
+    -> Result<(), FlashError>;
+    fn unmount_rootfs(&mut self, rootfs: &Path) -> Result<(), FlashError>;
+    fn dump(&mut self, source: &Path) -> Result<String, FlashError>;
+    fn apply(&mut self, destination: &Path, dump: &str) -> Result<(), FlashError>;
+    fn verify_partitions(&mut self, destination: &Path) -> Result<(), FlashError>;
+    fn copy_range(
+        &mut self,
+        src: &Path,
+        src_offset: u64,
+        dst: &Path,
+        dst_offset: u64,
+        len: Option<u64>,
+    ) -> Result<(), FlashError>;
+    fn reformat(&mut self, device: &Path, label: &str) -> Result<(), FlashError>;
+    fn e2image(&mut self, src: &Path, dst: &Path) -> Result<(), FlashError>;
+    #[cfg(feature = "gpt")]
+    fn set_part_uuid(&mut self, device: &Path, num: u32, uuid: &str) -> Result<(), FlashError>;
+    #[cfg(feature = "grub")]
+    fn write_grubenv(&mut self, boot_partition: &Path) -> Result<(), FlashError>;
+    fn sync(&mut self);
 }
 
-/// The byte size of one U-Boot environment and the byte offset of every bank
-/// the machine reserves.
-#[cfg(feature = "uboot")]
-fn uboot_env_banks(constants: &Constants) -> Result<(u64, Vec<u64>), FlashError> {
-    let size_kb = constants
-        .uboot_env_size
-        .ok_or(FlashError::MissingBuildConstant(CONST_UBOOT_ENV_SIZE))?;
-    let first_kb = constants
-        .uboot_env1_start
-        .ok_or(FlashError::MissingBuildConstant(CONST_UBOOT_ENV1_START))?;
+struct RealCloneOps;
 
-    let mut offsets = vec![kb_to_bytes(first_kb, CONST_UBOOT_ENV1_START)?];
-    if let Some(second_kb) = constants.uboot_env2_start {
-        offsets.push(kb_to_bytes(second_kb, CONST_UBOOT_ENV2_START)?);
+impl efi::EfiOps for RealCloneOps {
+    fn mount_efivarfs(&mut self) -> Result<(), FlashError> {
+        efi::RealEfiOps.mount_efivarfs()
     }
 
-    Ok((kb_to_bytes(size_kb, CONST_UBOOT_ENV_SIZE)?, offsets))
+    fn efibootmgr(&mut self, args: &[String]) -> Result<String, FlashError> {
+        efi::RealEfiOps.efibootmgr(args)
+    }
+
+    fn write_entry_dump(&mut self, boot_partition: &Path, dump: &str) -> Result<(), FlashError> {
+        efi::RealEfiOps.write_entry_dump(boot_partition, dump)
+    }
 }
 
-/// Put the default U-Boot environment in every bank the machine reserves.
-#[cfg(feature = "uboot")]
-fn write_boot_env(constants: &Constants, destination: &Path) -> Result<(), FlashError> {
-    let (size, offsets) = uboot_env_banks(constants)?;
-
-    for offset in offsets {
-        log::info!(
-            "writing {UBOOT_ENV_SOURCE} at {offset} bytes on {}",
-            destination.display()
-        );
-        rawio::copy_range(
-            Path::new(UBOOT_ENV_SOURCE),
-            0,
-            destination,
-            offset,
-            Some(size),
-        )?;
+impl CloneOps for RealCloneOps {
+    /// Reading `/dev/urandom` returns an error where `Uuid::new_v4` would
+    /// panic, and a panic in PID 1 is a kernel panic.
+    #[cfg(feature = "gpt")]
+    fn fresh_uuid(&mut self) -> Result<String, FlashError> {
+        let mut bytes = [0u8; UUID_BYTES];
+        fs::File::open(URANDOM_PATH)
+            .and_then(|mut f| f.read_exact(&mut bytes))
+            .map_err(|source| FlashError::PathIo {
+                path: PathBuf::from(URANDOM_PATH),
+                source,
+            })?;
+        Ok(uuid::Builder::from_random_bytes(bytes)
+            .into_uuid()
+            .to_string())
     }
 
-    Ok(())
+    fn resolve_destination(&mut self, destination: &Path) -> Result<PathBuf, FlashError> {
+        // A destination owned by the source always exists already, so the wait
+        // returns at once for it and the refusal is not delayed.
+        wait_for_block_device(destination, DEST_DEVICE_WAIT)?;
+        fs::canonicalize(destination).map_err(|e| FlashError::InvalidDestination {
+            device: destination.to_path_buf(),
+            reason: format!("cannot resolve: {e}"),
+        })
+    }
+
+    fn validate_destination(
+        &mut self,
+        destination: &Path,
+        source: &Path,
+    ) -> Result<(), FlashError> {
+        validate_destination(destination, source)
+    }
+
+    fn unmount_rootfs(&mut self, rootfs: &Path) -> Result<(), FlashError> {
+        unmount::unmount_rootfs(rootfs)
+    }
+
+    fn dump(&mut self, source: &Path) -> Result<String, FlashError> {
+        sfdisk::dump(source)
+    }
+
+    fn apply(&mut self, destination: &Path, dump: &str) -> Result<(), FlashError> {
+        sfdisk::apply(destination, dump)
+    }
+
+    fn verify_partitions(&mut self, destination: &Path) -> Result<(), FlashError> {
+        verify_destination_partitions(destination)
+    }
+
+    fn copy_range(
+        &mut self,
+        src: &Path,
+        src_offset: u64,
+        dst: &Path,
+        dst_offset: u64,
+        len: Option<u64>,
+    ) -> Result<(), FlashError> {
+        rawio::copy_range(src, src_offset, dst, dst_offset, len).map(drop)
+    }
+
+    fn reformat(&mut self, device: &Path, label: &str) -> Result<(), FlashError> {
+        Ok(reformat_ext4(device, label)?)
+    }
+
+    fn e2image(&mut self, src: &Path, dst: &Path) -> Result<(), FlashError> {
+        run_e2image(src, dst).map_err(|reason| FlashError::CopyFailed {
+            src: src.to_path_buf(),
+            dst: dst.to_path_buf(),
+            reason,
+        })
+    }
+
+    #[cfg(feature = "gpt")]
+    fn set_part_uuid(&mut self, device: &Path, num: u32, uuid: &str) -> Result<(), FlashError> {
+        sfdisk::set_part_uuid(device, num, uuid)
+    }
+
+    #[cfg(feature = "grub")]
+    fn write_grubenv(&mut self, boot_partition: &Path) -> Result<(), FlashError> {
+        with_mount(
+            boot_partition,
+            Path::new(scratch_mounts::CLONE_BOOT),
+            MountOptions::vfat(),
+            |boot_mount| copy_grubenv(&boot_mount.join(GRUBENV_TARGET)),
+        )
+    }
+
+    fn sync(&mut self) {
+        sync_filesystems();
+    }
 }
 
 /// Clone the running disk onto `ctx.destination`.
-pub fn run_clone(ctx: &CloneCtx<'_>) -> Result<(), FlashError> {
-    let constants = required_constants()?;
+pub(crate) fn run_clone(ctx: &CloneCtx<'_>) -> Result<(), FlashError> {
+    let constants = required_constants(&BuildConstants::from_build())?;
+    clone_with(ctx, &constants, &mut RealCloneOps)
+}
+
+fn clone_with(
+    ctx: &CloneCtx<'_>,
+    constants: &Constants,
+    ops: &mut dyn CloneOps,
+) -> Result<(), FlashError> {
     let source = ctx.layout.device.base.as_path();
 
     log::info!(
@@ -477,41 +576,54 @@ pub fn run_clone(ctx: &CloneCtx<'_>) -> Result<(), FlashError> {
         ctx.destination.display()
     );
 
-    // A destination owned by the source always exists already, so the wait
-    // returns at once for it and the refusal below is not delayed.
-    wait_for_block_device(ctx.destination, DEST_DEVICE_WAIT)?;
+    // The clone's boot and rootA partitions get identities of their own, so a
+    // host that sees both disks can tell them apart.
+    #[cfg(feature = "gpt")]
+    let fresh_uuids = [
+        (PARTITION_NUM_BOOT, ops.fresh_uuid()?),
+        (PARTITION_NUM_ROOT_A, ops.fresh_uuid()?),
+    ];
 
     // Everything below addresses the destination by the resolved path,
     // because `destination_partition` appends a partition index to it and an
     // alias such as a by-id link names no partition of its own.
-    let destination =
-        fs::canonicalize(ctx.destination).map_err(|e| FlashError::InvalidDestination {
-            device: ctx.destination.to_path_buf(),
-            reason: format!("cannot resolve: {e}"),
-        })?;
+    let destination = ops.resolve_destination(ctx.destination)?;
     let destination = destination.as_path();
     log::info!("destination resolved to {}", destination.display());
 
-    validate_destination(destination, source)?;
+    ops.validate_destination(destination, source)?;
 
     // `e2image` below must not read a mounted filesystem, and the raw boot
     // copy must not read one either.
-    unmount::unmount_sysroot(ctx.rootfs)?;
+    ops.unmount_rootfs(ctx.rootfs)?;
 
-    let dump = sfdisk::dump(source)?;
-    let rewritten = sfdisk::rewrite_dump(&dump, constants.data_size)?;
-    sfdisk::apply(destination, &rewritten)?;
-    verify_destination_partitions(destination)?;
+    let dump = ops.dump(source)?;
+    let rewritten = sfdisk::rewrite_dump(&dump, constants.data_size_kb)?;
+    ops.apply(destination, &rewritten)?;
+    ops.verify_partitions(destination)?;
 
-    copy_bootloader_area(&constants, source, destination)?;
+    if let Some(area) = &constants.bootloader_area {
+        log::info!(
+            "copying the {} byte bootloader area at {} bytes",
+            area.len,
+            area.offset
+        );
+        ops.copy_range(
+            source,
+            area.offset,
+            destination,
+            area.offset,
+            Some(area.len),
+        )?;
+    }
 
     // Empty `etc` and `data` filesystems are what put the clone into the
     // first-boot condition.
-    reformat_ext4(
+    ops.reformat(
         &destination_partition(destination, PARTITION_NUM_ETC),
         ETC_PARTITION_LABEL,
     )?;
-    reformat_ext4(
+    ops.reformat(
         &destination_partition(destination, PARTITION_NUM_DATA),
         DATA_PARTITION_LABEL,
     )?;
@@ -524,34 +636,57 @@ pub fn run_clone(ctx: &CloneCtx<'_>) -> Result<(), FlashError> {
         let src = source_partition(ctx.layout, name)?;
         let dst = destination_partition(destination, num);
         log::info!("copying {} onto {}", src.display(), dst.display());
-        rawio::copy_range(src, 0, &dst, 0, None)?;
+        ops.copy_range(src, 0, &dst, 0, None)?;
     }
 
-    copy_rootfs(ctx.layout, destination)?;
-    assign_fresh_partition_uuids(destination)?;
+    let root_src = ctx.layout.root_current();
+    let root_dst = destination_partition(destination, PARTITION_NUM_ROOT_A);
+    log::info!("imaging {} onto {}", root_src.display(), root_dst.display());
+    ops.e2image(&root_src, &root_dst)?;
 
-    write_boot_env(&constants, destination)?;
+    #[cfg(feature = "gpt")]
+    for (num, uuid) in &fresh_uuids {
+        log::info!(
+            "assigning partition {num} on {} the UUID {uuid}",
+            destination.display()
+        );
+        ops.set_part_uuid(destination, *num, uuid)?;
+    }
 
-    efi::handle(
-        &mut efi::RealEfiOps,
-        destination,
-        &destination_partition(destination, PARTITION_NUM_BOOT),
-        ctx.machine_features,
-    )?;
+    let boot_partition = destination_partition(destination, PARTITION_NUM_BOOT);
+
+    #[cfg(feature = "grub")]
+    ops.write_grubenv(&boot_partition)?;
+
+    #[cfg(feature = "uboot")]
+    for &offset in &constants.uboot_env.offsets {
+        log::info!(
+            "writing {UBOOT_ENV_SOURCE} at {offset} bytes on {}",
+            destination.display()
+        );
+        ops.copy_range(
+            Path::new(UBOOT_ENV_SOURCE),
+            0,
+            destination,
+            offset,
+            Some(constants.uboot_env.size),
+        )?;
+    }
+
+    efi::handle(ops, destination, &boot_partition, ctx.machine_features)?;
 
     log::info!("flash mode 1 finished");
-    sync_filesystems();
+    ops.sync();
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::partition::RootDevice;
 
     #[test]
     fn destination_partitions_use_the_same_indices_as_the_source() {
-        // The destination gets a copy of the source table, so the roles map
-        // onto the same indices on both disks.
         let dst = Path::new("/dev/sda");
         assert_eq!(
             destination_partition(dst, crate::partition::layout::PARTITION_NUM_BOOT),
@@ -561,34 +696,6 @@ mod tests {
         assert_eq!(
             destination_partition(mmc, crate::partition::layout::PARTITION_NUM_ROOT_A),
             PathBuf::from("/dev/mmcblk2p2")
-        );
-    }
-
-    #[cfg(feature = "gpt")]
-    #[test]
-    fn gpt_data_and_etc_land_on_the_gpt_indices() {
-        let dst = Path::new("/dev/sda");
-        assert_eq!(
-            destination_partition(dst, crate::partition::layout::PARTITION_NUM_ETC),
-            PathBuf::from("/dev/sda6")
-        );
-        assert_eq!(
-            destination_partition(dst, crate::partition::layout::PARTITION_NUM_DATA),
-            PathBuf::from("/dev/sda7")
-        );
-    }
-
-    #[cfg(feature = "dos")]
-    #[test]
-    fn dos_data_and_etc_land_on_the_dos_indices() {
-        let dst = Path::new("/dev/sda");
-        assert_eq!(
-            destination_partition(dst, crate::partition::layout::PARTITION_NUM_ETC),
-            PathBuf::from("/dev/sda7")
-        );
-        assert_eq!(
-            destination_partition(dst, crate::partition::layout::PARTITION_NUM_DATA),
-            PathBuf::from("/dev/sda8")
         );
     }
 
@@ -700,6 +807,26 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_partition_node_and_a_stat_error_are_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = verify_destination_partitions(&dir.path().join("sdz")).unwrap_err();
+        assert!(
+            matches!(&err, FlashError::InvalidDestination { reason, .. }
+                if reason == REASON_NO_PARTITION_NODE),
+            "got {err}"
+        );
+
+        // A path through a regular file fails with ENOTDIR, not ENOENT.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let err = verify_destination_partitions(&file.path().join("sdz")).unwrap_err();
+        assert!(
+            matches!(&err, FlashError::InvalidDestination { reason, .. }
+                if reason.starts_with("cannot stat:")),
+            "got {err}"
+        );
+    }
+
+    #[test]
     fn a_destination_present_when_the_wait_runs_out_counts_as_found() {
         let file = tempfile::NamedTempFile::new().unwrap();
         assert!(wait_for_block_device(file.path(), Duration::ZERO).is_ok());
@@ -715,23 +842,123 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "uboot")]
-    fn uboot_constants(uboot_env2_start: Option<u64>) -> Constants {
-        Constants {
-            data_size: 524_288,
-            uboot_env1_start: Some(4096),
-            uboot_env2_start,
-            uboot_env_size: Some(64),
+    #[test]
+    fn the_e2image_error_keeps_the_last_lines_of_its_output() {
+        let output = b"e2image 1.47.0 (5-Feb-2023)\nScanning inodes...\n\
+            Copying 0 / 1042 blocks (0%)\rCopying 512 / 1042 blocks (49%)\r\
+            e2image: Input/output error while writing block 600\n";
+        assert_eq!(
+            output_tail(output),
+            "Copying 0 / 1042 blocks (0%); Copying 512 / 1042 blocks (49%); \
+             e2image: Input/output error while writing block 600"
+        );
+    }
+
+    fn raw_constants() -> BuildConstants {
+        BuildConstants {
+            data_size: Some(4096),
             bootloader_start: None,
+            uboot_env1_start: Some(4096),
+            #[cfg(feature = "uboot")]
+            uboot_env2_start: None,
+            #[cfg(feature = "uboot")]
+            uboot_env_size: Some(64),
         }
+    }
+
+    #[test]
+    fn data_size_is_required() {
+        let raw = BuildConstants {
+            data_size: None,
+            ..raw_constants()
+        };
+        assert!(matches!(
+            required_constants(&raw),
+            Err(FlashError::MissingBuildConstant(BuildConstant::DataSize))
+        ));
+    }
+
+    #[test]
+    fn a_bootloader_area_needs_the_first_uboot_env_offset() {
+        let raw = BuildConstants {
+            bootloader_start: Some(2048),
+            uboot_env1_start: None,
+            ..raw_constants()
+        };
+        assert!(matches!(
+            required_constants(&raw),
+            Err(FlashError::MissingBuildConstant(
+                BuildConstant::UbootEnv1Start
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_bootloader_area_ending_before_its_start_is_refused() {
+        let raw = BuildConstants {
+            bootloader_start: Some(8192),
+            uboot_env1_start: Some(4096),
+            ..raw_constants()
+        };
+        assert!(matches!(
+            required_constants(&raw),
+            Err(FlashError::InvalidBuildConstant {
+                name: BuildConstant::UbootEnv1Start,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn the_bootloader_area_is_scaled_from_kb_to_bytes() {
+        let raw = BuildConstants {
+            bootloader_start: Some(2048),
+            ..raw_constants()
+        };
+        assert_eq!(
+            required_constants(&raw).unwrap().bootloader_area,
+            Some(ByteRange {
+                offset: 2_097_152,
+                len: 2_097_152
+            })
+        );
+        assert_eq!(
+            required_constants(&raw_constants())
+                .unwrap()
+                .bootloader_area,
+            None
+        );
+    }
+
+    #[test]
+    fn a_kb_value_that_overflows_bytes_is_refused() {
+        let raw = BuildConstants {
+            bootloader_start: Some(u64::MAX / 2),
+            uboot_env1_start: Some(u64::MAX),
+            ..raw_constants()
+        };
+        assert!(matches!(
+            required_constants(&raw),
+            Err(FlashError::InvalidBuildConstant {
+                name: BuildConstant::BootloaderStart,
+                ..
+            })
+        ));
     }
 
     #[cfg(feature = "uboot")]
     #[test]
     fn uboot_env_size_and_offsets_are_scaled_from_kb_to_bytes() {
+        let raw = BuildConstants {
+            uboot_env2_start: Some(8192),
+            ..raw_constants()
+        };
         assert_eq!(
-            uboot_env_banks(&uboot_constants(Some(8192))).unwrap(),
-            (65_536, vec![4_194_304, 8_388_608])
+            required_constants(&raw).unwrap().uboot_env,
+            UbootEnv {
+                size: 65_536,
+                offsets: vec![4_194_304, 8_388_608]
+            }
         );
     }
 
@@ -739,21 +966,280 @@ mod tests {
     #[test]
     fn a_machine_without_a_second_env_bank_gets_one_write() {
         assert_eq!(
-            uboot_env_banks(&uboot_constants(None)).unwrap(),
-            (65_536, vec![4_194_304])
+            required_constants(&raw_constants()).unwrap().uboot_env,
+            UbootEnv {
+                size: 65_536,
+                offsets: vec![4_194_304]
+            }
         );
     }
 
     #[cfg(feature = "uboot")]
     #[test]
-    fn the_bootloader_area_copy_needs_the_first_uboot_env_offset() {
-        // BOOTLOADER_START alone is not enough: the copy length is
-        // UBOOT_ENV1_START - BOOTLOADER_START.
-        assert!(bootloader_area_len(Some(2048), None).is_err());
-        assert!(bootloader_area_len(None, Some(4096)).unwrap().is_none());
-        assert_eq!(
-            bootloader_area_len(Some(2048), Some(4096)).unwrap(),
-            Some(2048)
+    fn uboot_needs_the_env_size_and_the_first_offset() {
+        let raw = BuildConstants {
+            uboot_env_size: None,
+            ..raw_constants()
+        };
+        assert!(matches!(
+            required_constants(&raw),
+            Err(FlashError::MissingBuildConstant(
+                BuildConstant::UbootEnvSize
+            ))
+        ));
+        let raw = BuildConstants {
+            uboot_env1_start: None,
+            ..raw_constants()
+        };
+        assert!(matches!(
+            required_constants(&raw),
+            Err(FlashError::MissingBuildConstant(
+                BuildConstant::UbootEnv1Start
+            ))
+        ));
+    }
+
+    /// Records every clone side effect as one line, in call order, and fails
+    /// the first call whose line starts with `fail_on`.
+    struct RecordingCloneOps {
+        calls: Vec<String>,
+        fail_on: Option<&'static str>,
+        #[cfg(feature = "gpt")]
+        uuids: u32,
+    }
+
+    impl RecordingCloneOps {
+        fn new() -> Self {
+            Self {
+                calls: Vec::new(),
+                fail_on: None,
+                #[cfg(feature = "gpt")]
+                uuids: 0,
+            }
+        }
+
+        fn record(&mut self, call: String) -> Result<(), FlashError> {
+            let fail = self.fail_on.is_some_and(|prefix| call.starts_with(prefix));
+            self.calls.push(call);
+            if fail {
+                return Err(FlashError::EfiFailed("injected".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    impl efi::EfiOps for RecordingCloneOps {
+        fn mount_efivarfs(&mut self) -> Result<(), FlashError> {
+            self.record("mount efivarfs".to_string())
+        }
+
+        fn efibootmgr(&mut self, args: &[String]) -> Result<String, FlashError> {
+            self.record(
+                format!("efibootmgr {}", args.join(" "))
+                    .trim_end()
+                    .to_string(),
+            )?;
+            Ok(String::new())
+        }
+
+        fn write_entry_dump(
+            &mut self,
+            boot_partition: &Path,
+            _dump: &str,
+        ) -> Result<(), FlashError> {
+            self.record(format!("write entry dump to {}", boot_partition.display()))
+        }
+    }
+
+    impl CloneOps for RecordingCloneOps {
+        #[cfg(feature = "gpt")]
+        fn fresh_uuid(&mut self) -> Result<String, FlashError> {
+            self.uuids += 1;
+            let uuid = format!("uuid-{}", self.uuids);
+            self.record(format!("generate {uuid}"))?;
+            Ok(uuid)
+        }
+
+        fn resolve_destination(&mut self, destination: &Path) -> Result<PathBuf, FlashError> {
+            self.record(format!("resolve {}", destination.display()))?;
+            Ok(destination.to_path_buf())
+        }
+
+        fn validate_destination(
+            &mut self,
+            destination: &Path,
+            source: &Path,
+        ) -> Result<(), FlashError> {
+            self.record(format!(
+                "validate {} against {}",
+                destination.display(),
+                source.display()
+            ))
+        }
+
+        fn unmount_rootfs(&mut self, rootfs: &Path) -> Result<(), FlashError> {
+            self.record(format!("unmount {}", rootfs.display()))
+        }
+
+        fn dump(&mut self, source: &Path) -> Result<String, FlashError> {
+            self.record(format!("dump {}", source.display()))?;
+            Ok(sfdisk::tests::SOURCE_DUMP.to_string())
+        }
+
+        fn apply(&mut self, destination: &Path, _dump: &str) -> Result<(), FlashError> {
+            self.record(format!("apply {}", destination.display()))
+        }
+
+        fn verify_partitions(&mut self, destination: &Path) -> Result<(), FlashError> {
+            self.record(format!("verify {}", destination.display()))
+        }
+
+        fn copy_range(
+            &mut self,
+            src: &Path,
+            src_offset: u64,
+            dst: &Path,
+            dst_offset: u64,
+            len: Option<u64>,
+        ) -> Result<(), FlashError> {
+            self.record(format!(
+                "copy {}@{src_offset} to {}@{dst_offset} len {len:?}",
+                src.display(),
+                dst.display()
+            ))
+        }
+
+        fn reformat(&mut self, device: &Path, label: &str) -> Result<(), FlashError> {
+            self.record(format!("reformat {} as {label}", device.display()))
+        }
+
+        fn e2image(&mut self, src: &Path, dst: &Path) -> Result<(), FlashError> {
+            self.record(format!("e2image {} to {}", src.display(), dst.display()))
+        }
+
+        #[cfg(feature = "gpt")]
+        fn set_part_uuid(&mut self, device: &Path, num: u32, uuid: &str) -> Result<(), FlashError> {
+            self.record(format!("set uuid {uuid} on {} {num}", device.display()))
+        }
+
+        #[cfg(feature = "grub")]
+        fn write_grubenv(&mut self, boot_partition: &Path) -> Result<(), FlashError> {
+            self.record(format!("write grubenv to {}", boot_partition.display()))
+        }
+
+        fn sync(&mut self) {
+            self.calls.push("sync".to_string());
+        }
+    }
+
+    fn source_layout() -> PartitionLayout {
+        PartitionLayout::new(RootDevice {
+            base: PathBuf::from("/dev/sda"),
+            partition_sep: "",
+            root_partition: PathBuf::from("/dev/sda2"),
+        })
+        .unwrap()
+    }
+
+    fn run_recorded(ops: &mut RecordingCloneOps, constants: &Constants) -> Result<(), FlashError> {
+        let layout = source_layout();
+        let ctx = CloneCtx {
+            destination: Path::new("/dev/sdb"),
+            layout: &layout,
+            rootfs: Path::new("/rootfs"),
+            machine_features: "efi",
+        };
+        clone_with(&ctx, constants, ops)
+    }
+
+    fn part(disk: &str, num: u32) -> String {
+        destination_partition(Path::new(disk), num)
+            .display()
+            .to_string()
+    }
+
+    /// The spec 4.1 order: nothing is written before the destination is
+    /// validated and the rootfs is unmounted, the table is applied and
+    /// verified before any partition is written, and `etc`/`data` are
+    /// reformatted before the other partitions are copied.
+    #[test]
+    fn the_clone_runs_its_steps_in_the_spec_order() {
+        let raw = BuildConstants {
+            bootloader_start: Some(2048),
+            ..raw_constants()
+        };
+        let constants = required_constants(&raw).unwrap();
+        let mut ops = RecordingCloneOps::new();
+        run_recorded(&mut ops, &constants).unwrap();
+
+        let mut expected: Vec<String> = Vec::new();
+        #[cfg(feature = "gpt")]
+        expected.extend(["generate uuid-1".to_string(), "generate uuid-2".to_string()]);
+        expected.extend([
+            "resolve /dev/sdb".to_string(),
+            "validate /dev/sdb against /dev/sda".to_string(),
+            "unmount /rootfs".to_string(),
+            "dump /dev/sda".to_string(),
+            "apply /dev/sdb".to_string(),
+            "verify /dev/sdb".to_string(),
+            "copy /dev/sda@2097152 to /dev/sdb@2097152 len Some(2097152)".to_string(),
+            format!("reformat {} as etc", part("/dev/sdb", PARTITION_NUM_ETC)),
+            format!("reformat {} as data", part("/dev/sdb", PARTITION_NUM_DATA)),
+        ]);
+        for num in [
+            PARTITION_NUM_BOOT,
+            PARTITION_NUM_FACTORY,
+            PARTITION_NUM_CERT,
+        ] {
+            expected.push(format!(
+                "copy {}@0 to {}@0 len None",
+                part("/dev/sda", num),
+                part("/dev/sdb", num)
+            ));
+        }
+        expected.push(format!(
+            "e2image {} to {}",
+            part("/dev/sda", PARTITION_NUM_ROOT_A),
+            part("/dev/sdb", PARTITION_NUM_ROOT_A)
+        ));
+        #[cfg(feature = "gpt")]
+        expected.extend([
+            "set uuid uuid-1 on /dev/sdb 1".to_string(),
+            "set uuid uuid-2 on /dev/sdb 2".to_string(),
+        ]);
+        #[cfg(feature = "grub")]
+        expected.push("write grubenv to /dev/sdb1".to_string());
+        #[cfg(feature = "uboot")]
+        expected.push(
+            "copy /etc/omnect/uboot-env.bin@0 to /dev/sdb@4194304 len Some(65536)".to_string(),
         );
+        expected.extend([
+            "mount efivarfs".to_string(),
+            "efibootmgr".to_string(),
+            r"efibootmgr -c -d /dev/sdb -p 1 -L omnect_os -l \EFI\BOOT\bootx64.efi".to_string(),
+            "efibootmgr -v".to_string(),
+            "write entry dump to /dev/sdb1".to_string(),
+            "sync".to_string(),
+        ]);
+
+        assert_eq!(ops.calls, expected);
+    }
+
+    #[test]
+    fn a_refused_destination_stops_the_clone_before_anything_is_unmounted_or_written() {
+        let constants = required_constants(&raw_constants()).unwrap();
+        let mut ops = RecordingCloneOps::new();
+        ops.fail_on = Some("validate");
+        assert!(run_recorded(&mut ops, &constants).is_err());
+        assert!(ops.calls.last().unwrap().starts_with("validate"));
+    }
+
+    #[test]
+    fn a_table_that_fails_verification_stops_the_clone_before_any_partition_is_written() {
+        let constants = required_constants(&raw_constants()).unwrap();
+        let mut ops = RecordingCloneOps::new();
+        ops.fail_on = Some("verify");
+        assert!(run_recorded(&mut ops, &constants).is_err());
+        assert!(ops.calls.last().unwrap().starts_with("verify"));
     }
 }

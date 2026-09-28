@@ -10,8 +10,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
+use crate::config::BuildConstant;
 use crate::error::FlashError;
-use crate::mode::flash::clone::CONST_DATA_SIZE;
 #[cfg(feature = "dos")]
 use crate::partition::layout::PARTITION_NUM_EXTENDED;
 use crate::partition::layout::{PARTITION_NUM_DATA, partition_suffix};
@@ -55,7 +55,7 @@ pub fn rewrite_dump(dump: &str, data_size_kb: u64) -> Result<String, FlashError>
     })?;
     let data_start = parse_field_u64(&lines[data_idx], START_FIELD)?;
     let unusable_data_size = |what: &str| FlashError::InvalidBuildConstant {
-        name: CONST_DATA_SIZE,
+        name: BuildConstant::DataSize,
         reason: format!("{data_size_kb} KB does not fit {what}"),
     };
     let data_sectors = data_size_kb
@@ -349,8 +349,13 @@ fn set_field_u64(line: &str, field: &str, value: u64) -> Result<String, FlashErr
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    #[cfg(feature = "dos")]
+    pub(crate) use DOS_DUMP as SOURCE_DUMP;
+    #[cfg(feature = "gpt")]
+    pub(crate) use GPT_DUMP as SOURCE_DUMP;
 
     const DATA_SIZE_KB: u64 = 4096; // 8192 sectors
 
@@ -373,7 +378,7 @@ mod tests {
     }
 
     #[cfg(feature = "gpt")]
-    const GPT_DUMP: &str = "\
+    pub(crate) const GPT_DUMP: &str = "\
 label: gpt
 label-id: 6B1F0F1E-0000-4000-8000-000000000001
 device: /dev/mmcblk0
@@ -426,7 +431,7 @@ sector-size: 512
     }
 
     #[cfg(feature = "dos")]
-    const DOS_DUMP: &str = "\
+    pub(crate) const DOS_DUMP: &str = "\
 label: dos
 label-id: 0x00000001
 device: /dev/sda

@@ -167,10 +167,10 @@ pub(crate) fn handle(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
 
-    pub(crate) const LISTING: &str = "\
+    const LISTING: &str = "\
 BootCurrent: 0002
 BootNext: 0001
 Timeout: 1 seconds
@@ -182,8 +182,8 @@ Boot0002* omnect_os
 
     /// Records every EFI side effect as one line, in call order.
     #[derive(Default)]
-    pub(crate) struct RecordingEfiOps {
-        pub(crate) calls: Vec<String>,
+    struct RecordingEfiOps {
+        calls: Vec<String>,
     }
 
     impl EfiOps for RecordingEfiOps {

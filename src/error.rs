@@ -300,10 +300,13 @@ pub enum FactoryResetError {
 #[derive(Error, Debug)]
 pub enum FlashError {
     #[error("Missing build-time constant: {0}")]
-    MissingBuildConstant(&'static str),
+    MissingBuildConstant(crate::config::BuildConstant),
 
     #[error("Build-time constant {name} is unusable: {reason}")]
-    InvalidBuildConstant { name: &'static str, reason: String },
+    InvalidBuildConstant {
+        name: crate::config::BuildConstant,
+        reason: String,
+    },
 
     #[error("Destination device {} is unusable: {reason}", device.display())]
     InvalidDestination { device: PathBuf, reason: String },
@@ -317,8 +320,11 @@ pub enum FlashError {
     )]
     ConflictingTriggers,
 
-    #[error("Destination device {} did not appear within {secs}s", device.display())]
-    DestinationTimeout { device: PathBuf, secs: u64 },
+    #[error("Destination device {} did not appear within {}s", device.display(), timeout.as_secs())]
+    DestinationTimeout {
+        device: PathBuf,
+        timeout: std::time::Duration,
+    },
 
     #[error("Partition table {operation} failed for {}: {reason}", device.display())]
     PartitionTable {
@@ -562,7 +568,9 @@ mod recovery_class_tests {
     #[cfg(feature = "flash-mode")]
     #[test]
     fn flash_errors_are_fatal() {
-        let err = InitramfsError::Flash(FlashError::MissingBuildConstant("DATA_SIZE"));
+        let err = InitramfsError::Flash(FlashError::MissingBuildConstant(
+            crate::config::BuildConstant::DataSize,
+        ));
         assert_eq!(err.recovery_class(), RecoveryClass::Fatal);
     }
 }
