@@ -23,19 +23,20 @@ pub struct FlashConfig {
     pub devpath: Devpath,
 }
 
-/// `None` means the value selects nothing.
+/// `None` means the value selects nothing. Compared exactly, as legacy does.
 pub(crate) fn parse_mode(value: &str) -> Option<FlashMode> {
-    match value.trim() {
+    match value {
         #[cfg(feature = "flash-mode-1")]
         "1" => Some(FlashMode::Mode1),
         _ => None,
     }
 }
 
+/// A blank value is no destination; any other value is taken as it is.
 #[cfg(feature = "flash-mode-1")]
 pub(crate) fn parse_devpath(value: Option<&str>) -> Devpath {
-    match value.map(str::trim) {
-        Some(path) if !path.is_empty() => Devpath::Set(PathBuf::from(path)),
+    match value {
+        Some(path) if !path.trim().is_empty() => Devpath::Set(PathBuf::from(path)),
         _ => Devpath::NotSet,
     }
 }
@@ -47,10 +48,8 @@ mod tests {
     #[test]
     fn parse_mode_accepts_only_the_known_selectors() {
         #[cfg(feature = "flash-mode-1")]
-        for selector in ["1", " 1", "1 ", "1\n"] {
-            assert_eq!(parse_mode(selector), Some(FlashMode::Mode1), "{selector:?}");
-        }
-        for unknown in ["", " ", "0", "4", "one", "11"] {
+        assert_eq!(parse_mode("1"), Some(FlashMode::Mode1));
+        for unknown in ["", " ", "0", "4", "one", "11", " 1", "1 "] {
             assert_eq!(
                 parse_mode(unknown),
                 None,
@@ -69,10 +68,14 @@ mod tests {
 
     #[cfg(feature = "flash-mode-1")]
     #[test]
-    fn parse_devpath_trims_like_parse_mode() {
+    fn parse_devpath_takes_the_value_as_it_is() {
         assert_eq!(
-            parse_devpath(Some(" /dev/mmcblk2\n")),
+            parse_devpath(Some("/dev/mmcblk2")),
             Devpath::Set(PathBuf::from("/dev/mmcblk2"))
+        );
+        assert_eq!(
+            parse_devpath(Some(" /dev/mmcblk2")),
+            Devpath::Set(PathBuf::from(" /dev/mmcblk2"))
         );
     }
 }
