@@ -10,8 +10,7 @@ use crate::error::FlashError;
 /// are addressed in bytes.
 pub const KIB: u64 = 1024;
 
-/// Copy buffer. Large enough to keep a block device streaming, small enough
-/// for an initramfs that shares RAM with the image it is flashing.
+/// Copy buffer: 1 MiB is enough to keep a block device streaming.
 pub const COPY_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Copy `len` bytes (or the rest of the source when `len` is `None`) from
@@ -99,6 +98,11 @@ pub fn copy_range(
         copied += n as u64;
     }
 
+    // Write-back errors on the destination are reported here or not at all.
+    dst_file
+        .sync_all()
+        .map_err(|e| copy_failed(format!("syncing destination: {e}")))?;
+
     Ok(copied)
 }
 
@@ -154,6 +158,33 @@ mod tests {
             matches!(err, FlashError::CopyFailed { .. }),
             "a truncated copy must fail loudly: {err}"
         );
+    }
+
+    #[test]
+    fn copy_range_copies_across_several_buffer_chunks() {
+        // Longer than `len`, so a chunk that overshoots shows up past the window.
+        const TAIL: usize = 10;
+        let len = 2 * COPY_BUFFER_SIZE + 1;
+        let bytes: Vec<u8> = (0..len + TAIL).map(|i| (i % 251) as u8).collect();
+        let src = file_with(&bytes);
+        let dst = file_with(&vec![0xff; len + 2 * TAIL]);
+
+        let n = copy_range(src.path(), 0, dst.path(), 1, Some(len as u64)).unwrap();
+        assert_eq!(n, len as u64);
+
+        let out = std::fs::read(dst.path()).unwrap();
+        assert_eq!(out[0], 0xff);
+        assert_eq!(&out[1..=len], &bytes[..len]);
+        assert!(out[len + 1..].iter().all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn copy_range_does_not_create_a_missing_destination() {
+        let src = file_with(b"abc");
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("sdz");
+        assert!(copy_range(src.path(), 0, &dst, 0, None).is_err());
+        assert!(!dst.exists());
     }
 
     #[test]
