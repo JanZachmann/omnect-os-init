@@ -1,5 +1,7 @@
 # Flash Modes 1, 2, 3 — Design
 
+**Status:** In review (PR #27)
+
 Port the three flash modes from the legacy scripted initramfs
 (`meta-omnect/recipes-omnect/initrdscripts/omnect-os-initramfs/flash-mode-{1,2,3}`)
 to the Rust initramfs.
@@ -102,13 +104,13 @@ Relative to the legacy scripts this is partly a match and partly a deviation:
 
 - **matches** — legacy ran the flash modes at `init.d/87`, ahead of `resize-data`
   (88) and `fs-mount` (89);
-- **deviates** — the Rust initramfs mounts the rootfs at `/sysroot` and the boot
-  partition at `/sysroot/boot` in `mount_core_partitions` before dispatch, on both
+- **deviates** — the Rust initramfs mounts the rootfs at `/rootfs` and the boot
+  partition at `/rootfs/boot` in `mount_core_partitions` before dispatch, on both
   bootloaders. Legacy mounted the boot partition on demand for environment access
   only (GRUB), and `fs-mount` (89) ran after the flash modes, so the rootfs was
   never mounted while a flash mode ran. This matters for mode 1, which images the
-  running rootfs: every mode therefore unmounts `/sysroot` completely before
-  writing anything (§4.1 step 5, §5.1). Nothing in any mode needs `/sysroot` —
+  running rootfs: every mode therefore unmounts `/rootfs` completely before
+  writing anything (§4.1 step 5, §5.1). Nothing in any mode needs `/rootfs` —
   no mode reaches `switch_root`, and `grubenv.in` and `uboot-env.bin` live in the
   initramfs at `/etc/omnect/`;
 - **matches** — the extra-bootargs sync is skipped for flash modes. Legacy has
@@ -137,7 +139,7 @@ src/mode/flash/
   clone.rs      mode 1 orchestration                                     flash-mode-1
   sfdisk.rs     partition-table dump parsing and rewriting      (pure)   flash-mode-1
   rawio.rs      in-process replacement for every `dd` call               flash-mode-1
-  unmount.rs    `/sysroot` teardown                                      flash-mode-1
+  unmount.rs    rootfs unmount                                           flash-mode-1
   net.rs        interface up, dhcpcd, dropbear                           flash-mode-2/3
   bmap.rs       bmaptool wrapper                                         flash-mode-2/3
   scp.rs        mode 2 orchestration                                     flash-mode-2
@@ -146,7 +148,7 @@ src/mode/flash/
 
 The right column is the gating feature (§3.6). `rawio.rs` and `unmount.rs` were
 not anticipated in the original design; both hold logic modes 2 and 3 are
-expected to reuse (the byte-offset copy, and the `/sysroot` teardown that §5.1
+expected to reuse (the byte-offset copy, and the rootfs unmount that §5.1
 extends with a `/proc/mounts` sweep), but each is gated on `flash-mode-1` for
 now, since mode 1 is the only mode implemented so far. The sweep is added with
 mode 2, its first caller. Widening the gate is expected once mode 2 or
@@ -421,7 +423,7 @@ work tracked in §12 rather than part of the port.
    writes a table into it. Comparing device numbers catches every alias
    spelling of the running disk. A destination sysfs does not list is refused, because a
    partition of the source cannot be ruled out.
-5. `sync`, then unmount `/sysroot` completely — the boot partition first, then the
+5. `sync`, then unmount `/rootfs` completely — the boot partition first, then the
    rootfs. Both are mounted by `mount_core_partitions` on both bootloaders. The
    boot unmount is needed so the raw copy of the boot partition reads a
    consistent image; the rootfs unmount is needed so step 11 does not run
@@ -491,7 +493,7 @@ bring up the network, flash, EFI handling, `sync`, `reboot`.
 
 ### 5.1 Unmounting
 
-`sync`, then unmount `/sysroot` completely — boot partition first, then rootfs, on
+`sync`, then unmount `/rootfs` completely — boot partition first, then rootfs, on
 both bootloaders (§2.3). Then unmount every remaining mount point backed by the
 target disk, by sweeping `/proc/mounts`.
 
@@ -581,7 +583,8 @@ Step 4 is in §10.3.
 
 ## 7. Bounded waits
 
-Every wait is bounded by a named constant and logs progress while waiting. On
+Every wait logs once when it starts, and every machine-driven wait is bounded
+by a named constant. On
 timeout the mode fails into the normal fatal-error path (§8).
 
 | Wait | Legacy | Proposed bound | Rationale |
@@ -624,7 +627,7 @@ See §10.4.
 |---|---|
 | Boot env read failure | Log warn → Normal boot |
 | Unknown `flash-mode` value | Log warn → Normal boot |
-| `flash-mode` clear failure | Log warn → continue; the mode may repeat on the next boot |
+| `flash-mode` clear failure | Log warn → continue. The keys stay set after the power off, so the next power-on runs the mode again, onto whatever is at `flash-mode-devpath` then |
 | Missing build-time constant | Fatal |
 | Destination device missing, invalid, or equal to source | Fatal |
 | Dump read, rewrite, or apply failure | Fatal |
@@ -716,7 +719,7 @@ Behaviour changes, as opposed to bug fixes:
   `\\EFI\\BOOT\\bootx64.efi`. Whether the firmware treats both the same is
   not verified; the EFI hardware run in §10.2 covers it;
 - the new EFI entry is created before the old ones are deleted (§6);
-- every mode unmounts `/sysroot` fully before writing, because the Rust flow mounts
+- every mode unmounts `/rootfs` fully before writing, because the Rust flow mounts
   it before dispatch and legacy did not (§2.3). Without this, mode 1 would image a
   mounted `rootCurrent`;
 - a queued factory reset combined with a flash mode is now an error. Legacy ran

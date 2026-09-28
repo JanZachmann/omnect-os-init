@@ -49,7 +49,7 @@ src/
 │       ├── clone.rs         # Mode 1 orchestration (feature = flash-mode-1)
 │       ├── sfdisk.rs        # Partition-table dump parsing and rewriting (feature = flash-mode-1)
 │       ├── rawio.rs         # In-process replacement for every `dd` call (feature = flash-mode-1)
-│       └── unmount.rs       # /sysroot teardown (feature = flash-mode-1)
+│       └── unmount.rs       # rootfs unmount (feature = flash-mode-1)
 ├── partition/
 │   ├── mod.rs               # Public API
 │   ├── device.rs            # Root device detection (GRUB: blkid/fsuuid, U-Boot: root=)
@@ -99,9 +99,8 @@ src/
   cargo test --features uboot,gpt,resize-data,release-image,test-utils
   ```
   `flash-mode-1` sits in the default feature set, so every base combination
-  above already builds and tests it; the README also lists it explicitly
-  against every bootloader × partition-table pair, plus the one combination
-  that adds `factory-reset` to compile the conflicting-trigger refusal path.
+  above already builds and tests it, and the `factory-reset` ones also cover
+  the refusal of a flash mode queued together with a factory reset.
   The flash-free build needs `--no-default-features`, since `--features` is
   additive and cannot turn a default feature back off:
   ```
