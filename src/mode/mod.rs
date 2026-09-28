@@ -103,7 +103,7 @@ fn build_flash_config(
     #[cfg(feature = "flash-mode-1")]
     let devpath = match _bl.get_env(BootEnvKey::FlashModeDevPath) {
         Ok(value) => flash::config::parse_devpath(value.as_deref()),
-        Err(e) => Err(format!("failed to read env: {e}")),
+        Err(e) => flash::config::Devpath::Unreadable(e.to_string()),
     };
 
     flash::config::FlashConfig {
@@ -306,8 +306,8 @@ mod tests {
             };
             assert_eq!(config.mode, crate::mode::flash::config::FlashMode::Mode1);
             assert_eq!(
-                config.devpath.as_deref(),
-                Ok(std::path::Path::new("/dev/mmcblk2"))
+                config.devpath,
+                crate::mode::flash::config::Devpath::Set("/dev/mmcblk2".into())
             );
             // The success path clears nothing: clearing is the mode's own first step.
             assert!(mock.set_env_calls.is_empty());
@@ -402,20 +402,21 @@ mod tests {
         #[cfg(feature = "flash-mode-1")]
         #[test]
         fn detect_carries_the_reason_an_unusable_destination_was_dropped() {
+            use crate::mode::flash::config::Devpath;
+
             let mut unset = create_mock_bootloader().with_env(BootEnvKey::FlashMode, "1");
+            let Ok(BootMode::Flash(config)) = BootMode::detect(Some(&mut unset)) else {
+                panic!("an unset destination must still select the flash mode");
+            };
+            assert_eq!(config.devpath, Devpath::NotSet);
+
             let mut unreadable = create_mock_bootloader()
                 .with_env(BootEnvKey::FlashMode, "1")
                 .with_get_env_error_for(BootEnvKey::FlashModeDevPath);
-            for (mock, expected) in [
-                (&mut unset, "not set"),
-                (&mut unreadable, "failed to read env"),
-            ] {
-                let Ok(BootMode::Flash(config)) = BootMode::detect(Some(mock)) else {
-                    panic!("an unusable destination must still select the flash mode");
-                };
-                let reason = config.devpath.unwrap_err();
-                assert!(reason.contains(expected), "got: {reason}");
-            }
+            let Ok(BootMode::Flash(config)) = BootMode::detect(Some(&mut unreadable)) else {
+                panic!("an unreadable destination must still select the flash mode");
+            };
+            assert!(matches!(config.devpath, Devpath::Unreadable(_)));
         }
     }
 }

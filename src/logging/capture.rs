@@ -1,10 +1,5 @@
 //! Optional in-memory copy of everything the logger emits.
 //!
-//! A flash mode ends in a power off, so the kernel ring buffer is gone the
-//! moment it finishes. Turning the capture on lets the mode write the whole run
-//! to a disk it did not touch, which is the only post-mortem a failed flash
-//! leaves behind.
-//!
 //! The design assumes a single execution stream: nothing in the crate spawns a
 //! thread, and a mode's `run` calls `start_capture` and `take_capture` once
 //! each. That is what makes the `Relaxed` flag enough — introducing a thread
@@ -17,21 +12,15 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use log::Record;
 
-/// Upper bound on captured lines.
-///
-/// The buffer sits in initramfs RAM until the mode writes it out, so a step
-/// that logs in a retry loop must not be able to grow it without limit. A clone
-/// logs on the order of tens of lines, so the bound only ever bites on a run
-/// that has already gone wrong.
+/// Captured lines kept before the capture stops with one marker line, so a
+/// step that logs in a loop cannot grow the buffer without limit.
 const CAPTURE_MAX_LINES: usize = 4096;
 
 /// Whether a capture is running. Checked before the lock, so a boot that never
 /// captures pays one atomic load per record instead of a lock acquisition.
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 
-/// `Some` while a mode is capturing. Held only around the push, never while a
-/// record is formatted, so a `Display` impl that logs cannot re-enter this and
-/// deadlock.
+/// `Some` while a mode is capturing.
 static CAPTURE: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
 fn push_bounded(buffer: &mut Vec<String>, line: String) {
@@ -67,9 +56,6 @@ pub(crate) fn capture_record(record: &Record) {
 }
 
 /// Begin capturing, discarding anything an earlier capture left behind.
-///
-/// A flash mode is the only caller, so a build without one carries the hook in
-/// `capture_record` and no way to switch it on.
 #[cfg(any(test, feature = "flash-mode"))]
 pub(crate) fn start_capture() {
     if let Ok(mut capture) = CAPTURE.lock() {
@@ -96,6 +82,37 @@ pub(crate) fn take_capture() -> Vec<String> {
 /// holds this lock.
 #[cfg(test)]
 pub(crate) static SERIALIZE: Mutex<()> = Mutex::new(());
+
+/// Feeds the capture without needing write access to `/dev/kmsg`, which
+/// constructing the real logger requires.
+#[cfg(test)]
+struct CaptureOnlyLogger;
+
+#[cfg(test)]
+impl log::Log for CaptureOnlyLogger {
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &Record) {
+        capture_record(record);
+    }
+
+    fn flush(&self) {}
+}
+
+/// Route the `log` macros into the capture for the rest of the test binary.
+///
+/// Every test that logs can then reach a running capture, so a test asserts
+/// only that its own lines are in it, never on the whole content.
+#[cfg(test)]
+pub(crate) fn install_test_logger() {
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        let _ = log::set_boxed_logger(Box::new(CaptureOnlyLogger));
+        log::set_max_level(log::LevelFilter::Debug);
+    });
+}
 
 #[cfg(test)]
 mod tests {
@@ -147,30 +164,10 @@ mod tests {
         assert!(take_capture().is_empty());
     }
 
-    /// Feeds the capture without needing write access to `/dev/kmsg`, which
-    /// constructing the real logger requires.
-    struct CaptureOnlyLogger;
-
-    impl log::Log for CaptureOnlyLogger {
-        fn enabled(&self, _metadata: &log::Metadata) -> bool {
-            true
-        }
-
-        fn log(&self, record: &Record) {
-            capture_record(record);
-        }
-
-        fn flush(&self) {}
-    }
-
     #[test]
     fn the_log_macros_reach_a_running_capture() {
         let _guard = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
-        assert!(
-            log::set_boxed_logger(Box::new(CaptureOnlyLogger)).is_ok(),
-            "this is the only test in the binary that installs a logger"
-        );
-        log::set_max_level(log::LevelFilter::Debug);
+        install_test_logger();
 
         start_capture();
         log::warn!("destination {} did not appear", "/dev/sdb");

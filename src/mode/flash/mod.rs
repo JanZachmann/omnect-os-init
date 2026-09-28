@@ -1,26 +1,24 @@
 //! Flash modes: deploy a whole disk image from the initramfs, before any
 //! rootfs is handed control.
-//!
-//! The mode is selected through the bootloader environment and runs at most
-//! once — the trigger is cleared before any work starts, so a crash mid-flash
-//! leads to a normal boot attempt rather than an endless re-entry.
 
 #[cfg(feature = "flash-mode-1")]
-pub mod clone;
+pub(crate) mod clone;
 pub mod config;
-pub mod efi;
+pub(crate) mod efi;
 #[cfg(feature = "flash-mode-1")]
-pub mod rawio;
+pub(crate) mod rawio;
 #[cfg(feature = "flash-mode-1")]
-pub mod sfdisk;
+pub(crate) mod sfdisk;
 #[cfg(feature = "flash-mode-1")]
-pub mod unmount;
+pub(crate) mod unmount;
 
 use std::fs;
 use std::path::Path;
 
 use nix::sys::reboot::{RebootMode, reboot};
 
+#[cfg(feature = "flash-mode-1")]
+use crate::bootloader::BootEnvKey;
 use crate::bootloader::sync_filesystems;
 use crate::error::FlashError;
 use crate::filesystem::{MountOptions, MountPoint, mount, umount};
@@ -43,7 +41,9 @@ pub(crate) mod scratch_mounts {
 #[cfg(feature = "flash-mode-1")]
 const MODE_1_LOG_FILE: &str = "flash-mode-1.log";
 
-/// The run-log file name on the data partition, one per mode.
+/// Writes the run log: the data partition, the file name, the captured lines.
+type LogWriter<'a> = &'a mut dyn FnMut(&Path, &str, &[String]) -> Result<(), FlashError>;
+
 fn log_file(mode: config::FlashMode) -> &'static str {
     match mode {
         #[cfg(feature = "flash-mode-1")]
@@ -56,15 +56,18 @@ fn log_contents(lines: &[String]) -> String {
 }
 
 /// Mount `source` at `target`, run `work` on the mount point, and unmount it
-/// again on both paths. An unmount failure is returned only when `work`
-/// succeeded; otherwise the `work` error wins and the unmount is logged.
+/// again on success and on error. An unmount failure is returned only when
+/// `work` succeeded; otherwise the `work` error wins and the unmount is logged.
 pub(crate) fn with_mount<T>(
     source: &Path,
     target: &Path,
     options: MountOptions,
     work: impl FnOnce(&Path) -> Result<T, FlashError>,
 ) -> Result<T, FlashError> {
-    fs::create_dir_all(target)?;
+    fs::create_dir_all(target).map_err(|source| FlashError::PathIo {
+        path: target.to_path_buf(),
+        source,
+    })?;
     mount(MountPoint::new(source, target, options))?;
 
     let result = work(target);
@@ -81,43 +84,37 @@ pub(crate) fn with_mount<T>(
 }
 
 /// The destination mode 1 was given.
-///
-/// Detection selects the mode even for an unusable `flash-mode-devpath`, so
-/// the reason becomes an error here, inside the log capture.
 #[cfg(feature = "flash-mode-1")]
 fn destination(flash_config: &config::FlashConfig) -> Result<&Path, FlashError> {
-    flash_config
-        .devpath
-        .as_deref()
-        .map_err(|reason| FlashError::InvalidEnvValue {
-            key: config::DEVPATH_KEY,
-            reason: reason.to_string(),
-        })
+    let invalid = |reason: String| FlashError::InvalidEnvValue {
+        key: BootEnvKey::FlashModeDevPath,
+        reason,
+    };
+    match &flash_config.devpath {
+        config::Devpath::Set(path) => Ok(path),
+        config::Devpath::NotSet => Err(invalid("not set".to_string())),
+        config::Devpath::Unreadable(e) => Err(invalid(format!("failed to read env: {e}"))),
+    }
 }
 
 /// Write the captured log onto the source data partition.
-///
-/// The partition is mounted here because nothing else in a flash boot mounts
-/// it: `run_init` brings up only the core partitions, and mode 1 unmounts even
-/// those before it starts writing.
 fn write_log(data_partition: &Path, file: &str, lines: &[String]) -> Result<(), FlashError> {
     with_mount(
         data_partition,
         Path::new(scratch_mounts::LOG_DATA),
         MountOptions::ext4_readwrite(),
-        |mount_point| Ok(fs::write(mount_point.join(file), log_contents(lines))?),
+        |mount_point| {
+            let path = mount_point.join(file);
+            fs::write(&path, log_contents(lines))
+                .map_err(|source| FlashError::PathIo { path, source })
+        },
     )
 }
 
-/// Persist the run log, best-effort.
-///
-/// Nothing in the clone sequence writes destructively to the source disk,
-/// which makes this log the one record that survives a failed clone — but
-/// losing it must not change the outcome the operator already has on kmsg.
-fn persist_log(layout: &PartitionLayout, file: &str, lines: &[String]) {
+/// Persist the run log, best-effort: losing it must not change the outcome.
+fn persist_log(layout: &PartitionLayout, file: &str, lines: &[String], write: LogWriter<'_>) {
     // A run always logs its own outcome, so an empty capture means the capture
-    // itself was lost. Writing the empty file anyway would leave the operator
-    // unable to tell that from a run that logged nothing.
+    // itself was lost.
     if lines.is_empty() {
         log::warn!("flash mode: nothing was captured; no run log is written");
         return;
@@ -127,7 +124,7 @@ fn persist_log(layout: &PartitionLayout, file: &str, lines: &[String]) {
         log::warn!("flash mode: the source layout has no data partition; the run log is not kept");
         return;
     };
-    if let Err(e) = write_log(data_partition, file, lines) {
+    if let Err(e) = write(data_partition, file, lines) {
         log::warn!("flash mode: failed to write the run log to the source disk: {e}");
     }
 }
@@ -147,41 +144,52 @@ fn run_selected_mode(
     }
 }
 
-/// Run the selected flash mode.
-///
-/// The `Ok` path does not return: mode 1 ends in a power off, because it
-/// leaves a clone on a second disk that an operator has to move, and a reboot
-/// would come back up on the source. On `Err` the caller's fatal-error path
-/// takes over — a shell in the debug image, a log-and-halt loop in the release
-/// image.
-pub fn run(mut ctx: BootContext<'_>, flash_config: config::FlashConfig) -> crate::Result<()> {
-    // First line, so a failed trigger clear reaches the persisted log too: it
-    // means the mode may re-enter on the next boot, which the operator has to
-    // learn from the post-mortem. kmsg is gone after the power off, which
-    // leaves the file on the source disk as the only record of the run.
+/// Clear the triggers, run the mode and persist its log, on success and on
+/// error.
+fn run_and_persist(
+    ctx: &mut BootContext<'_>,
+    flash_config: &config::FlashConfig,
+    write: LogWriter<'_>,
+) -> Result<(), FlashError> {
+    // First, so a failed trigger clear reaches the run log too. kmsg is gone
+    // after the power off, so the file on the source disk is the only record
+    // of the run.
     start_capture();
 
-    // Before any work: a crash mid-flash must lead to a normal boot attempt
-    // rather than an endless re-entry.
     if let Some(bl) = ctx.boot_env.available_mut() {
         clear_flash_triggers(bl);
     }
 
-    let outcome = run_selected_mode(&flash_config, &ctx);
+    let outcome = run_selected_mode(flash_config, ctx);
     match &outcome {
         Ok(()) => log::info!("flash mode finished"),
         Err(e) => log::error!("flash mode failed: {e}"),
     }
-    persist_log(ctx.layout, log_file(flash_config.mode), &take_capture());
+    persist_log(
+        ctx.layout,
+        log_file(flash_config.mode),
+        &take_capture(),
+        write,
+    );
 
-    outcome?;
-
-    // The run log is written after the sequence's own sync, and reboot(2) does
-    // not flush.
+    // The run log is written after the sequence's own sync. On error the
+    // release image halts, and a power cycle must not lose the log.
     sync_filesystems();
 
-    // reboot(2) returns Result<Infallible, _>, so the Ok side is uninhabited
-    // and this let is irrefutable.
+    outcome
+}
+
+/// Run the selected flash mode.
+///
+/// The `Ok` path does not return: mode 1 ends in a power off, because it
+/// leaves a clone on a second disk that an operator has to move, and a reboot
+/// would boot the source disk again.
+pub(crate) fn run(
+    mut ctx: BootContext<'_>,
+    flash_config: config::FlashConfig,
+) -> crate::Result<()> {
+    run_and_persist(&mut ctx, &flash_config, &mut write_log)?;
+
     let Err(e) = reboot(RebootMode::RB_POWER_OFF);
     Err(FlashError::Io(e.into()).into())
 }
@@ -189,7 +197,7 @@ pub fn run(mut ctx: BootContext<'_>, flash_config: config::FlashConfig) -> crate
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bootloader::{BootEnv, BootEnvKey, MockBootEnv};
+    use crate::bootloader::{BootEnv, MockBootEnv};
 
     #[cfg(feature = "flash-mode-1")]
     #[test]
@@ -207,61 +215,109 @@ mod tests {
     }
 
     #[cfg(feature = "flash-mode-1")]
-    #[test]
-    fn a_failing_mode_still_leaves_its_triggers_cleared() {
-        use std::collections::HashMap;
-        use std::path::PathBuf;
-
+    fn failing_mode_1(
+        layout: &PartitionLayout,
+        write: LogWriter<'_>,
+    ) -> (FlashError, Vec<BootEnvKey>) {
         use crate::bootloader::BootEnvState;
         use crate::config::Config;
-        use crate::error::InitramfsError;
-        use crate::partition::RootDevice;
         use crate::runtime::OdsStatus;
-
-        let _guard = crate::logging::capture::SERIALIZE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
 
         let mock = MockBootEnv::new()
             .with_env(BootEnvKey::FlashMode, "1")
             .with_env(BootEnvKey::FlashModeDevPath, " ");
         let cleared = mock.shared_set_env_calls();
         let config = Config::default();
-        // No data partition, so the run log is dropped instead of mounted.
-        let layout = PartitionLayout {
-            partitions: HashMap::new(),
-            device: RootDevice {
-                base: PathBuf::from("/dev/sda"),
-                partition_sep: "",
-                root_partition: PathBuf::from("/dev/sda2"),
-            },
-        };
-        let ctx = BootContext::new(
+        let mut ctx = BootContext::new(
             &config,
-            &layout,
+            layout,
             Path::new("/nonexistent/rootfs"),
             BootEnvState::Available(Box::new(mock)),
             OdsStatus::default(),
         );
         let flash_config = config::FlashConfig {
             mode: config::FlashMode::Mode1,
-            devpath: Err("not set".to_string()),
+            devpath: config::Devpath::NotSet,
         };
 
-        // Fails before any device is touched, so the power off is never reached.
-        let err = run(ctx, flash_config).unwrap_err();
+        // Fails before any device is touched.
+        let err = run_and_persist(&mut ctx, &flash_config, write).unwrap_err();
+        let cleared = cleared.lock().unwrap().clone();
+        (err, cleared)
+    }
+
+    #[cfg(feature = "flash-mode-1")]
+    fn source_layout() -> PartitionLayout {
+        PartitionLayout::new(crate::partition::RootDevice {
+            base: "/dev/sda".into(),
+            partition_sep: "",
+            root_partition: "/dev/sda2".into(),
+        })
+        .unwrap()
+    }
+
+    #[cfg(feature = "flash-mode-1")]
+    #[test]
+    fn a_failing_mode_still_leaves_its_triggers_cleared() {
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+
+        let (err, cleared) = failing_mode_1(&source_layout(), &mut |_, _, _| Ok(()));
         assert!(
-            matches!(
-                err,
-                InitramfsError::Flash(FlashError::InvalidEnvValue { .. })
-            ),
+            matches!(err, FlashError::InvalidEnvValue { .. }),
             "got {err}"
         );
         assert_eq!(
-            *cleared.lock().unwrap(),
+            cleared,
             vec![BootEnvKey::FlashMode, BootEnvKey::FlashModeDevPath],
             "a failed run must not leave a trigger that re-enters on the next boot"
         );
+    }
+
+    #[cfg(feature = "flash-mode-1")]
+    #[test]
+    fn a_failing_mode_persists_a_run_log_that_carries_the_error() {
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::logging::capture::install_test_logger();
+
+        let layout = source_layout();
+        let mut written: Vec<(std::path::PathBuf, String, Vec<String>)> = Vec::new();
+        failing_mode_1(&layout, &mut |partition, file, lines| {
+            written.push((partition.to_path_buf(), file.to_string(), lines.to_vec()));
+            Ok(())
+        });
+
+        let [(partition, file, lines)] = written.as_slice() else {
+            panic!("the run log must be written once, got {written:?}");
+        };
+        assert_eq!(Some(partition), layout.get(PartitionName::Data));
+        assert_eq!(file, "flash-mode-1.log");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("[ERROR] flash mode failed:")
+                    && line.contains("flash-mode-devpath")),
+            "got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_capture_writes_no_run_log() {
+        let layout = PartitionLayout::new(crate::partition::RootDevice {
+            base: "/dev/sda".into(),
+            partition_sep: "",
+            root_partition: "/dev/sda2".into(),
+        })
+        .unwrap();
+        let mut calls = 0;
+        persist_log(&layout, "flash-mode-1.log", &[], &mut |_, _, _| {
+            calls += 1;
+            Ok(())
+        });
+        assert_eq!(calls, 0);
     }
 
     #[test]
@@ -295,12 +351,12 @@ mod tests {
     fn a_missing_destination_is_reported_with_its_reason() {
         let flash_config = config::FlashConfig {
             mode: config::FlashMode::Mode1,
-            devpath: Err("not set".to_string()),
+            devpath: config::Devpath::NotSet,
         };
         let err = destination(&flash_config).unwrap_err();
         assert!(
             matches!(&err, FlashError::InvalidEnvValue { key, reason }
-                if *key == config::DEVPATH_KEY && reason == "not set"),
+                if *key == BootEnvKey::FlashModeDevPath && reason == "not set"),
             "the absent destination must be named by its env key and reason, got: {err}"
         );
     }

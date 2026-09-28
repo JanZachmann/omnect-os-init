@@ -311,8 +311,11 @@ pub enum FlashError {
     #[error("Destination device {} is unusable: {reason}", device.display())]
     InvalidDestination { device: PathBuf, reason: String },
 
-    #[error("Boot-env value for '{key}' is unusable: {reason}")]
-    InvalidEnvValue { key: &'static str, reason: String },
+    #[error("Boot-env value for '{}' is unusable: {reason}", key.as_str())]
+    InvalidEnvValue {
+        key: crate::bootloader::BootEnvKey,
+        reason: String,
+    },
 
     #[error(
         "a factory reset is queued together with a flash mode; both triggers were cleared, \
