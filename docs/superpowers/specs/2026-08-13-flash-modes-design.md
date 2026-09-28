@@ -626,7 +626,7 @@ See §10.4.
 
 | Error source | Handling |
 |---|---|
-| Boot env read failure | Log warn → Normal boot |
+| Boot env read failure | Log warn → Normal boot. A queued factory reset is not cleared and not reported either; it runs on the next boot where the env can be read |
 | Unknown `flash-mode` value | Log warn → Normal boot |
 | `flash-mode` clear failure | Log warn → continue. The keys stay set after the power off, so the next power-on runs the mode again, onto whatever is at `flash-mode-devpath` then |
 | Missing build-time constant | Fatal |
