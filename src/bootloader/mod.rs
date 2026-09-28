@@ -98,8 +98,7 @@ pub enum BootEnvKey {
     /// follows halts before switch_root. Plain text `"<partition>:<reason>"`.
     FactoryResetLastError,
     #[cfg(feature = "flash-mode")]
-    /// `flash-mode` — mode selector set by the operator. Cleared by the initramfs
-    /// before the selected mode starts work.
+    /// `flash-mode` — mode selector set by the operator.
     FlashMode,
     #[cfg(feature = "flash-mode-1")]
     /// `flash-mode-devpath` — destination block device for mode 1.
@@ -696,7 +695,7 @@ mod tests {
 
     #[cfg(feature = "flash-mode")]
     #[test]
-    fn flash_mode_keys_use_the_legacy_hyphenated_names() {
+    fn flash_mode_keys_use_the_hyphenated_names_operators_set() {
         assert_eq!(BootEnvKey::FlashMode.as_str(), "flash-mode");
         #[cfg(feature = "flash-mode-1")]
         assert_eq!(BootEnvKey::FlashModeDevPath.as_str(), "flash-mode-devpath");

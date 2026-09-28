@@ -299,15 +299,7 @@ struct RealReformatOps<'a> {
 
 impl ReformatRetryOps for RealReformatOps<'_> {
     fn reformat(&mut self, device: &Path, label: &str) -> Result<()> {
-        reformat_ext4(device, label).map_err(|e| {
-            // Keep the factory-reset class: an unreformattable partition degrades the
-            // boot, it does not stop it. The shared helper cannot know that.
-            FactoryResetError::ReformatFailed {
-                device: device.to_path_buf(),
-                reason: e.to_string(),
-            }
-            .into()
-        })
+        reformat_ext4(device, label).map_err(|e| reformat_failed(device, e))
     }
 
     fn mount_all(&mut self) -> Result<()> {
@@ -317,6 +309,16 @@ impl ReformatRetryOps for RealReformatOps<'_> {
             },
         )
     }
+}
+
+/// Keep the factory-reset class: an unreformattable partition degrades the
+/// boot, it does not stop it. The shared helper cannot know that.
+fn reformat_failed(device: &Path, e: crate::error::FilesystemError) -> crate::InitramfsError {
+    FactoryResetError::ReformatFailed {
+        device: device.to_path_buf(),
+        reason: e.to_string(),
+    }
+    .into()
 }
 
 fn join_context(first: Option<String>, second: Option<String>) -> Option<String> {
@@ -699,39 +701,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn real_reformat_ops_wraps_the_shared_helper_error_as_factory_reset() {
-        use crate::partition::RootDevice;
-        use std::collections::HashMap;
-
-        let layout = PartitionLayout {
-            partitions: HashMap::new(),
-            device: RootDevice {
-                base: PathBuf::from("/dev/sda"),
-                partition_sep: "",
-                root_partition: PathBuf::from("/dev/sda2"),
+    fn a_reformat_failure_keeps_the_factory_reset_class_and_the_mkfs_reason() {
+        let err = reformat_failed(
+            Path::new("/dev/sda7"),
+            crate::error::FilesystemError::FormatFailed {
+                device: PathBuf::from("/dev/sda7"),
+                fstype: "ext4".to_string(),
+                reason: "mkfs.ext4 failed (exit status: 1): Device size reported to be zero"
+                    .to_string(),
             },
-        };
-        let rootfs = PathBuf::from("/");
-        let mut ods_status = OdsStatus::new();
-        let mut mounts: Vec<PathBuf> = Vec::new();
-        let mut ops = RealReformatOps {
-            layout: &layout,
-            rootfs: &rootfs,
-            ods_status: &mut ods_status,
-            mounts: &mut mounts,
-        };
-
-        let err = ops
-            .reformat(Path::new("/nonexistent/zzz"), "data")
-            .expect_err("reformatting a nonexistent device must fail");
-
+        );
         assert!(
             matches!(
-                err,
-                InitramfsError::FactoryReset(FactoryResetError::ReformatFailed { .. })
+                &err,
+                InitramfsError::FactoryReset(FactoryResetError::ReformatFailed { reason, .. })
+                    if reason.contains("Device size reported to be zero")
             ),
-            "expected the shared helper's error to be wrapped back into \
-             FactoryResetError::ReformatFailed, got: {err:?}"
+            "got: {err:?}"
         );
     }
 

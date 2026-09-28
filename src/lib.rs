@@ -175,13 +175,13 @@ pub fn run_init() -> Result<()> {
     // on it without threading the value through every return type.
     set_update_pending(update_pending_from_env(&bootloader_env));
 
-    // Detected once: a second read would repeat the warnings detection logs
-    // and could see a different answer than the one that is dispatched below.
+    // Detected once: a second read would log the detection warnings again and
+    // could see a different answer than the one that is dispatched below.
     let mode = BootMode::detect(bootloader_env.available_mut())?;
 
-    // A flash mode clones or overwrites a whole disk, so init_setup's work on
-    // the running disk is either discarded seconds later or not carried over,
-    // and an extra-bootargs reboot would only delay the flash.
+    // A flash mode clones the whole disk, so init_setup's work on the running
+    // disk is not carried over, and an extra-bootargs reboot would only delay
+    // the flash.
     #[cfg(feature = "flash-mode")]
     let skip_init_setup = matches!(mode, BootMode::Flash(_));
     #[cfg(not(feature = "flash-mode"))]

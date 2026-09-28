@@ -66,9 +66,8 @@ pub enum BootMode {
 
 /// Best-effort clear of the flash trigger keys.
 ///
-/// Used by the conflict refusal and as the flash mode's own first step. On a
-/// release image a fatal error halts forever, so a trigger left set would mean
-/// every power cycle repeats the same outcome.
+/// On a release image a fatal error halts forever, so a trigger left set would
+/// mean every power cycle repeats the same outcome.
 #[cfg(feature = "flash-mode")]
 pub(crate) fn clear_flash_triggers(bl: &mut dyn BootEnv) {
     if let Err(e) = bl.set_env(BootEnvKey::FlashMode, None) {
@@ -80,8 +79,6 @@ pub(crate) fn clear_flash_triggers(bl: &mut dyn BootEnv) {
     }
 }
 
-/// Best-effort clear of both the flash and the factory-reset triggers ahead
-/// of the conflict refusal, so a re-queue starts from a clean slate.
 #[cfg(all(feature = "flash-mode", feature = "factory-reset"))]
 fn clear_flash_and_reset_triggers(bl: &mut dyn BootEnv) {
     clear_flash_triggers(bl);
@@ -96,12 +93,13 @@ fn clear_flash_and_reset_triggers(bl: &mut dyn BootEnv) {
 /// runs before the mode starts its log capture, and the mode is where the
 /// reason has to reach the persisted log.
 #[cfg(feature = "flash-mode")]
+#[cfg_attr(not(feature = "flash-mode-1"), allow(unused_variables))]
 fn build_flash_config(
-    _bl: &mut dyn BootEnv,
+    bl: &mut dyn BootEnv,
     mode: flash::config::FlashMode,
 ) -> flash::config::FlashConfig {
     #[cfg(feature = "flash-mode-1")]
-    let devpath = match _bl.get_env(BootEnvKey::FlashModeDevPath) {
+    let devpath = match bl.get_env(BootEnvKey::FlashModeDevPath) {
         Ok(value) => flash::config::parse_devpath(value.as_deref()),
         Err(e) => flash::config::Devpath::Unreadable(e.to_string()),
     };
@@ -117,33 +115,33 @@ impl BootMode {
     /// Detect the boot mode from the boot environment.
     ///
     /// A set `flash-mode` selects `Flash`; a `factory-reset` with a non-blank
-    /// value selects `FactoryReset`, whether or not that value can be used — an
-    /// unusable one is carried as `FactoryResetTrigger::Rejected`, so it is
-    /// cleared and reported. A blank value of either key is no trigger.
+    /// value selects `FactoryReset`. A blank value of either key is no trigger.
     /// Both triggers at once is refused — they act on different disks and
     /// single-mode dispatch cannot perform both, so dropping one silently would
-    /// be the worse failure. Both triggers are cleared before that refusal is
-    /// raised, because a release image halts on a fatal error and would
-    /// otherwise repeat the refusal on every power cycle.
+    /// be the worse failure. The refusal is the only error, and it is fatal.
     ///
     /// A `flash-mode` value that selects nothing is logged and the device boots
     /// normally: an operator typo must not stop a device from booting.
     /// Falls back to `Normal` when either trigger key cannot be read while a
     /// flash mode may be set, since a conflict cannot be ruled out and both
-    /// modes are destructive. Never blocks boot.
-    pub fn detect(_bl: Option<&mut dyn BootEnv>) -> Result<Self> {
-        if let Some(_bl) = _bl {
+    /// modes are destructive.
+    #[cfg_attr(
+        not(any(feature = "factory-reset", feature = "flash-mode")),
+        allow(unused_variables)
+    )]
+    pub fn detect(bl: Option<&mut dyn BootEnv>) -> Result<Self> {
+        if let Some(bl) = bl {
             #[cfg(feature = "flash-mode")]
-            match _bl.get_env(BootEnvKey::FlashMode) {
+            match bl.get_env(BootEnvKey::FlashMode) {
                 // Blank is no trigger, for the same backend reason as the
                 // factory-reset key below.
                 Ok(Some(value)) if value.trim().is_empty() => {}
                 Ok(Some(value)) => match flash::config::parse_mode(&value) {
                     Some(mode) => {
                         #[cfg(feature = "factory-reset")]
-                        match _bl.get_env(BootEnvKey::FactoryReset) {
+                        match bl.get_env(BootEnvKey::FactoryReset) {
                             Ok(Some(json)) if !json.trim().is_empty() => {
-                                clear_flash_and_reset_triggers(_bl);
+                                clear_flash_and_reset_triggers(bl);
                                 return Err(crate::error::FlashError::ConflictingTriggers.into());
                             }
                             Ok(Some(_)) | Ok(None) => {}
@@ -155,7 +153,7 @@ impl BootMode {
                             }
                         }
 
-                        return Ok(Self::Flash(build_flash_config(_bl, mode)));
+                        return Ok(Self::Flash(build_flash_config(bl, mode)));
                     }
                     None => {
                         log::warn!("flash-mode: unrecognised value '{value}', booting normally");
@@ -169,7 +167,7 @@ impl BootMode {
             }
 
             #[cfg(feature = "factory-reset")]
-            match _bl.get_env(BootEnvKey::FactoryReset) {
+            match bl.get_env(BootEnvKey::FactoryReset) {
                 // A trigger can be cleared by unsetting the key or by writing
                 // an empty value. The backends disagree about the second:
                 // fw_printenv reports an empty variable as unset, grub-editenv
@@ -348,7 +346,6 @@ mod tests {
                 ),
                 "the pair must be refused, not silently resolved: {err}"
             );
-            // All three triggers must be gone, or a release image halts on every power cycle.
             assert!(mock.set_env_calls.contains(&BootEnvKey::FlashMode));
             assert!(mock.set_env_calls.contains(&BootEnvKey::FlashModeDevPath));
             assert!(mock.set_env_calls.contains(&BootEnvKey::FactoryReset));

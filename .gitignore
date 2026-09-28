@@ -30,5 +30,5 @@ rewrite-initramfs-plan.md
 
 docs/superpowers/reviews/
 
-# SDD scratch workspace
+# subagent-driven-development scratch directory
 .superpowers/

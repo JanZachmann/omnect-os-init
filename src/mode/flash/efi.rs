@@ -35,7 +35,6 @@ const BOOT_ENTRY_ID_LEN: usize = 4;
 /// The side effects of the EFI handling, so a test can pin their order.
 pub(crate) trait EfiOps {
     fn mount_efivarfs(&mut self) -> Result<(), FlashError>;
-    /// Run `efibootmgr` with `args`, returning stdout on success.
     fn efibootmgr(&mut self, args: &[String]) -> Result<String, FlashError>;
     fn write_entry_dump(&mut self, boot_partition: &Path, dump: &str) -> Result<(), FlashError>;
 }

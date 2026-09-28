@@ -115,9 +115,8 @@ impl Config {
     }
 }
 
-/// Read `MACHINE_FEATURES` from the **initramfs-local** `/etc/os-release`,
-/// not `/sysroot/etc/os-release` — a flash mode unmounts `/sysroot` before
-/// this value is needed. A file that cannot be read yields an empty string.
+/// Read at startup from the initramfs. A file that cannot be read yields an
+/// empty string.
 fn load_machine_features() -> String {
     fs::read_to_string(OS_RELEASE_PATH)
         .map(|contents| parse_machine_features(&contents))
