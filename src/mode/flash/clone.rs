@@ -25,9 +25,9 @@ use crate::error::FlashError;
 #[cfg(feature = "grub")]
 use crate::filesystem::MountOptions;
 use crate::filesystem::reformat_ext4;
-#[cfg(feature = "grub")]
-use crate::mode::flash::with_mount;
 use crate::mode::flash::{efi, rawio, sfdisk, unmount};
+#[cfg(feature = "grub")]
+use crate::mode::flash::{scratch_mounts, with_mount};
 use crate::partition::device::partition_sep_for;
 use crate::partition::layout::{
     PARTITION_NUM_BOOT, PARTITION_NUM_CERT, PARTITION_NUM_DATA, PARTITION_NUM_ETC,
@@ -52,10 +52,6 @@ const ETC_PARTITION_LABEL: &str = "etc";
 const GRUBENV_SOURCE: &str = "/etc/omnect/grubenv.in";
 #[cfg(feature = "grub")]
 const GRUBENV_TARGET: &str = "EFI/BOOT/grubenv";
-/// Scratch mount point for the destination boot partition while the default
-/// GRUB environment is written.
-#[cfg(feature = "grub")]
-const BOOT_ENV_MOUNT_POINT: &str = "/tmp/clone-boot";
 
 #[cfg(feature = "uboot")]
 const UBOOT_ENV_SOURCE: &str = "/etc/omnect/uboot-env.bin";
@@ -423,7 +419,7 @@ fn copy_grubenv(target: &Path) -> Result<(), FlashError> {
 fn write_boot_env(_constants: &Constants, destination: &Path) -> Result<(), FlashError> {
     with_mount(
         &destination_partition(destination, PARTITION_NUM_BOOT),
-        Path::new(BOOT_ENV_MOUNT_POINT),
+        Path::new(scratch_mounts::CLONE_BOOT),
         MountOptions::vfat(),
         |boot_mount| copy_grubenv(&boot_mount.join(GRUBENV_TARGET)),
     )
@@ -537,6 +533,7 @@ pub fn run_clone(ctx: &CloneCtx<'_>) -> Result<(), FlashError> {
     write_boot_env(&constants, destination)?;
 
     efi::handle(
+        &mut efi::RealEfiOps,
         destination,
         &destination_partition(destination, PARTITION_NUM_BOOT),
         ctx.machine_features,

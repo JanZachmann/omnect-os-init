@@ -42,6 +42,8 @@ pub enum FsType {
     Vfat,
     Tmpfs,
     Overlay,
+    #[cfg(feature = "flash-mode")]
+    Efivarfs,
 }
 
 impl FsType {
@@ -52,6 +54,8 @@ impl FsType {
             FsType::Vfat => "vfat",
             FsType::Tmpfs => "tmpfs",
             FsType::Overlay => "overlay",
+            #[cfg(feature = "flash-mode")]
+            FsType::Efivarfs => "efivarfs",
         }
     }
 }
@@ -130,6 +134,15 @@ impl MountOptions {
     pub fn tmpfs() -> Self {
         Self {
             fstype: Some(FsType::Tmpfs),
+            flags: MsFlags::empty(),
+            data: None,
+        }
+    }
+
+    #[cfg(feature = "flash-mode")]
+    pub fn efivarfs() -> Self {
+        Self {
+            fstype: Some(FsType::Efivarfs),
             flags: MsFlags::empty(),
             data: None,
         }

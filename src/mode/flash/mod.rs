@@ -28,10 +28,18 @@ use crate::logging::{start_capture, take_capture};
 use crate::mode::{BootContext, clear_flash_triggers};
 use crate::partition::{PartitionLayout, PartitionName};
 
-/// Scratch mount point for the source data partition while the run log is
-/// written. It sits outside the rootfs mount, which mode 1 unmounts before it
-/// writes anything.
-const FLASH_LOG_MOUNT_POINT: &str = "/tmp/flash-log-data";
+/// Scratch mount points. They sit outside the rootfs mount, which mode 1
+/// unmounts before it writes anything.
+pub(crate) mod scratch_mounts {
+    /// The source data partition, while the run log is written.
+    pub(crate) const LOG_DATA: &str = "/tmp/flash-log-data";
+    /// The destination boot partition, while the default GRUB environment is
+    /// written.
+    #[cfg(all(feature = "flash-mode-1", feature = "grub"))]
+    pub(crate) const CLONE_BOOT: &str = "/tmp/clone-boot";
+    /// The target boot partition, while the EFI entry dump is written.
+    pub(crate) const EFI_BOOT: &str = "/tmp/boot";
+}
 #[cfg(feature = "flash-mode-1")]
 const MODE_1_LOG_FILE: &str = "flash-mode-1.log";
 
@@ -95,7 +103,7 @@ fn destination(flash_config: &config::FlashConfig) -> Result<&Path, FlashError> 
 fn write_log(data_partition: &Path, file: &str, lines: &[String]) -> Result<(), FlashError> {
     with_mount(
         data_partition,
-        Path::new(FLASH_LOG_MOUNT_POINT),
+        Path::new(scratch_mounts::LOG_DATA),
         MountOptions::ext4_readwrite(),
         |mount_point| Ok(fs::write(mount_point.join(file), log_contents(lines))?),
     )
@@ -257,10 +265,15 @@ mod tests {
     }
 
     #[test]
-    fn the_log_mount_point_stays_outside_the_rootfs_mount() {
-        // Mode 1 unmounts the rootfs before it writes anything, so a target
-        // under it would be gone by the time the log is written.
-        assert!(!Path::new(FLASH_LOG_MOUNT_POINT).starts_with(crate::ROOTFS_DIR));
+    fn the_scratch_mount_points_stay_outside_the_rootfs_mount() {
+        for mount_point in [
+            scratch_mounts::LOG_DATA,
+            scratch_mounts::EFI_BOOT,
+            #[cfg(all(feature = "flash-mode-1", feature = "grub"))]
+            scratch_mounts::CLONE_BOOT,
+        ] {
+            assert!(!Path::new(mount_point).starts_with(crate::ROOTFS_DIR));
+        }
     }
 
     #[cfg(feature = "flash-mode-1")]

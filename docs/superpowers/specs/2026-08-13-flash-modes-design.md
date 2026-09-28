@@ -553,25 +553,31 @@ see §10.1.
 ## 6. EFI handling
 
 Applies on machines whose `MACHINE_FEATURES` contains `efi`. Ported from
-`flash_mode_efi_handling` in `common-sh`, unchanged:
+`flash_mode_efi_handling` in `common-sh`, with the order changed so the machine
+always keeps a boot entry:
 
-1. Delete every EFI boot entry, active or not. `flash_mode_efi_handling` greps
+1. Mount `efivarfs` at `/sys/firmware/efi/efivars` unless it is mounted
+   already. `efibootmgr` needs it, and the init mounts only `/dev`, `/proc`,
+   `/sys` and `/run`.
+2. List every EFI boot entry, active or not. `flash_mode_efi_handling` greps
    with an unquoted `^Boot[0-9a-fA-F][0-9a-fA-F][0-9a-fA-F][0-9a-fA-F]\*`: the
    shell turns `\*` into `*`, which `grep` reads as "zero or more" of the last
    hex class, so every `Boot####` line matches, with or without the `*`
    active marker.
-2. Mount the target boot partition — the destination's for mode 1, the running
-   disk's for modes 2 and 3.
 3. Create an `omnect_os` entry pointing at `\EFI\BOOT\bootx64.efi` on partition 1
-   of the target disk.
-4. Write `efibootmgr -v` output to `EFI/BOOT/efibootmgr_entry` on the boot
-   partition.
-5. Unmount.
+   of the target disk. `efibootmgr -c` takes an unused number.
+4. Delete every entry listed in step 2.
+5. Mount the target boot partition — the destination's for mode 1, the running
+   disk's for modes 2 and 3 — write `efibootmgr -v` output to
+   `EFI/BOOT/efibootmgr_entry` on it, and unmount.
+
+Legacy deletes first and creates second. The end state is the same, but a
+failure between the two left the machine with no boot entry.
 
 The legacy duplicate entry — a second entry with the same loader and the label
 `"omnect_os "`, differing only by a trailing space — is not ported (§10.2).
 
-Item 1 is in §10.3.
+Step 4 is in §10.3.
 
 ## 7. Bounded waits
 
@@ -629,7 +635,7 @@ See §10.4.
 | Network setup or wait timeout | Fatal |
 | Download failure or checksum mismatch | Fatal |
 | `bmaptool` failure | Fatal |
-| EFI handling failure | Fatal |
+| EFI handling failure | Fatal. The machine keeps its old entries if the create failed, and the new entry plus any not yet deleted if a delete failed |
 | Log persistence failure | Log warn → continue |
 
 "Fatal" means the mode aborts into §8.1's failure path. For mode 1 the source
@@ -705,6 +711,11 @@ Behaviour changes, as opposed to bug fixes:
 - machine-driven unbounded waits become bounded (§7); the wait for the
   operator's `scp` keeps polling as legacy does (§10.8);
 - `dd` is replaced by in-process file I/O (§2.8);
+- the EFI loader is passed to `efibootmgr` as `\EFI\BOOT\bootx64.efi`. The
+  legacy script's unquoted `\\\\EFI\\\\BOOT` reached it as
+  `\\EFI\\BOOT\\bootx64.efi`. Whether the firmware treats both the same is
+  not verified; the EFI hardware run in §10.2 covers it;
+- the new EFI entry is created before the old ones are deleted (§6);
 - every mode unmounts `/sysroot` fully before writing, because the Rust flow mounts
   it before dispatch and legacy did not (§2.3). Without this, mode 1 would image a
   mounted `rootCurrent`;
@@ -790,6 +801,7 @@ The current handling removes every EFI boot entry on the machine, active or
 not, before creating its own, including entries unrelated to omnect (§6 item 1).
 
 **Decided: keep — it is what ships today.**
+The new entry is created before the old ones are deleted (§6).
 
 ### 10.4 Uniform `reboot`, including mode 1?
 

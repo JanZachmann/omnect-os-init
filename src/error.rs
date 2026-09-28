@@ -346,6 +346,12 @@ pub enum FlashError {
     #[error("EFI handling failed: {0}")]
     EfiFailed(String),
 
+    #[error("{}: {source}", path.display())]
+    PathIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     #[error("Filesystem error: {0}")]
     Filesystem(#[from] FilesystemError),
 
