@@ -252,7 +252,7 @@ enabled; `uuidgen` needs the new `uuid` crate; `dd` needs nothing:
 
 | Legacy | In-process |
 |---|---|
-| `uuidgen` | `uuid::Uuid::new_v4` |
+| `uuidgen` | 16 bytes from `/dev/urandom` into `uuid::Builder::from_random_bytes` |
 | `dd` | `std::io` read/write at an offset, with `COPY_BUFFER_SIZE` as the buffer |
 | `mkfifo` | `nix::unistd::mkfifo` |
 | `chown omnect:omnect` | `nix::unistd::chown`, with the uid/gid looked up via the `user` feature |
@@ -388,7 +388,8 @@ each mode feature pulls it in. `flash-mode-2` and `flash-mode-3` additionally
 gate `net.rs` and `bmap.rs`.
 
 One new dependency, pulled in by `flash-mode-1` only:
-`uuid = { version = "1.11", default-features = false, features = ["v4"] }`.
+`uuid = { version = "1.11", default-features = false }`. The bytes come from
+`/dev/urandom`, so a failing random source is an error and not a panic in PID 1.
 
 `default = ["core", "flash-mode-1"]`, mirroring the legacy recipe, which installs
 `flash-mode-1` unconditionally and gates 2 and 3 on `DISTRO_FEATURES`. This also
@@ -734,8 +735,8 @@ Behaviour changes, as opposed to bug fixes:
 - the console tee is lost. Legacy pipes the whole run through
   `tee … >/dev/console`, so the operator at the device sees every line. The
   port emits `log::info!` to `/dev/kmsg` only, which a `quiet` boot keeps off
-  the console. `e2image` progress still reaches it, because the kernel gives
-  PID 1 `/dev/console` as its standard streams and the copy inherits them.
+  the console. `e2image` output still reaches it: the init reads it from a pipe
+  and writes it to its own stderr, which the kernel sets to `/dev/console`.
   Recorded as a known deviation; a console writer is a separate decision.
 
 ### 9.1 Limitations: identifiers shared with the source disk

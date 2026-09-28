@@ -294,6 +294,7 @@ time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
 | `sfdisk` | `flash-mode-1` | `util-linux-sfdisk` |
 | `e2image` | `flash-mode-1` | `e2fsprogs` |
 | `efibootmgr` | `flash-mode-1` on EFI machines | `efibootmgr` |
+| `efivarfs` filesystem | `flash-mode-1` on EFI machines | kernel (`CONFIG_EFIVAR_FS`) |
 | `/etc/omnect/grubenv.in` | `flash-mode-1` with `grub` | `grub-env` |
 | `/etc/omnect/uboot-env.bin` | `flash-mode-1` with `uboot` | image recipe (`add_uboot_env`) |
 

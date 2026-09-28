@@ -386,6 +386,8 @@ fn run_e2image(src: &Path, dst: &Path) -> Result<(), String> {
             Err(_) => break,
         }
     }
+    // A child still writing would block on a full pipe after a read error.
+    drop(reader);
 
     let status = child
         .wait()
@@ -695,25 +697,23 @@ mod tests {
         );
     }
 
-    // The two tests below pin DEST_PARTITION_ROLES against literal indices on
-    // purpose: the list has to stay in step with the reformat calls, the copy
-    // loop and the layout constants, and a pin written in terms of those same
-    // constants would follow any of them silently.
-
-    #[cfg(feature = "gpt")]
     #[test]
-    fn the_roles_the_clone_writes_are_pinned_for_gpt() {
-        assert_eq!(DEST_PARTITION_ROLES, [1, 2, 3, 4, 5, 6, 7]);
-    }
-
-    #[cfg(feature = "dos")]
-    #[test]
-    fn the_roles_the_clone_writes_are_pinned_for_dos() {
-        assert_eq!(DEST_PARTITION_ROLES, [1, 2, 3, 5, 6, 7, 8]);
-        assert!(
-            !DEST_PARTITION_ROLES.contains(&crate::partition::layout::PARTITION_NUM_EXTENDED),
-            "the extended container holds none of the roles the clone writes"
+    fn the_clone_writes_every_role_but_the_dos_extended_container() {
+        use crate::partition::layout::*;
+        assert_eq!(
+            DEST_PARTITION_ROLES,
+            [
+                PARTITION_NUM_BOOT,
+                PARTITION_NUM_ROOT_A,
+                PARTITION_NUM_ROOT_B,
+                PARTITION_NUM_FACTORY,
+                PARTITION_NUM_CERT,
+                PARTITION_NUM_ETC,
+                PARTITION_NUM_DATA,
+            ]
         );
+        #[cfg(feature = "dos")]
+        assert!(!DEST_PARTITION_ROLES.contains(&PARTITION_NUM_EXTENDED));
     }
 
     const SDA: u64 = makedev(8, 0);
