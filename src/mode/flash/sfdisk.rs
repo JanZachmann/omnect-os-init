@@ -1,32 +1,27 @@
 //! Rewriting and applying `sfdisk -d` partition-table dumps.
 //!
-//! Flash mode 1 clones the running disk onto another device. The clone must
-//! not inherit any growth the running disk picked up from `resize-data`, so
-//! the dump taken from the source is rewritten here to reset the data
-//! partition back to its shipped size before it is applied to the
-//! destination.
+//! The clone must not inherit the growth `resize-data` applied to the running
+//! disk, so the source dump is rewritten to reset the data partition to its
+//! shipped size before it is applied to the destination.
 
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 use crate::config::BuildConstant;
-use crate::error::FlashError;
+use crate::error::{FlashError, PartitionTableOperation};
 #[cfg(feature = "dos")]
 use crate::partition::layout::PARTITION_NUM_EXTENDED;
 use crate::partition::layout::{PARTITION_NUM_DATA, partition_suffix};
 
-pub const SFDISK_CMD: &str = "/sbin/sfdisk";
+const SFDISK_CMD: &str = "/sbin/sfdisk";
 const SFDISK_DUMP_FLAG: &str = "-d";
-const SFDISK_OPERATION_DUMP: &str = "dump";
-const SFDISK_OPERATION_APPLY: &str = "apply";
 #[cfg(feature = "gpt")]
 const SFDISK_PART_UUID_FLAG: &str = "--part-uuid";
 
 const SECTOR_SIZE: u64 = 512;
-// A 1 KB block is two sectors, but only when the sector size is 512 bytes.
-// verify_sector_scale rejects any dump that declares a different sector size,
-// so this conversion factor is safe to apply unconditionally afterwards.
+/// A 1 KB block is two sectors, which holds only for 512-byte sectors.
+/// `verify_sector_scale` rejects a dump that declares any other sector size.
 const SECTORS_PER_KB: u64 = 2;
 
 const UNIT_FIELD_PREFIX: &str = "unit:";
@@ -38,22 +33,31 @@ const DEVICE_LINE_PREFIX: &str = "/dev/";
 const START_FIELD: &str = "start=";
 const SIZE_FIELD: &str = "size=";
 
-/// Rewrite a source dump so the data partition (and, for a DOS table, the
-/// extended container that holds it) is reset to its shipped size.
+/// Rewrite the dump of `device` so the data partition (and, for a DOS table,
+/// the extended container that holds it) is reset to its shipped size.
 ///
-/// Every other partition is carried over unchanged, so identities such as
-/// GPT `label-id` or partition types and names survive the clone.
-pub fn rewrite_dump(dump: &str, data_size_kb: u64) -> Result<String, FlashError> {
-    verify_sector_scale(dump)?;
+/// Every other line is carried over unchanged, so identities such as GPT
+/// `label-id` or partition types and names survive the clone.
+pub(crate) fn rewrite_dump(
+    device: &Path,
+    dump: &str,
+    data_size_kb: u64,
+) -> Result<String, FlashError> {
+    let malformed = |reason: String| FlashError::MalformedDump {
+        device: device.to_path_buf(),
+        reason,
+    };
+
+    verify_sector_scale(dump).map_err(malformed)?;
 
     let mut lines: Vec<String> = dump.lines().map(str::to_string).collect();
 
     let data_idx = find_partition_line(&lines, PARTITION_NUM_DATA).ok_or_else(|| {
-        FlashError::MalformedDump(format!(
+        malformed(format!(
             "no partition {PARTITION_NUM_DATA} (the data partition) found in dump"
         ))
     })?;
-    let data_start = parse_field_u64(&lines[data_idx], START_FIELD)?;
+    let data_start = parse_field_u64(&lines[data_idx], START_FIELD).map_err(malformed)?;
     let unusable_data_size = |what: &str| FlashError::InvalidBuildConstant {
         name: BuildConstant::DataSize,
         reason: format!("{data_size_kb} KB does not fit {what}"),
@@ -69,13 +73,14 @@ pub fn rewrite_dump(dump: &str, data_size_kb: u64) -> Result<String, FlashError>
         "Resetting the data partition to its shipped size: {data_sectors} sectors ({data_bytes} bytes)"
     );
 
-    lines[data_idx] = set_field_u64(&lines[data_idx], SIZE_FIELD, data_sectors)?;
+    lines[data_idx] =
+        set_field_u64(&lines[data_idx], SIZE_FIELD, data_sectors).map_err(malformed)?;
 
-    rewrite_layout_specific(&mut lines, data_start, data_sectors)?;
+    rewrite_layout_specific(&mut lines, data_start, data_sectors).map_err(malformed)?;
 
-    // The table about to be applied is the most useful thing in the
-    // post-mortem of a failed apply. One record per line, because a multi-line
-    // record reaches `/dev/kmsg` as a single write with embedded newlines.
+    // The table about to be applied is the most useful thing in the run log of
+    // a failed apply. One record per line, because a multi-line record
+    // reaches `/dev/kmsg` as a single write with embedded newlines.
     log::info!("rewritten partition table for the destination:");
     for line in &lines {
         log::info!("{line}");
@@ -86,37 +91,34 @@ pub fn rewrite_dump(dump: &str, data_size_kb: u64) -> Result<String, FlashError>
     Ok(out)
 }
 
-pub fn dump(device: &Path) -> Result<String, FlashError> {
+pub(crate) fn dump(device: &Path) -> Result<String, FlashError> {
+    let dump_failed = |reason: String| FlashError::PartitionTable {
+        device: device.to_path_buf(),
+        operation: PartitionTableOperation::Dump,
+        reason,
+    };
+
     let output = Command::new(SFDISK_CMD)
         .arg(SFDISK_DUMP_FLAG)
         .arg(device)
         .output()
-        .map_err(|e| FlashError::PartitionTable {
-            device: device.to_path_buf(),
-            operation: SFDISK_OPERATION_DUMP.to_string(),
-            reason: format!("failed to run {SFDISK_CMD}: {e}"),
-        })?;
+        .map_err(|e| dump_failed(format!("failed to run {SFDISK_CMD}: {e}")))?;
 
     if !output.status.success() {
-        return Err(FlashError::PartitionTable {
-            device: device.to_path_buf(),
-            operation: SFDISK_OPERATION_DUMP.to_string(),
-            reason: format!(
-                "{SFDISK_CMD} {SFDISK_DUMP_FLAG} failed ({}): {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        });
+        return Err(dump_failed(format!(
+            "{SFDISK_CMD} {SFDISK_DUMP_FLAG} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Apply a rewritten dump to `device` by piping it into `sfdisk`.
-pub fn apply(device: &Path, dump: &str) -> Result<(), FlashError> {
+pub(crate) fn apply(device: &Path, dump: &str) -> Result<(), FlashError> {
     let apply_failed = |reason: String| FlashError::PartitionTable {
         device: device.to_path_buf(),
-        operation: SFDISK_OPERATION_APPLY.to_string(),
+        operation: PartitionTableOperation::Apply,
         reason,
     };
 
@@ -140,9 +142,7 @@ pub fn apply(device: &Path, dump: &str) -> Result<(), FlashError> {
 
     // Reaped on both paths: a dump sfdisk rejects makes it exit before the
     // write completes, so the write reports a broken pipe while the message
-    // saying what is wrong with the table is on the child's stderr. This is
-    // the first destructive step, and after a power off the persisted log is
-    // the only post-mortem left.
+    // saying what is wrong with the table is on the child's stderr.
     let output = child
         .wait_with_output()
         .map_err(|e| apply_failed(format!("failed to wait for {SFDISK_CMD}: {e}")))?;
@@ -164,8 +164,6 @@ pub fn apply(device: &Path, dump: &str) -> Result<(), FlashError> {
     Ok(())
 }
 
-/// The `sfdisk` argument vector that gives partition `part_num` of `device`
-/// the UUID `uuid`.
 #[cfg(feature = "gpt")]
 fn part_uuid_args(device: &Path, part_num: u32, uuid: &str) -> Vec<String> {
     vec![
@@ -181,7 +179,7 @@ fn part_uuid_args(device: &Path, part_num: u32, uuid: &str) -> Vec<String> {
 /// The UUID lives in the partition table, so it survives any later image copy
 /// into that partition.
 #[cfg(feature = "gpt")]
-pub fn set_part_uuid(device: &Path, part_num: u32, uuid: &str) -> Result<(), FlashError> {
+pub(crate) fn set_part_uuid(device: &Path, part_num: u32, uuid: &str) -> Result<(), FlashError> {
     let uuid_failed = |reason: String| FlashError::UuidFailed {
         device: device.to_path_buf(),
         reason,
@@ -208,19 +206,19 @@ fn rewrite_layout_specific(
     lines: &mut [String],
     data_start: u64,
     data_sectors: u64,
-) -> Result<(), FlashError> {
+) -> Result<(), String> {
     let last_lba_idx = lines
         .iter()
         .position(|l| l.trim_start().starts_with(LAST_LBA_FIELD))
-        .ok_or_else(|| FlashError::MalformedDump("missing 'last-lba:' header in dump".into()))?;
+        .ok_or_else(|| "missing 'last-lba:' header in dump".to_string())?;
     let new_last_lba = data_start
         .checked_add(data_sectors)
         .and_then(|end| end.checked_sub(1))
         .ok_or_else(|| {
-            FlashError::MalformedDump(format!(
+            format!(
                 "data partition of {data_sectors} sectors starting at {data_start} \
                  computes an invalid last-lba"
-            ))
+            )
         })?;
     lines[last_lba_idx] = set_field_u64(&lines[last_lba_idx], LAST_LBA_FIELD, new_last_lba)?;
     Ok(())
@@ -231,63 +229,51 @@ fn rewrite_layout_specific(
     lines: &mut [String],
     data_start: u64,
     data_sectors: u64,
-) -> Result<(), FlashError> {
+) -> Result<(), String> {
     let extended_idx = find_partition_line(lines, PARTITION_NUM_EXTENDED).ok_or_else(|| {
-        FlashError::MalformedDump(format!(
-            "no partition {PARTITION_NUM_EXTENDED} (the extended container) found in dump"
-        ))
+        format!("no partition {PARTITION_NUM_EXTENDED} (the extended container) found in dump")
     })?;
     let extended_start = parse_field_u64(&lines[extended_idx], START_FIELD)?;
     let new_size = data_start
         .checked_sub(extended_start)
         .ok_or_else(|| {
-            FlashError::MalformedDump(format!(
+            format!(
                 "extended container starts after the data partition: {}",
                 lines[extended_idx]
-            ))
+            )
         })?
         .checked_add(data_sectors)
         .ok_or_else(|| {
-            FlashError::MalformedDump(format!(
+            format!(
                 "data partition of {data_sectors} sectors starting at {data_start} \
                  computes an invalid extended-container size"
-            ))
+            )
         })?;
     lines[extended_idx] = set_field_u64(&lines[extended_idx], SIZE_FIELD, new_size)?;
     Ok(())
 }
 
 /// Reject a dump unless it declares both `unit: sectors` and `sector-size: 512`.
-///
-/// Every size this module computes is a 512-byte-sector count assuming a
-/// 1 KB block is two sectors; a dump declaring a different unit or a
-/// different sector size (e.g. a 4Kn device) would otherwise be silently
-/// mis-scaled into a corrupt partition table.
-fn verify_sector_scale(dump: &str) -> Result<(), FlashError> {
+fn verify_sector_scale(dump: &str) -> Result<(), String> {
     let unit_line = dump
         .lines()
         .find(|l| l.trim_start().starts_with(UNIT_FIELD_PREFIX))
-        .ok_or_else(|| FlashError::MalformedDump("missing 'unit:' declaration in dump".into()))?;
-    let unit_value = field_value(unit_line, UNIT_FIELD_PREFIX).ok_or_else(|| {
-        FlashError::MalformedDump(format!("unparsable 'unit:' line: {unit_line}"))
-    })?;
+        .ok_or_else(|| "missing 'unit:' declaration in dump".to_string())?;
+    let unit_value = field_value(unit_line, UNIT_FIELD_PREFIX)
+        .ok_or_else(|| format!("unparsable 'unit:' line: {unit_line}"))?;
     if unit_value != UNIT_SECTORS_VALUE {
-        return Err(FlashError::MalformedDump(format!(
-            "dump is not in sectors: {unit_line}"
-        )));
+        return Err(format!("dump is not in sectors: {unit_line}"));
     }
 
     let sector_size_line = dump
         .lines()
         .find(|l| l.trim_start().starts_with(SECTOR_SIZE_FIELD_PREFIX))
-        .ok_or_else(|| {
-            FlashError::MalformedDump("missing 'sector-size:' declaration in dump".into())
-        })?;
+        .ok_or_else(|| "missing 'sector-size:' declaration in dump".to_string())?;
     let sector_size = parse_field_u64(sector_size_line, SECTOR_SIZE_FIELD_PREFIX)?;
     if sector_size != SECTOR_SIZE {
-        return Err(FlashError::MalformedDump(format!(
+        return Err(format!(
             "unsupported sector size (only {SECTOR_SIZE}-byte sectors are supported): {sector_size_line}"
-        )));
+        ));
     }
     Ok(())
 }
@@ -315,18 +301,18 @@ fn field_value<'a>(line: &'a str, field: &str) -> Option<&'a str> {
     Some(after[..end].trim())
 }
 
-fn parse_field_u64(line: &str, field: &str) -> Result<u64, FlashError> {
+fn parse_field_u64(line: &str, field: &str) -> Result<u64, String> {
     field_value(line, field)
         .and_then(|v| v.parse().ok())
-        .ok_or_else(|| FlashError::MalformedDump(format!("unparsable {field} field: {line}")))
+        .ok_or_else(|| format!("unparsable {field} field: {line}"))
 }
 
 /// Replace the numeric value of `field` in `line`, keeping the surrounding
 /// text — including the original spacing before the digits — unchanged.
-fn set_field_u64(line: &str, field: &str, value: u64) -> Result<String, FlashError> {
+fn set_field_u64(line: &str, field: &str, value: u64) -> Result<String, String> {
     let field_pos = line
         .find(field)
-        .ok_or_else(|| FlashError::MalformedDump(format!("missing {field} field: {line}")))?;
+        .ok_or_else(|| format!("missing {field} field: {line}"))?;
     let value_start = field_pos + field.len();
     let rest = &line[value_start..];
     let ws_len = rest.len() - rest.trim_start().len();
@@ -336,9 +322,7 @@ fn set_field_u64(line: &str, field: &str, value: u64) -> Result<String, FlashErr
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(digits.len());
     if digits_len == 0 {
-        return Err(FlashError::MalformedDump(format!(
-            "unparsable {field} field: {line}"
-        )));
+        return Err(format!("unparsable {field} field: {line}"));
     }
     let digits_end = digits_start + digits_len;
     Ok(format!(
@@ -399,7 +383,7 @@ sector-size: 512
     #[cfg(feature = "gpt")]
     #[test]
     fn gpt_rewrite_shrinks_data_and_pulls_last_lba_in() {
-        let out = rewrite_dump(GPT_DUMP, DATA_SIZE_KB).unwrap();
+        let out = rewrite_dump(Path::new("/dev/mmcblk0"), GPT_DUMP, DATA_SIZE_KB).unwrap();
         // data start 4464640 + 4096*2 - 1
         assert!(
             out.contains("last-lba: 4472831"),
@@ -420,7 +404,7 @@ sector-size: 512
     #[cfg(feature = "gpt")]
     #[test]
     fn gpt_rewrite_leaves_the_other_partitions_alone() {
-        let out = rewrite_dump(GPT_DUMP, DATA_SIZE_KB).unwrap();
+        let out = rewrite_dump(Path::new("/dev/mmcblk0"), GPT_DUMP, DATA_SIZE_KB).unwrap();
         for name in ["boot", "rootA", "rootB", "factory", "cert", "etc"] {
             let before = GPT_DUMP
                 .lines()
@@ -451,7 +435,7 @@ sector-size: 512
     #[cfg(feature = "dos")]
     #[test]
     fn dos_rewrite_shrinks_data_and_the_extended_container_that_holds_it() {
-        let out = rewrite_dump(DOS_DUMP, DATA_SIZE_KB).unwrap();
+        let out = rewrite_dump(Path::new("/dev/sda"), DOS_DUMP, DATA_SIZE_KB).unwrap();
         let data = out.lines().find(|l| l.starts_with("/dev/sda8")).unwrap();
         assert!(
             data.replace(' ', "").contains("size=8192,"),
@@ -465,25 +449,57 @@ sector-size: 512
         );
     }
 
+    #[cfg(feature = "dos")]
+    #[test]
+    fn dos_rewrite_leaves_every_other_line_alone() {
+        let out = rewrite_dump(Path::new("/dev/sda"), DOS_DUMP, DATA_SIZE_KB).unwrap();
+        for line in DOS_DUMP
+            .lines()
+            .filter(|l| !l.starts_with("/dev/sda4") && !l.starts_with("/dev/sda8"))
+        {
+            assert!(
+                out.lines().any(|o| o == line),
+                "must be carried over verbatim: {line}"
+            );
+        }
+    }
+
+    /// The start sector of the data partition, and of the DOS extended
+    /// container, is what the rewrite computes the new sizes from, so it must
+    /// not move.
+    #[test]
+    fn the_rewrite_keeps_every_start_sector() {
+        let (device, dump) = (Path::new("/dev/sda"), SOURCE_DUMP);
+        let out = rewrite_dump(device, dump, DATA_SIZE_KB).unwrap();
+        let starts = |text: &str| -> Vec<u64> {
+            text.lines()
+                .filter(|l| l.starts_with(DEVICE_LINE_PREFIX))
+                .map(|l| parse_field_u64(l, START_FIELD).unwrap())
+                .collect()
+        };
+        assert_eq!(starts(&out), starts(dump));
+    }
+
     #[cfg(feature = "gpt")]
     #[test]
     fn gpt_rewrite_rejects_a_dump_missing_last_lba() {
         let bad = "label: gpt\nunit: sectors\nsector-size: 512\n\n\
                    /dev/mmcblk0p7 : start=100, size=10, name=\"data\"\n";
         assert!(matches!(
-            rewrite_dump(bad, DATA_SIZE_KB),
-            Err(FlashError::MalformedDump(_))
+            rewrite_dump(Path::new("/dev/mmcblk0"), bad, DATA_SIZE_KB),
+            Err(FlashError::MalformedDump { .. })
         ));
     }
 
     #[test]
     fn rewrite_rejects_a_dump_with_no_data_partition() {
         let err = rewrite_dump(
+            Path::new("/dev/mmcblk0"),
             "label: gpt\nunit: sectors\nsector-size: 512\n\n",
             DATA_SIZE_KB,
         )
         .unwrap_err();
-        assert!(matches!(err, FlashError::MalformedDump(_)), "{err}");
+        assert!(matches!(err, FlashError::MalformedDump { .. }), "{err}");
     }
 
     #[test]
@@ -497,8 +513,8 @@ sector-size: 512
                    /dev/mmcblk0p7 : start=notanumber, size=10, name=\"data\"\n\
                    /dev/mmcblk0p8 : start=notanumber, size=10, name=\"data\"\n";
         assert!(matches!(
-            rewrite_dump(bad, DATA_SIZE_KB),
-            Err(FlashError::MalformedDump(_))
+            rewrite_dump(Path::new("/dev/mmcblk0"), bad, DATA_SIZE_KB),
+            Err(FlashError::MalformedDump { .. })
         ));
     }
 
@@ -507,8 +523,8 @@ sector-size: 512
         let bad = "label: gpt\nunit: sectors\n\n\
                    /dev/mmcblk0p7 : start=100, size=10, name=\"data\"\n";
         assert!(matches!(
-            rewrite_dump(bad, DATA_SIZE_KB),
-            Err(FlashError::MalformedDump(_))
+            rewrite_dump(Path::new("/dev/mmcblk0"), bad, DATA_SIZE_KB),
+            Err(FlashError::MalformedDump { .. })
         ));
     }
 
@@ -517,8 +533,8 @@ sector-size: 512
         let bad = "label: gpt\nunit: sectors\nsector-size: 4096\n\n\
                    /dev/mmcblk0p7 : start=100, size=10, name=\"data\"\n";
         assert!(matches!(
-            rewrite_dump(bad, DATA_SIZE_KB),
-            Err(FlashError::MalformedDump(_))
+            rewrite_dump(Path::new("/dev/mmcblk0"), bad, DATA_SIZE_KB),
+            Err(FlashError::MalformedDump { .. })
         ));
     }
 
@@ -527,8 +543,8 @@ sector-size: 512
         let bad = "label: gpt\nunit: cylinders\n\n\
                    /dev/mmcblk0p7 : start=100, size=10, name=\"data\"\n";
         assert!(matches!(
-            rewrite_dump(bad, DATA_SIZE_KB),
-            Err(FlashError::MalformedDump(_))
+            rewrite_dump(Path::new("/dev/mmcblk0"), bad, DATA_SIZE_KB),
+            Err(FlashError::MalformedDump { .. })
         ));
     }
 }

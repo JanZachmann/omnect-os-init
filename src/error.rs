@@ -292,6 +292,25 @@ pub enum FactoryResetError {
     Io(#[from] std::io::Error),
 }
 
+#[cfg(feature = "flash-mode")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionTableOperation {
+    Dump,
+    Apply,
+    Lookup,
+}
+
+#[cfg(feature = "flash-mode")]
+impl std::fmt::Display for PartitionTableOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Dump => "dump",
+            Self::Apply => "apply",
+            Self::Lookup => "lookup",
+        })
+    }
+}
+
 /// Errors during a flash mode.
 ///
 /// Every variant is fatal: a flash either completes or leaves the operator to
@@ -332,12 +351,12 @@ pub enum FlashError {
     #[error("Partition table {operation} failed for {}: {reason}", device.display())]
     PartitionTable {
         device: PathBuf,
-        operation: String,
+        operation: PartitionTableOperation,
         reason: String,
     },
 
-    #[error("Malformed sfdisk dump: {0}")]
-    MalformedDump(String),
+    #[error("Malformed sfdisk dump of {}: {reason}", device.display())]
+    MalformedDump { device: PathBuf, reason: String },
 
     #[error("Copy from {} to {} failed: {reason}", src.display(), dst.display())]
     CopyFailed {

@@ -17,7 +17,7 @@ use nix::sys::stat::{major, makedev, minor};
 
 use crate::bootloader::sync_filesystems;
 use crate::config::{BuildConstant, build};
-use crate::error::FlashError;
+use crate::error::{FlashError, PartitionTableOperation};
 #[cfg(feature = "grub")]
 use crate::filesystem::MountOptions;
 use crate::filesystem::reformat_ext4;
@@ -57,8 +57,6 @@ const UBOOT_ENV_SOURCE: &str = "/etc/omnect/uboot-env.bin";
 const URANDOM_PATH: &str = "/dev/urandom";
 #[cfg(feature = "gpt")]
 const UUID_BYTES: usize = 16;
-
-const LAYOUT_LOOKUP_OPERATION: &str = "lookup";
 
 const REASON_IDENTICAL_DISK: &str = "identical to the booted disk";
 const REASON_SOURCE_PARTITION: &str = "a partition of the booted disk";
@@ -337,7 +335,7 @@ fn source_partition(layout: &PartitionLayout, name: PartitionName) -> Result<&Pa
         .map(PathBuf::as_path)
         .ok_or_else(|| FlashError::PartitionTable {
             device: layout.device.base.clone(),
-            operation: LAYOUT_LOOKUP_OPERATION.to_string(),
+            operation: PartitionTableOperation::Lookup,
             reason: format!("the source layout has no {name} partition"),
         })
 }
@@ -598,7 +596,7 @@ fn clone_with(
     ops.unmount_rootfs(ctx.rootfs)?;
 
     let dump = ops.dump(source)?;
-    let rewritten = sfdisk::rewrite_dump(&dump, constants.data_size_kb)?;
+    let rewritten = sfdisk::rewrite_dump(source, &dump, constants.data_size_kb)?;
     ops.apply(destination, &rewritten)?;
     ops.verify_partitions(destination)?;
 
