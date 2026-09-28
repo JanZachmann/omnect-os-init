@@ -417,8 +417,9 @@ work tracked in §12 rather than part of the port.
    to exist — and use the resolved path for every step that follows. Reject a
    destination that is not a block device, and one whose device number is the
    source disk's or whose parent disk (read from `/sys/dev/block`) is the
-   source disk. Comparing device numbers catches every alias spelling of the
-   running disk. A destination sysfs does not list is refused, because a
+   source disk. Reject a partition of any other disk too, before `sfdisk`
+   writes a table into it. Comparing device numbers catches every alias
+   spelling of the running disk. A destination sysfs does not list is refused, because a
    partition of the source cannot be ruled out.
 5. `sync`, then unmount `/sysroot` completely — the boot partition first, then the
    rootfs. Both are mounted by `mount_core_partitions` on both bootloaders. The

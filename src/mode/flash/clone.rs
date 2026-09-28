@@ -75,6 +75,7 @@ const LAYOUT_LOOKUP_OPERATION: &str = "lookup";
 /// Why a destination was refused.
 const REASON_IDENTICAL_DISK: &str = "identical to the booted disk";
 const REASON_SOURCE_PARTITION: &str = "a partition of the booted disk";
+const REASON_NOT_A_WHOLE_DISK: &str = "a partition, not a whole disk";
 const REASON_NOT_A_BLOCK_DEVICE: &str = "not a block device";
 const REASON_UNKNOWN_DISK: &str = "the disk it belongs to is unknown to sysfs";
 
@@ -229,12 +230,13 @@ fn refusal(destination: u64, destination_disk: Option<u64>, source: u64) -> Opti
     match destination_disk {
         None => Some(REASON_UNKNOWN_DISK),
         Some(disk) if disk == source => Some(REASON_SOURCE_PARTITION),
+        Some(disk) if disk != destination => Some(REASON_NOT_A_WHOLE_DISK),
         Some(_) => None,
     }
 }
 
 /// Refuse a destination that is not a block device, that is the disk the
-/// device booted from, or that is one of that disk's partitions.
+/// device booted from, or that is a partition of any disk.
 ///
 /// Device numbers are compared, so every spelling of the booted disk is
 /// caught. Writing a partition table into a partition of the running disk
@@ -262,7 +264,10 @@ fn validate_devices(
         whole_disk_devnum(sys_dev_block, destination_dev),
         source_dev,
     ) {
-        Some(reason) => Err(invalid(format!("{reason} {}", source.display()))),
+        Some(reason @ (REASON_IDENTICAL_DISK | REASON_SOURCE_PARTITION)) => {
+            Err(invalid(format!("{reason} {}", source.display())))
+        }
+        Some(reason) => Err(invalid(reason.to_string())),
         None => Ok(()),
     }
 }
@@ -614,6 +619,7 @@ mod tests {
     const SDA: u64 = makedev(8, 0);
     const SDA2: u64 = makedev(8, 2);
     const SDB: u64 = makedev(8, 16);
+    const SDB1: u64 = makedev(8, 17);
 
     #[test]
     fn the_booted_disk_itself_is_refused() {
@@ -623,6 +629,11 @@ mod tests {
     #[test]
     fn a_partition_of_the_booted_disk_is_refused() {
         assert_eq!(refusal(SDA2, Some(SDA), SDA), Some(REASON_SOURCE_PARTITION));
+    }
+
+    #[test]
+    fn a_partition_of_another_disk_is_refused() {
+        assert_eq!(refusal(SDB1, Some(SDB), SDA), Some(REASON_NOT_A_WHOLE_DISK));
     }
 
     #[test]
