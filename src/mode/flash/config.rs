@@ -32,11 +32,11 @@ pub(crate) fn parse_mode(value: &str) -> Option<FlashMode> {
     }
 }
 
-/// A blank value is no destination; any other value is taken as it is.
+/// Trimmed, as legacy word splitting did.
 #[cfg(feature = "flash-mode-1")]
 pub(crate) fn parse_devpath(value: Option<&str>) -> Devpath {
-    match value {
-        Some(path) if !path.trim().is_empty() => Devpath::Set(PathBuf::from(path)),
+    match value.map(str::trim) {
+        Some(path) if !path.is_empty() => Devpath::Set(PathBuf::from(path)),
         _ => Devpath::NotSet,
     }
 }
@@ -68,14 +68,13 @@ mod tests {
 
     #[cfg(feature = "flash-mode-1")]
     #[test]
-    fn parse_devpath_takes_the_value_as_it_is() {
-        assert_eq!(
-            parse_devpath(Some("/dev/mmcblk2")),
-            Devpath::Set(PathBuf::from("/dev/mmcblk2"))
-        );
-        assert_eq!(
-            parse_devpath(Some(" /dev/mmcblk2")),
-            Devpath::Set(PathBuf::from(" /dev/mmcblk2"))
-        );
+    fn parse_devpath_trims_surrounding_whitespace() {
+        for value in ["/dev/mmcblk2", " /dev/mmcblk2", "/dev/mmcblk2 \n"] {
+            assert_eq!(
+                parse_devpath(Some(value)),
+                Devpath::Set(PathBuf::from("/dev/mmcblk2")),
+                "{value:?}"
+            );
+        }
     }
 }
