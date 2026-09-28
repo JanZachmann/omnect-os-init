@@ -113,7 +113,6 @@ impl BuildConstants {
     }
 }
 
-/// A byte range on a block device.
 #[derive(Debug, PartialEq, Eq)]
 struct ByteRange {
     offset: u64,
@@ -340,7 +339,6 @@ fn source_partition(layout: &PartitionLayout, name: PartitionName) -> Result<&Pa
         })
 }
 
-/// The last few lines of `e2image` output, for the error.
 fn output_tail(output: &[u8]) -> String {
     let text = String::from_utf8_lossy(output);
     let lines: Vec<&str> = text
@@ -462,8 +460,8 @@ impl efi::EfiOps for RealCloneOps {
 }
 
 impl CloneOps for RealCloneOps {
-    /// Reading `/dev/urandom` returns an error where `Uuid::new_v4` would
-    /// panic, and a panic in PID 1 is a kernel panic.
+    /// A panic in PID 1 is a kernel panic, so a failing random source has to
+    /// be an error.
     #[cfg(feature = "gpt")]
     fn fresh_uuid(&mut self) -> Result<String, FlashError> {
         let mut bytes = [0u8; UUID_BYTES];

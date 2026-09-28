@@ -227,7 +227,6 @@ pub(crate) fn partition_sep_for(disk: &Path) -> &'static str {
         .map_or("", partition_sep_for_name)
 }
 
-/// The path of partition `num` on `disk`.
 pub(crate) fn partition_path(disk: &Path, partition_sep: &str, num: u32) -> PathBuf {
     PathBuf::from(format!("{}{partition_sep}{num}", disk.display()))
 }
