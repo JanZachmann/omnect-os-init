@@ -102,7 +102,9 @@ A new step, `early_modules::load(rootfs)`, runs in `run_init` right after
    2. find its path in `modules.dep` (module name = file name without `.ko`
       and without a compression suffix, `-` replaced by `_`);
    3. load its dependencies first, in the reverse order in which
-      `modules.dep` lists them, without parameters, with the same skip check;
+      `modules.dep` lists them, with the same skip check. A dependency gets
+      the parameters of its own config line if it has one, and none
+      otherwise;
    4. open `<rootfs>/lib/modules/<release>/<path>` and load it with
       `finit_module`. A compressed file (`.ko.xz`, `.ko.zst`, `.ko.gz`) gets
       the flag `MODULE_INIT_COMPRESSED_FILE`; a `.ko` file gets no flag.
@@ -134,8 +136,8 @@ compressed files, an uncompressed module still loads on an older kernel.
   entry the loader tries, and it can be changed at runtime (mode 0644), so
   writing the rootfs path to it replaces the legacy bind mount of
   `/lib/firmware`. Nothing is left mounted in the initramfs.
-- On machines where `/lib` is a link to `usr/lib`, the link is relative, so
-  `<rootfs>/lib/...` stays inside the rootfs.
+- `/lib` can be a link to `usr/lib` in the rootfs. The link must be relative
+  (as it is on rpi4), so that `<rootfs>/lib/...` stays inside the rootfs.
 
 ## 7. The asynchronous firmware load
 
@@ -246,6 +248,7 @@ Unit tests, with the sysfs, procfs and rootfs paths injectable:
   dependency order;
 - a built-in or already loaded module is skipped, also as a dependency;
 - a failed dependency skips the module that needs it;
+- a dependency that is also listed gets the parameters of its config line;
 - `MODULE_INIT_COMPRESSED_FILE` is set for `.ko.*` files only;
 - no listed module leaves `firmware_class.path` alone; the saved value is
   written back by the restore, including an empty value;
@@ -294,7 +297,7 @@ On hardware (phyGATE Tauri-L):
    the initramfs to be unpacked, so a built-in driver finds the firmware there
    at probe time. This removes the race completely, but it changes the kernel
    for every image of the machine, puts a second copy of the firmware into the
-   initramfs that has to stay in step with the rootfs package, and needs a new
+   initramfs that has to match the rootfs package, and needs a new
    decision about the firmware license, which is the reason the driver is a
    module.
 5. **Do nothing** — every consumer orders itself on its device unit, as
