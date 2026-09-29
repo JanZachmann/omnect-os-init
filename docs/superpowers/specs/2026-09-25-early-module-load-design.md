@@ -3,9 +3,9 @@
 **Date:** 2026-09-25
 **Status:** Draft, for review
 **Scope:** omnect-os-init — a new early step after the rootfs mount that loads
-the modules listed in a config file in the rootfs, a `firmware_class.path`
-restore before `switch_root`, one Cargo feature. meta-omnect sets the feature
-and ships the first config file (`imx_sdma` on i.MX8MM).
+the modules listed in a config file in the rootfs, one Cargo feature.
+meta-omnect sets the feature and ships the first config file (`imx_sdma` on
+i.MX8MM).
 
 ---
 
@@ -77,7 +77,10 @@ example_mod debug=1 mode=fast
 - `#` starts a comment; empty lines are ignored.
 - The first word is the module name; `-` and `_` are equal, as in `modprobe`.
 - The rest of the line is passed unchanged as the parameter string of
-  `finit_module(2)`.
+  `finit_module(2)`. It is the only source of parameters: a module loaded in
+  the initramfs stays loaded after `switch_root`, so udev and `modprobe` in the
+  rootfs skip it, and its `options` lines in `/etc/modprobe.d` never take
+  effect. A module that needs options gets them on its config line.
 - A module that appears twice is loaded once, with the parameters of its first
   line; the second line is logged as a warning.
 - The files are read from the rootfs image, before the etc overlay is mounted.
@@ -93,9 +96,8 @@ A new step, `early_modules::load(rootfs)`, runs in `run_init` right after
    `firmware_class.path` alone.
 2. Read `<release>` from `/proc/sys/kernel/osrelease`. Read
    `<rootfs>/lib/modules/<release>/modules.dep` and `modules.builtin`.
-3. Point the kernel firmware search at the rootfs: save the current value of
-   `/sys/module/firmware_class/parameters/path` and write
-   `<rootfs>/lib/firmware` to it.
+3. Point the kernel firmware search at the rootfs: write
+   `<rootfs>/lib/firmware` to `/sys/module/firmware_class/parameters/path`.
 4. For each listed module, in config order:
    1. skip it when it is in `modules.builtin`, or when
       `/sys/module/<name>/initstate` exists (already loaded);
@@ -109,9 +111,10 @@ A new step, `early_modules::load(rootfs)`, runs in `run_init` right after
       `finit_module`. A compressed file (`.ko.xz`, `.ko.zst`, `.ko.gz`) gets
       the flag `MODULE_INIT_COMPRESSED_FILE`; a `.ko` file gets no flag.
 
-`mode::normal::run` restores the saved `firmware_class.path` value right
-before `switch_root`. Every boot path that reaches `switch_root` goes through
-`mode::normal::run`; the factory-reset mode ends there too.
+The path is not restored. After `switch_root` it names a directory that does
+not exist, so the loader skips it and uses its default paths. The only effect
+is the stale value in sysfs. A value set on the kernel command line is
+replaced.
 
 Firmware needs no list of its own. While the path points at the rootfs, every
 firmware file a listed module requests is found there.
@@ -150,12 +153,9 @@ that time.
   measured device that is at least several hundred milliseconds later, because
   the other partitions are checked and mounted in between. A direct read of
   the 3 KB SDMA firmware file finishes well before that.
-- If the read ever runs after the restore in section 5, the default paths
-  apply. Before `switch_root` they do not exist in the initramfs; with
-  `CONFIG_FW_LOADER_USER_HELPER_FALLBACK=y` the loader then waits for the
-  sysfs fallback (60 s by default). The boot is not blocked, because the wait
-  runs on the workqueue. For SDMA the driver retries once and then uses its
-  ROM scripts, so SDMA runs without the RAM firmware.
+- If the read ever runs after `switch_root`, the rootfs path no longer
+  exists, and the loader finds the firmware in the default path
+  `/lib/firmware` of the new root.
 
 The step does not wait for firmware. The kernel offers no general signal for
 "firmware loaded", and a wait would add boot time on every boot to cover a
@@ -175,14 +175,11 @@ returned as an error, and none changes the ODS status.
 | module name not in `modules.dep` | `warn`, skip the module |
 | a dependency fails to load | `warn`, skip the module that needs it |
 | module file cannot be opened | `warn`, skip the module |
-| `firmware_class.path` cannot be read or written | `warn`, skip all loads (without the path a firmware load would fall into the 60 s fallback) |
+| `firmware_class.path` cannot be written | `warn`, skip all loads (without the path a firmware request finds nothing in the initramfs and waits for the sysfs fallback, 60 s by default) |
 | `finit_module` fails with `EEXIST` | `info` (loaded in the meantime) |
 | compressed module, kernel without `CONFIG_MODULE_DECOMPRESS` | `finit_module` fails; `warn`, skip the module |
 | `finit_module` fails otherwise | `warn`, skip the module |
-| restore before `switch_root` fails | `warn`, continue |
 | rootfs mount failed | the step does not run |
-
-When no module was loaded in the end, the path is restored at once.
 
 A release image must never stop in the fatal-error loop because of this step,
 so no path returns an error.
@@ -213,32 +210,10 @@ defined:
   for now; the kernel option only makes the loader usable there later.
 - The README table of runtime dependencies gets a row for the files read from
   the rootfs: `/etc/omnect/early-modules.d/*.conf`, `modules.dep`,
-  `modules.builtin`, the listed modules and their firmware.
+  `modules.builtin`, the listed modules and their firmware. It also says that
+  `modprobe.d` options do not apply to a listed module.
 
-## 11. Open decisions
-
-1. **Restore `firmware_class.path` before `switch_root`, or leave it set?**
-   Restoring leaves the kernel as the rootfs expects it; the cost is the
-   corner case in section 7. Leaving it set means a stale path
-   (`/rootfs/lib/firmware`) that does not exist after `switch_root`, which the
-   loader skips. Proposed: restore.
-2. **Module options from `modprobe.d`.** A module loaded in the initramfs
-   stays loaded after `switch_root`, so udev and `modprobe` in the rootfs skip
-   it, and an `options` line for it in the rootfs `/etc/modprobe.d` never
-   takes effect. Two ways:
-   - a) Also read `options <module> ...` lines from
-     `<rootfs>/etc/modprobe.d/*.conf` and `<rootfs>/usr/lib/modprobe.d/*.conf`
-     for the listed modules and their dependencies, and add the parameters
-     from the config line. The parameters stay in one place, and a module can
-     move to the early list without changes to its `modprobe.d` file. The
-     cost is a second parser, and the result can still differ from
-     `modprobe` (no `install`, `softdep` or `blacklist`).
-   - b) The config line is the only source of parameters. Listing a module in
-     `early-modules.d` makes its `modprobe.d` options ineffective, and the
-     README says so. Less code, but a module with existing options must have
-     them copied to the config line.
-
-## 12. Testing
+## 11. Testing
 
 Unit tests, with the sysfs, procfs and rootfs paths injectable:
 
@@ -250,8 +225,7 @@ Unit tests, with the sysfs, procfs and rootfs paths injectable:
 - a failed dependency skips the module that needs it;
 - a dependency that is also listed gets the parameters of its config line;
 - `MODULE_INIT_COMPRESSED_FILE` is set for `.ko.*` files only;
-- no listed module leaves `firmware_class.path` alone; the saved value is
-  written back by the restore, including an empty value;
+- no listed module leaves `firmware_class.path` alone;
 - `EEXIST` is treated as loaded.
 
 `finit_module` sits behind a small trait, so the tests never load a module.
@@ -260,24 +234,23 @@ On hardware (phyGATE Tauri-L):
 
 - `dmesg` shows `imx-sdma … loaded firmware` and the TPM on `spi0.1` before
   systemd starts;
-- `/sys/module/firmware_class/parameters/path` is empty after boot;
 - with `imx-sdma.ko` removed from the rootfs, the device boots normally and
   logs the warning;
 - an image for another machine contains no loader code (`cargo build` without
   the feature).
 
-## 13. Comparison to legacy
+## 12. Comparison to legacy
 
 | | Legacy `90-imx_sdma` | This design |
 |---|---|---|
 | Gate | `mx8mm-nxp-bsp` override | Cargo feature, set for `mx8mm-nxp-bsp` |
 | Module list | fixed in the script | config files in the rootfs |
 | Module load | `modprobe` from a bind-mounted `/lib/modules` | `finit_module` on the rootfs file, dependencies from `modules.dep` |
-| Firmware | bind-mounted `/lib/firmware`, left mounted | `firmware_class.path`, restored before `switch_root` |
+| Firmware | bind-mounted `/lib/firmware`, left mounted | `firmware_class.path` set to the rootfs |
 | Errors | ignored | logged, never fatal |
 | Position | after the rootfs mount | after the rootfs mount |
 
-## 14. Alternatives considered
+## 13. Alternatives considered
 
 1. **Load only `imx_sdma`** — the same step with the module name fixed in the
    code. Less code, but every new module needs a code change and a new
