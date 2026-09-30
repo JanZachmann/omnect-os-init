@@ -4,10 +4,10 @@
 // TODO: remove me, as soon as flash mode 2 calls it
 #![allow(dead_code)]
 
+use std::ffi::OsStr;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
-use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ use nix::ifaddrs::getifaddrs;
 
 use crate::error::FlashError;
 use crate::filesystem::{FsType, MountOptions, MountPoint, is_path_mounted, mount};
-use crate::mode::flash::CHILD_PATH;
+use crate::mode::flash::run_inherited;
 
 const FLASH_INTERFACE: &str = "eth0";
 const IP_CMD: &str = "/sbin/ip";
@@ -44,23 +44,9 @@ pub(crate) trait NetOps {
 
 pub(crate) struct RealNetOps;
 
-fn child(cmd: &str) -> Command {
-    let mut command = Command::new(cmd);
-    command.env("PATH", CHILD_PATH);
-    command
-}
-
 fn run_visible(cmd: &str, args: &[&str]) -> Result<(), FlashError> {
-    let status = child(cmd)
-        .args(args)
-        .status()
-        .map_err(|e| FlashError::NetworkFailed(format!("failed to run {cmd}: {e}")))?;
-    if !status.success() {
-        return Err(FlashError::NetworkFailed(format!(
-            "{cmd} {args:?} failed ({status})"
-        )));
-    }
-    Ok(())
+    let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
+    run_inherited(cmd, &args).map_err(FlashError::NetworkFailed)
 }
 
 impl NetOps for RealNetOps {
@@ -308,15 +294,5 @@ mod tests {
         assert!(matches!(err, FlashError::NetworkFailed(_)), "{err}");
         assert_eq!(ops.calls.iter().filter(|c| *c == "dhcpcd").count(), 1);
         assert_eq!(ops.calls.iter().filter(|c| *c == "addresses").count(), 2);
-    }
-
-    #[test]
-    fn children_get_the_explicit_path() {
-        let command = child("/bin/true");
-        let path = command
-            .get_envs()
-            .find(|(k, _)| *k == "PATH")
-            .and_then(|(_, v)| v);
-        assert_eq!(path, Some(std::ffi::OsStr::new(CHILD_PATH)));
     }
 }

@@ -1,6 +1,8 @@
 //! Flash modes: deploy a whole disk image from the initramfs, before any
 //! rootfs is handed control.
 
+#[cfg(feature = "flash-mode-2")]
+pub(crate) mod bmap;
 #[cfg(feature = "flash-mode-1")]
 pub(crate) mod clone;
 pub mod config;
@@ -15,8 +17,12 @@ pub(crate) mod sfdisk;
 #[cfg(feature = "flash-mode")]
 pub(crate) mod unmount;
 
+#[cfg(feature = "flash-mode-2")]
+use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
+#[cfg(feature = "flash-mode-2")]
+use std::process::Command;
 
 use nix::sys::reboot::{RebootMode, reboot};
 
@@ -33,6 +39,27 @@ use crate::partition::{PartitionLayout, PartitionName};
 /// as `dhcpcd` run hook scripts that look up their own helpers.
 #[cfg(feature = "flash-mode-2")]
 pub(crate) const CHILD_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+#[cfg(feature = "flash-mode-2")]
+fn child(cmd: &str) -> Command {
+    let mut command = Command::new(cmd);
+    command.env("PATH", CHILD_PATH);
+    command
+}
+
+/// Run `cmd` with inherited stdout and stderr, so the operator sees its
+/// output. The error is the reason the run failed.
+#[cfg(feature = "flash-mode-2")]
+pub(crate) fn run_inherited(cmd: &str, args: &[&OsStr]) -> Result<(), String> {
+    let status = child(cmd)
+        .args(args)
+        .status()
+        .map_err(|e| format!("failed to run {cmd}: {e}"))?;
+    if !status.success() {
+        return Err(format!("{cmd} {args:?} failed ({status})"));
+    }
+    Ok(())
+}
 
 /// Scratch mount points. They sit outside the rootfs mount, which mode 1
 /// unmounts before it writes anything.
@@ -206,6 +233,26 @@ pub(crate) fn run(
 mod tests {
     use super::*;
     use crate::bootloader::{BootEnv, MockBootEnv};
+
+    #[cfg(feature = "flash-mode-2")]
+    #[test]
+    fn children_get_the_explicit_path() {
+        let command = child("/bin/true");
+        let path = command
+            .get_envs()
+            .find(|(k, _)| *k == "PATH")
+            .and_then(|(_, v)| v);
+        assert_eq!(path, Some(OsStr::new(CHILD_PATH)));
+    }
+
+    #[cfg(feature = "flash-mode-2")]
+    #[test]
+    fn a_failing_child_is_reported_with_its_status() {
+        let reason = run_inherited("/bin/false", &[]).unwrap_err();
+        assert!(reason.contains("/bin/false"), "{reason}");
+        assert!(run_inherited("/nonexistent/tool", &[]).is_err());
+        assert!(run_inherited("/bin/true", &[]).is_ok());
+    }
 
     #[cfg(feature = "flash-mode-1")]
     #[test]
