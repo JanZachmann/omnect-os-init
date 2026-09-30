@@ -21,10 +21,11 @@ Implemented functionality:
 - **switch\_root**: MS_MOVE + chroot + exec systemd (`pivot_root(2)` is not used; ramfs does not support it)
 - **Factory reset (modes 1-3)**: Selective-preserve backup → wipe `data`/`etc` (modes 2 and 3 only) → reformat → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
 - **Flash mode 1**: Clones the running disk onto another block device given by the `flash-mode-devpath` bootloader env key, triggered by `flash-mode`; powers off on success so the clone can be moved to its own device (feature `flash-mode-1`, part of the default feature set)
+- **Flash mode 2**: Brings up `eth0` with DHCP and starts `dropbear`; the operator pushes a `wic.xz` with `scp`, and `bmaptool` flashes it onto the running disk. Triggered by `flash-mode=2` in the bootloader env or by the flag file `/etc/enforce_flash_mode` (feature `flash-mode-2`)
 
 Not yet implemented (planned):
 
-- Flash modes 2 and 3 (network push, HTTP/HTTPS download)
+- Flash mode 3 (HTTP/HTTPS download)
 
 ## Startup Flow
 
@@ -262,7 +263,8 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 | `factory-reset` | Factory reset support (modes 1-3: selective-preserve backup → wipe → reformat → restore) | Implemented |
 | `flash-mode` | Shared flash layer: trigger detection, dispatch, log capture. Pulled in by a mode feature, never selected on its own | Implemented |
 | `flash-mode-1` | Disk cloning (part of the default feature set) | Implemented |
-| `flash-mode-2` | Network flashing | Planned |
+| `flash-mode-2` | Flash a `wic.xz` pushed in over `scp` | Implemented |
+| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream | Implemented |
 | `flash-mode-3` | HTTP/HTTPS flashing | Planned |
 
 > **Note:** `grub` and `uboot` are mutually exclusive, and so are `gpt` and `dos`.
@@ -270,6 +272,17 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 > The Yocto recipe selects the correct features via `CARGO_FEATURES` based on `MACHINE_FEATURES`.
 > `flash-mode-1` is in the default feature set, so it is already enabled in the
 > `cargo build` examples above; add `--no-default-features` to build without it.
+
+### Build constants for flash mode 2
+
+`build.rs` reads these Yocto environment variables. Flash mode 2 needs all three; the
+build does not fail without them, but the mode refuses to run.
+
+| Env var | Constant | Unit |
+|---------|----------|------|
+| `OMNECT_PART_OFFSET_BOOT` | `BOOT_START` | KB |
+| `OMNECT_PART_SIZE_BOOT` | `BOOT_SIZE` | KB |
+| `OMNECT_USER_ID` | `OMNECT_USER_ID` | uid and gid of the `omnect` user |
 
 ## Runtime Dependencies
 
@@ -297,6 +310,11 @@ time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
 | `efivarfs` filesystem | `flash-mode-1` on EFI machines | kernel (`CONFIG_EFIVAR_FS`) |
 | `/etc/omnect/grubenv.in` | `flash-mode-1` with `grub` | `grub-env` |
 | `/etc/omnect/uboot-env.bin` | `flash-mode-1` with `uboot` | image recipe (`add_uboot_env`) |
+| `/sbin/ip` | `flash-mode-2` | `busybox` |
+| `/sbin/dhcpcd` | `flash-mode-2` | `dhcpcd` |
+| `/sbin/dropbear` | `flash-mode-2` | `dropbear` |
+| `/usr/bin/bmaptool` | `flash-mode-2` | `bmaptool` |
+| `xz` (run by `bmaptool`) | `flash-mode-2` | `xz` |
 
 ## Testing
 
@@ -340,11 +358,22 @@ cargo test --features uboot,gpt,resize-data,release-image,test-utils
 # additive and cannot turn a default feature off
 cargo test --no-default-features --features grub,gpt,factory-reset,test-utils
 
+# Flash mode 2: default enables mode 1, so a mode-2-only build needs
+# --no-default-features
+cargo test --no-default-features --features core,grub,gpt,flash-mode-2,test-utils
+cargo test --no-default-features --features core,grub,dos,flash-mode-2,test-utils
+cargo test --no-default-features --features core,uboot,gpt,flash-mode-2,test-utils
+cargo test --no-default-features --features core,uboot,dos,flash-mode-2,test-utils
+cargo test --no-default-features --features core,uboot,gpt,flash-mode-2-direct,test-utils
+
+# Flash modes 1 and 2 together
+cargo test --features uboot,gpt,flash-mode-1,flash-mode-2,factory-reset,test-utils
+
 # Verbose output
 cargo test --features grub,gpt,test-utils -- --nocapture
 ```
 
-`flash-mode` alone, without `flash-mode-1` (or a future `flash-mode-2`/`-3`),
+`flash-mode` alone, without `flash-mode-1` or `flash-mode-2` (or a future `flash-mode-3`),
 is not a supported configuration — no combination above builds it that way,
 and no gate covers it.
 
@@ -357,6 +386,11 @@ and `cargo clippy` need no cross-linker):
 rustup target add armv7-unknown-linux-gnueabihf
 cargo clippy --target armv7-unknown-linux-gnueabihf --tests \
   --features uboot,dos,factory-reset,test-utils -- -D warnings
+
+# Run the tests on a 32-bit host target (needs no cross-linker on x86-64)
+rustup target add i686-unknown-linux-gnu
+cargo test --target i686-unknown-linux-gnu --no-default-features \
+  --features core,uboot,dos,flash-mode-2,test-utils
 
 # Narrowing casts, reviewed by hand — not part of the gate, it also flags safe ones
 cargo clippy --target armv7-unknown-linux-gnueabihf \

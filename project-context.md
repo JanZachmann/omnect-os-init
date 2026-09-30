@@ -46,6 +46,9 @@ src/
 │       ├── mod.rs           # Dispatch, terminal action, log capture and persistence
 │       ├── config.rs        # Environment read, validation -> FlashConfig
 │       ├── efi.rs           # efibootmgr handling
+│       ├── net.rs           # eth0 up, dhcpcd, dropbear (feature = flash-mode-2)
+│       ├── scp.rs           # Mode 2 orchestration: fifo for the scp upload (feature = flash-mode-2)
+│       ├── bmap.rs          # bmaptool copy invocation (feature = flash-mode-2)
 │       ├── clone.rs         # Mode 1 orchestration (feature = flash-mode-1)
 │       ├── sfdisk.rs        # Partition-table dump parsing and rewriting (feature = flash-mode-1)
 │       ├── rawio.rs         # In-process replacement for every `dd` call (feature = flash-mode-1)
@@ -106,6 +109,12 @@ src/
   ```
   cargo test --no-default-features --features grub,gpt,factory-reset,test-utils
   ```
+  Mode 2 combinations need `--no-default-features`, because `default` enables mode 1:
+  ```
+  cargo test --no-default-features --features core,uboot,gpt,flash-mode-2,test-utils
+  cargo test --no-default-features --features core,uboot,gpt,flash-mode-2-direct,test-utils
+  cargo test --features uboot,gpt,flash-mode-1,flash-mode-2,factory-reset,test-utils
+  ```
   `flash-mode` alone, without a mode feature, is not a supported configuration
   and no combination here or in the README covers it.
 - **Audit:** `cargo audit`
@@ -124,6 +133,8 @@ src/
 | `factory-reset` | Factory reset, modes 1-3: backup → wipe (2 and 3) → reformat → restore |
 | `flash-mode` | Shared flash layer: trigger detection, dispatch, log capture. Never selected directly — each mode feature pulls it in |
 | `flash-mode-1` | Clone the running disk onto another block device. Part of the default feature set |
+| `flash-mode-2` | Flash a `wic.xz` pushed in over `scp`. Needs `ip`, `dhcpcd`, `dropbear`, `bmaptool`, `xz` in the initramfs and the build constants `OMNECT_PART_OFFSET_BOOT` (`BOOT_START`, KB), `OMNECT_PART_SIZE_BOOT` (`BOOT_SIZE`, KB), `OMNECT_USER_ID` (uid and gid of the omnect user). Trigger: `flash-mode=2` in the boot env or the file `/etc/enforce_flash_mode` |
+| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream |
 | `test-utils` | Expose `MockBootEnv` for integration tests — never enabled in production builds |
 
 ## 5. Runtime Constraints
