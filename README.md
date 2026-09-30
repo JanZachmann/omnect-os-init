@@ -18,7 +18,7 @@ Implemented functionality:
 - **Logging**: Kernel ring buffer (`/dev/kmsg`) with log level prefixes
 - **ODS integration**: Runtime files for `omnect-device-service`
 - **fs-links**: Symlink creation from `etc/omnect/fs-link.json` and `etc/omnect/fs-link.d/`
-- **switch\_root**: MS_MOVE + chroot + exec systemd (`pivot_root(2)` is not used; ramfs does not support it)
+- **switch\_root**: MS_MOVE + chroot + exec systemd (`pivot_root(2)` is not used; the initial rootfs does not support it)
 - **Factory reset (modes 1-3)**: Selective-preserve backup → wipe `data`/`etc` (modes 2 and 3 only) → reformat → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
 - **Flash mode 1**: Clones the running disk onto another block device given by the `flash-mode-devpath` bootloader env key, triggered by `flash-mode`; powers off on success so the clone can be moved to its own device (feature `flash-mode-1`, part of the default feature set)
 - **Flash mode 2**: Brings up `eth0` with DHCP and starts `dropbear`; the operator pushes a `wic.xz` with `scp`, and `bmaptool` flashes it onto the running disk. Triggered by `flash-mode=2` in the bootloader env or by the flag file `/etc/enforce_flash_mode` (feature `flash-mode-2`)

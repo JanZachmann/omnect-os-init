@@ -32,7 +32,7 @@ const IP_LINK_ARGS: [&str; 4] = ["link", "set", FLASH_INTERFACE, "up"];
 pub(crate) trait NetOps {
     /// `ip link set eth0 up`; an error means "try again later".
     fn link_up(&mut self) -> Result<(), FlashError>;
-    /// `dhcpcd eth0`; the address is polled afterwards, with a bound.
+    /// `dhcpcd eth0`; it must return, then the address is polled with a bound.
     fn run_dhcpcd(&mut self) -> Result<(), FlashError>;
     /// Every interface address as `(interface name, address)`.
     fn addresses(&mut self) -> Result<Vec<(String, Option<IpAddr>)>, FlashError>;

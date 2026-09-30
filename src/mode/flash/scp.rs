@@ -127,9 +127,8 @@ fn create_owned_fifo(path: &Path, uid: Uid, gid: Gid) -> Result<(), FlashError> 
     chown(path, Some(uid), Some(gid)).map_err(failed)
 }
 
-/// `scp` creates the file before it writes the content, and with
-/// `flash-mode-2-direct` the disk head is zeroed before `bmaptool` reads the
-/// bmap, so a half-written bmap must not end the wait.
+/// With `flash-mode-2-direct` the disk head is zeroed before `bmaptool` reads
+/// the bmap, so a half-written bmap must not end the wait.
 fn bmap_is_complete(path: &Path) -> bool {
     path.is_file()
         && fs::read(path).is_ok_and(|content| {

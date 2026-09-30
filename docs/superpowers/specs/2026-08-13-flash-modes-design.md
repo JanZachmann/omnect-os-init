@@ -362,7 +362,7 @@ Detection follows the legacy order `86-factory-reset`, `87-flash_mode_1`,
 | `flash-mode` `2`, no flag | Mode 2 |
 | flag or `flash-mode` `2`, plus a set `factory-reset` | both cleared, then refused |
 | `flash-mode` `2`, no flag, `factory-reset` unreadable | Normal |
-| flag, `factory-reset` unreadable | Mode 2 |
+| flag, `flash-mode` not `1`, `factory-reset` unreadable | Mode 2 |
 | flag, boot env unavailable or `flash-mode` unreadable | Mode 2 |
 
 The flag rows with an unreadable environment follow legacy, which checks the
