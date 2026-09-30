@@ -208,8 +208,6 @@ impl ScpOps for RealScpOps {
 }
 
 /// Flash the running disk with the image the operator pushes in.
-// TODO: remove me, as soon as flash mode 2 is dispatched
-#[allow(dead_code)]
 pub(crate) fn run_scp(ctx: &ScpCtx<'_>) -> Result<(), FlashError> {
     scp_with(ctx, &BuildConstants::from_build(), &mut RealScpOps)
 }

@@ -78,6 +78,8 @@ pub(crate) mod scratch_mounts {
 }
 #[cfg(feature = "flash-mode-1")]
 const MODE_1_LOG_FILE: &str = "flash-mode-1.log";
+#[cfg(feature = "flash-mode-2")]
+const MODE_2_LOG_FILE: &str = "flash-mode-2.log";
 
 /// Writes the run log: the data partition, the file name, the captured lines.
 type LogWriter<'a> = &'a mut dyn FnMut(&Path, &str, &[String]) -> Result<(), FlashError>;
@@ -86,6 +88,8 @@ fn log_file(mode: config::FlashMode) -> &'static str {
     match mode {
         #[cfg(feature = "flash-mode-1")]
         config::FlashMode::Mode1 => MODE_1_LOG_FILE,
+        #[cfg(feature = "flash-mode-2")]
+        config::FlashMode::Mode2 => MODE_2_LOG_FILE,
     }
 }
 
@@ -178,6 +182,11 @@ fn run_selected_mode(
             layout: ctx.layout,
             rootfs: ctx.rootfs,
         }),
+        #[cfg(feature = "flash-mode-2")]
+        config::FlashMode::Mode2 => scp::run_scp(&scp::ScpCtx {
+            layout: ctx.layout,
+            rootfs: ctx.rootfs,
+        }),
     }
 }
 
@@ -234,6 +243,7 @@ pub(crate) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "flash-mode-1")]
     use crate::bootloader::{BootEnv, MockBootEnv};
 
     #[cfg(feature = "flash-mode-2")]
@@ -395,6 +405,12 @@ mod tests {
     #[test]
     fn mode_1_writes_its_run_log_under_the_name_operators_look_for() {
         assert_eq!(log_file(config::FlashMode::Mode1), "flash-mode-1.log");
+    }
+
+    #[cfg(feature = "flash-mode-2")]
+    #[test]
+    fn mode_2_writes_its_run_log_under_the_name_operators_look_for() {
+        assert_eq!(log_file(config::FlashMode::Mode2), "flash-mode-2.log");
     }
 
     #[test]

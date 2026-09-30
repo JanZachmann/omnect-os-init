@@ -1470,7 +1470,7 @@ mod tests {
 
             let mut bl = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, trigger);
             let BootMode::FactoryReset(FactoryResetTrigger::Rejected(e)) =
-                BootMode::detect(Some(&mut bl)).expect("detect never fails")
+                BootMode::detect_with(Some(&mut bl), false).expect("detect never fails")
             else {
                 panic!("trigger must be rejected: {trigger}");
             };

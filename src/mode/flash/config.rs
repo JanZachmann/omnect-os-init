@@ -5,6 +5,8 @@ use std::path::PathBuf;
 pub enum FlashMode {
     #[cfg(feature = "flash-mode-1")]
     Mode1,
+    #[cfg(feature = "flash-mode-2")]
+    Mode2,
 }
 
 /// What `flash-mode-devpath` held when the mode was detected.
@@ -28,6 +30,8 @@ pub(crate) fn parse_mode(value: &str) -> Option<FlashMode> {
     match value {
         #[cfg(feature = "flash-mode-1")]
         "1" => Some(FlashMode::Mode1),
+        #[cfg(feature = "flash-mode-2")]
+        "2" => Some(FlashMode::Mode2),
         _ => None,
     }
 }
@@ -49,7 +53,9 @@ mod tests {
     fn parse_mode_accepts_only_the_known_selectors() {
         #[cfg(feature = "flash-mode-1")]
         assert_eq!(parse_mode("1"), Some(FlashMode::Mode1));
-        for unknown in ["", " ", "0", "4", "one", "11", " 1", "1 "] {
+        #[cfg(feature = "flash-mode-2")]
+        assert_eq!(parse_mode("2"), Some(FlashMode::Mode2));
+        for unknown in ["", " ", "0", "4", "one", "11", " 1", "1 ", " 2", "2 "] {
             assert_eq!(
                 parse_mode(unknown),
                 None,
