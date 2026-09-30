@@ -560,9 +560,11 @@ flag file shipped by `omnect-os-initramfs-test`. Both are kept.
    `scp` streams directly into `bmaptool`.
 4. Log the first command the operator must run, with the acquired IP address:
    `scp <bmap-file> omnect@<ip>:wic.bmap`.
-5. Wait for `/home/omnect/wic.bmap` to appear, unbounded — this waits for a
-   person (§7). Then log the second command, `scp <wic-image> omnect@<ip>:wic.xz`,
-   in the same order as legacy.
+5. Wait for `/home/omnect/wic.bmap` to be complete, unbounded — this waits for
+   a person (§7). Complete means a regular file whose content ends with the
+   closing `</bmap>` tag, so a half-copied bmap does not end the wait. Then log
+   the second command, `scp <wic-image> omnect@<ip>:wic.xz`, in the same order
+   as legacy.
 6. Flash. Every `bmaptool` call uses `--bmap /home/omnect/wic.bmap`:
    - **default** — verify pass first:
      `bmaptool copy --bmap wic.bmap wic.xz /home/omnect/wic`, which consumes the
@@ -750,6 +752,8 @@ Behaviour changes, as opposed to bug fixes:
 
 - machine-driven unbounded waits become bounded (§7); the wait for the
   operator's `scp` keeps polling as legacy does (§10.8);
+- the `wic.bmap` wait ends when the file is complete, where legacy stopped as
+  soon as the file existed (§5.4);
 - `dd` is replaced by in-process file I/O (§2.8);
 - the EFI loader is passed to `efibootmgr` as `\EFI\BOOT\bootx64.efi`. The
   legacy script's unquoted `\\\\EFI\\\\BOOT` reached it as

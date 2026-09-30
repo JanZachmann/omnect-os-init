@@ -1,6 +1,7 @@
 //! Flash mode 2: flash the running disk with a `wic.xz` the operator pushes in
 //! over `scp`.
 
+use std::fs;
 use std::net::Ipv4Addr;
 use std::path::Path;
 #[cfg(feature = "grub")]
@@ -34,6 +35,8 @@ const WIC_BMAP_NAME: &str = "wic.bmap";
 #[cfg(not(feature = "flash-mode-2-direct"))]
 const WIC_MATERIALIZED_NAME: &str = "wic";
 const BMAP_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// The last element of a bmap file.
+const BMAP_CLOSING_TAG: &str = "</bmap>";
 
 pub(crate) struct ScpCtx<'a> {
     pub(crate) layout: &'a PartitionLayout,
@@ -125,9 +128,21 @@ fn create_owned_fifo(path: &Path, uid: Uid, gid: Gid) -> Result<(), FlashError> 
     chown(path, Some(uid), Some(gid)).map_err(failed)
 }
 
-fn wait_for_file(path: &Path, interval: Duration, sleep: &mut dyn FnMut(Duration)) {
+/// `scp` creates the file before it writes the content, and with
+/// `flash-mode-2-direct` the disk head is zeroed before `bmaptool` reads the
+/// bmap, so a half-written bmap must not end the wait.
+fn bmap_is_complete(path: &Path) -> bool {
+    path.is_file()
+        && fs::read(path).is_ok_and(|content| {
+            content
+                .trim_ascii_end()
+                .ends_with(BMAP_CLOSING_TAG.as_bytes())
+        })
+}
+
+fn wait_for_bmap(path: &Path, interval: Duration, sleep: &mut dyn FnMut(Duration)) {
     log::info!("waiting for {}", path.display());
-    while !path.exists() {
+    while !bmap_is_complete(path) {
         sleep(interval);
     }
 }
@@ -139,7 +154,7 @@ trait ScpOps {
     fn start_dropbear(&mut self) -> Result<(), FlashError>;
     fn create_fifo(&mut self, path: &Path, owner: u32) -> Result<(), FlashError>;
     fn tell_operator(&mut self, message: &str);
-    fn wait_for_file(&mut self, path: &Path);
+    fn wait_for_bmap(&mut self, path: &Path);
     fn bmap_copy(&mut self, args: &BmapArgs<'_>) -> Result<(), FlashError>;
     fn zero_range(&mut self, dst: &Path, offset: u64, len: u64) -> Result<(), FlashError>;
     #[cfg(feature = "grub")]
@@ -185,8 +200,8 @@ impl ScpOps for RealScpOps {
         log::info!("{message}");
     }
 
-    fn wait_for_file(&mut self, path: &Path) {
-        wait_for_file(path, BMAP_POLL_INTERVAL, &mut thread::sleep);
+    fn wait_for_bmap(&mut self, path: &Path) {
+        wait_for_bmap(path, BMAP_POLL_INTERVAL, &mut thread::sleep);
     }
 
     fn bmap_copy(&mut self, args: &BmapArgs<'_>) -> Result<(), FlashError> {
@@ -238,7 +253,7 @@ fn scp_with(
 
     ops.tell_operator(&bmap_instruction(ip));
     // Unbounded: this waits for a person to start the `scp`.
-    ops.wait_for_file(&bmap);
+    ops.wait_for_bmap(&bmap);
     ops.tell_operator(&image_instruction(ip));
 
     // The verify pass reads the whole stream first, so a broken transfer
@@ -396,8 +411,29 @@ mod tests {
         assert_eq!(meta.gid(), Gid::current().as_raw());
     }
 
+    /// Enough polls for the test sequence; more means the wait never ends.
+    const MAX_TEST_POLLS: usize = 10;
+    const PARTIAL_BMAP: &str = "<?xml version=\"1.0\" ?>\n<bmap version=\"2.0\">\n";
+
     #[test]
-    fn the_file_wait_polls_until_the_file_appears_and_logs_once() {
+    fn a_bmap_is_complete_only_as_a_regular_file_with_its_closing_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WIC_BMAP_NAME);
+        assert!(!bmap_is_complete(&path), "missing");
+
+        std::fs::create_dir(&path).unwrap();
+        assert!(!bmap_is_complete(&path), "directory");
+        std::fs::remove_dir(&path).unwrap();
+
+        std::fs::write(&path, PARTIAL_BMAP).unwrap();
+        assert!(!bmap_is_complete(&path), "no closing tag");
+
+        std::fs::write(&path, format!("{PARTIAL_BMAP}{BMAP_CLOSING_TAG}\n")).unwrap();
+        assert!(bmap_is_complete(&path), "closing tag and trailing newline");
+    }
+
+    #[test]
+    fn the_bmap_wait_polls_until_the_bmap_is_complete_and_logs_once() {
         let _guard = crate::logging::capture::SERIALIZE
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -407,13 +443,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(WIC_BMAP_NAME);
         let mut sleeps = Vec::new();
-        wait_for_file(&path, BMAP_POLL_INTERVAL, &mut |d| {
+        wait_for_bmap(&path, BMAP_POLL_INTERVAL, &mut |d| {
             sleeps.push(d);
-            if sleeps.len() == 2 {
-                std::fs::write(&path, b"").unwrap();
+            match sleeps.len() {
+                2 => std::fs::write(&path, PARTIAL_BMAP).unwrap(),
+                3 => std::fs::write(&path, format!("{PARTIAL_BMAP}{BMAP_CLOSING_TAG}")).unwrap(),
+                n if n > MAX_TEST_POLLS => panic!("the wait did not end"),
+                _ => {}
             }
         });
-        assert_eq!(sleeps, [BMAP_POLL_INTERVAL, BMAP_POLL_INTERVAL]);
+        assert_eq!(sleeps, [BMAP_POLL_INTERVAL; 3]);
 
         let waiting = format!("waiting for {}", path.display());
         let lines = crate::logging::capture::take_capture();
@@ -486,7 +525,7 @@ mod tests {
             self.calls.push(format!("tell {message}"));
         }
 
-        fn wait_for_file(&mut self, path: &Path) {
+        fn wait_for_bmap(&mut self, path: &Path) {
             self.calls.push(format!("wait for {}", path.display()));
         }
 
