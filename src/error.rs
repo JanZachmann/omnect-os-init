@@ -374,6 +374,10 @@ pub enum FlashError {
     #[error("EFI handling failed: {0}")]
     EfiFailed(String),
 
+    #[cfg(feature = "flash-mode-2")]
+    #[error("Network setup failed: {0}")]
+    NetworkFailed(String),
+
     #[error("{}: {source}", path.display())]
     PathIo {
         path: PathBuf,

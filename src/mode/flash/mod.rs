@@ -6,6 +6,8 @@ pub(crate) mod clone;
 pub mod config;
 #[cfg(feature = "grub")]
 pub(crate) mod efi;
+#[cfg(feature = "flash-mode-2")]
+pub(crate) mod net;
 #[cfg(feature = "flash-mode-1")]
 pub(crate) mod rawio;
 #[cfg(feature = "flash-mode-1")]
@@ -26,6 +28,11 @@ use crate::filesystem::{MountOptions, MountPoint, mount, umount};
 use crate::logging::{start_capture, take_capture};
 use crate::mode::{BootContext, clear_flash_triggers};
 use crate::partition::{PartitionLayout, PartitionName};
+
+/// `PATH` for child processes: PID 1 has no login environment, and tools such
+/// as `dhcpcd` run hook scripts that look up their own helpers.
+#[cfg(feature = "flash-mode-2")]
+pub(crate) const CHILD_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Scratch mount points. They sit outside the rootfs mount, which mode 1
 /// unmounts before it writes anything.

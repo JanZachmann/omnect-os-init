@@ -44,6 +44,8 @@ pub enum FsType {
     Overlay,
     #[cfg(all(feature = "flash-mode", feature = "grub"))]
     Efivarfs,
+    #[cfg(feature = "flash-mode-2")]
+    Devpts,
 }
 
 impl FsType {
@@ -56,6 +58,8 @@ impl FsType {
             FsType::Overlay => "overlay",
             #[cfg(all(feature = "flash-mode", feature = "grub"))]
             FsType::Efivarfs => "efivarfs",
+            #[cfg(feature = "flash-mode-2")]
+            FsType::Devpts => "devpts",
         }
     }
 }
@@ -143,6 +147,15 @@ impl MountOptions {
     pub fn efivarfs() -> Self {
         Self {
             fstype: Some(FsType::Efivarfs),
+            flags: MsFlags::empty(),
+            data: None,
+        }
+    }
+
+    #[cfg(feature = "flash-mode-2")]
+    pub fn devpts() -> Self {
+        Self {
+            fstype: Some(FsType::Devpts),
             flags: MsFlags::empty(),
             data: None,
         }
