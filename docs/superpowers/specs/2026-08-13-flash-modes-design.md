@@ -559,9 +559,11 @@ Trigger: `flash-mode == 2`, **or** the presence of `/etc/enforce_flash_mode`, th
 flag file shipped by `omnect-os-initramfs-test`. Both are kept.
 
 1. Clear `flash-mode`.
-2. Unmount (§5.1), network up plus `dropbear` (§5.2).
+2. Unmount (§5.1), network up (§5.2).
 3. Create the image FIFO at `/home/omnect/wic.xz`, owned by the `omnect` user, so
-   `scp` streams directly into `bmaptool`.
+   `scp` streams directly into `bmaptool`. Then start `dropbear` (§5.2). The FIFO
+   comes first, so a client that can log in always finds it; CI checks for it
+   over `ssh` to know the device is ready.
 4. Log the first command the operator must run, with the acquired IP address:
    `scp <bmap-file> omnect@<ip>:wic.bmap`.
 5. Wait for `/home/omnect/wic.bmap` to be complete, unbounded — this waits for
@@ -761,6 +763,8 @@ Behaviour changes, as opposed to bug fixes:
 
 - machine-driven unbounded waits become bounded (§7); the wait for the
   operator's `scp` keeps polling as legacy does (§10.8);
+- mode 2 creates the image FIFO before it starts `dropbear`; legacy started
+  `dropbear` first, so a login could briefly find no `wic.xz` (§5.4);
 - the `wic.bmap` wait ends when the file is complete, where legacy stopped as
   soon as the file existed (§5.4);
 - `dd` is replaced by in-process file I/O (§2.8);

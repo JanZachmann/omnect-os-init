@@ -239,8 +239,9 @@ fn scp_with(
 
     ops.unmount(ctx.rootfs, disk)?;
     let ip = ops.bring_up_network()?;
-    ops.start_dropbear()?;
+    // Before dropbear, so a client that can log in always finds the FIFO.
     ops.create_fifo(&fifo, constants.omnect_user_id)?;
+    ops.start_dropbear()?;
 
     ops.tell_operator(&bmap_instruction(ip));
     // Unbounded: this waits for a person to start the `scp`.
@@ -573,8 +574,8 @@ mod tests {
         let mut expected = vec![
             "unmount /rootfs and /dev/sda".to_string(),
             "network".to_string(),
-            "dropbear".to_string(),
             "fifo /home/omnect/wic.xz owned by 1000".to_string(),
+            "dropbear".to_string(),
             "tell please run: scp <bmap-file> omnect@192.168.0.7:wic.bmap".to_string(),
             "wait for /home/omnect/wic.bmap".to_string(),
             "tell please run: scp <wic-image> omnect@192.168.0.7:wic.xz".to_string(),
