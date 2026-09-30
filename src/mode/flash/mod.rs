@@ -10,7 +10,7 @@ pub(crate) mod efi;
 pub(crate) mod rawio;
 #[cfg(feature = "flash-mode-1")]
 pub(crate) mod sfdisk;
-#[cfg(feature = "flash-mode-1")]
+#[cfg(feature = "flash-mode")]
 pub(crate) mod unmount;
 
 use std::fs;
