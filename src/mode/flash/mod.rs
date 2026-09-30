@@ -63,10 +63,10 @@ pub(crate) fn run_inherited(cmd: &str, args: &[&OsStr]) -> Result<(), String> {
     Ok(())
 }
 
-/// Scratch mount points. They sit outside the rootfs mount, which mode 1
-/// unmounts before it writes anything.
+/// Scratch mount points. They sit outside the rootfs mount, which is unmounted
+/// before the disk is written.
 pub(crate) mod scratch_mounts {
-    /// The source data partition, while the run log is written.
+    /// The data partition, while the run log is written.
     pub(crate) const LOG_DATA: &str = "/tmp/flash-log-data";
     /// The destination boot partition, while the default GRUB environment is
     /// written.
@@ -93,7 +93,6 @@ fn log_file(mode: config::FlashMode) -> &'static str {
     }
 }
 
-/// Runs the selected mode: its config and the boot context.
 type ModeRunner<'a> =
     &'a mut dyn FnMut(&config::FlashConfig, &BootContext<'_>) -> Result<(), FlashError>;
 
@@ -163,7 +162,7 @@ fn destination(flash_config: &config::FlashConfig) -> Result<&Path, FlashError> 
     }
 }
 
-/// Write the captured log onto the source data partition.
+/// Write the captured log onto the data partition.
 fn write_log(data_partition: &Path, file: &str, lines: &[String]) -> Result<(), FlashError> {
     with_mount(
         data_partition,
@@ -187,11 +186,11 @@ fn persist_log(layout: &PartitionLayout, file: &str, lines: &[String], write: Lo
     }
 
     let Some(data_partition) = layout.get(PartitionName::Data) else {
-        log::warn!("flash mode: the source layout has no data partition; the run log is not kept");
+        log::warn!("flash mode: the layout has no data partition; the run log is not kept");
         return;
     };
     if let Err(e) = write(data_partition, file, lines) {
-        log::warn!("flash mode: failed to write the run log to the source disk: {e}");
+        log::warn!("flash mode: failed to write the run log to the data partition: {e}");
     }
 }
 
@@ -223,8 +222,8 @@ fn run_and_persist(
     write: LogWriter<'_>,
 ) -> Result<(), FlashError> {
     // First, so a failed trigger clear reaches the run log too. kmsg is gone
-    // after the power off, so the file on the source disk is the only record
-    // of the run.
+    // after the power off or reboot, so the file on the data partition is the
+    // only record of the run.
     start_capture();
 
     if let Some(bl) = ctx.boot_env.available_mut() {

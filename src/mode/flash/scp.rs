@@ -43,7 +43,7 @@ pub(crate) struct ScpCtx<'a> {
     pub(crate) rootfs: &'a Path,
 }
 
-/// The build-time constants as `build.rs` generated them, KB-valued.
+/// The build-time constants as `build.rs` generated them.
 struct BuildConstants {
     boot_start: Option<u64>,
     boot_size: Option<u64>,
@@ -60,7 +60,6 @@ impl BuildConstants {
     }
 }
 
-/// The build-time constants mode 2 needs, validated.
 #[derive(Debug, PartialEq, Eq)]
 struct Constants {
     zero_head_bytes: u64,
@@ -265,8 +264,9 @@ fn scp_with(
     #[cfg(feature = "flash-mode-2-direct")]
     let source = fifo;
 
-    // Without this, some devices failed to boot after a flash, on GRUB and on
-    // U-Boot. The root cause is unknown.
+    // Without this, GRUB devices sometimes could not boot after a flash
+    // (`bootx64.efi` on the disk differed from the image), and U-Boot devices
+    // had errors on the boot partition after `bmaptool`.
     log::info!(
         "zeroing the first {} bytes of {}",
         constants.zero_head_bytes,
@@ -564,8 +564,8 @@ mod tests {
         (result, ops.calls)
     }
 
-    /// The spec 5.4 order: the operator is asked for the image only after the
-    /// bmap arrived, and the disk head is zeroed right before the flash.
+    /// The operator is asked for the image only after the bmap arrived, and the
+    /// disk head is zeroed right before the flash.
     #[test]
     fn mode_2_runs_its_steps_in_the_spec_order() {
         let (result, calls) = run_recorded(&raw_constants());

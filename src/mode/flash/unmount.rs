@@ -66,7 +66,7 @@ pub(crate) fn unmount_target_disk(rootfs: &Path, disk: &Path) -> Result<(), Flas
 }
 
 /// The mount points whose source sits on `disk`, deepest first so a nested
-/// mount goes before its parent. Device numbers are compared, never names.
+/// mount goes before its parent. Sources are matched by device number.
 #[cfg(feature = "flash-mode-2")]
 fn mounts_backed_by(
     proc_mounts: &str,

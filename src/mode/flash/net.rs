@@ -32,7 +32,7 @@ const IP_LINK_ARGS: [&str; 4] = ["link", "set", FLASH_INTERFACE, "up"];
 pub(crate) trait NetOps {
     /// `ip link set eth0 up`; an error means "try again later".
     fn link_up(&mut self) -> Result<(), FlashError>;
-    /// `dhcpcd eth0`; returns once dhcpcd has gone to the background.
+    /// `dhcpcd eth0`; the address is polled afterwards, with a bound.
     fn run_dhcpcd(&mut self) -> Result<(), FlashError>;
     /// Every interface address as `(interface name, address)`.
     fn addresses(&mut self) -> Result<Vec<(String, Option<IpAddr>)>, FlashError>;
@@ -79,7 +79,6 @@ impl NetOps for RealNetOps {
     }
 }
 
-/// The first IPv4 address of `iface`.
 pub(crate) fn ipv4_of(addrs: &[(String, Option<IpAddr>)], iface: &str) -> Option<Ipv4Addr> {
     addrs.iter().find_map(|(name, ip)| match ip {
         Some(IpAddr::V4(v4)) if name == iface => Some(*v4),
@@ -87,7 +86,7 @@ pub(crate) fn ipv4_of(addrs: &[(String, Option<IpAddr>)], iface: &str) -> Option
     })
 }
 
-/// The bound is the sum of the sleeps, not wall time.
+/// The bound is the sum of the sleeps.
 fn wait_for<T>(
     ops: &mut dyn NetOps,
     what: &str,
@@ -138,7 +137,6 @@ fn bring_up_with(
     )
 }
 
-/// Bring `eth0` up, get an address by DHCP and return it.
 pub(crate) fn bring_up() -> Result<Ipv4Addr, FlashError> {
     let ip = bring_up_with(
         &mut RealNetOps,

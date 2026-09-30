@@ -157,8 +157,7 @@ impl BootMode {
     /// Falls back to `Normal` when either trigger key cannot be read while a
     /// flash mode may be set, since a conflict cannot be ruled out and both
     /// modes are destructive. The enforce flag is the exception: it selects
-    /// mode 2 even when the environment cannot be read, as legacy checks the
-    /// flag before it reads `flash-mode`.
+    /// mode 2 even when the environment cannot be read.
     #[cfg_attr(
         not(any(feature = "factory-reset", feature = "flash-mode")),
         allow(unused_variables)
