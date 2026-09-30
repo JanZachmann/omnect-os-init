@@ -1,6 +1,5 @@
 pub mod backup_restore;
 pub mod config;
-pub mod reformat;
 pub mod wipe;
 
 use std::path::{Path, PathBuf};
@@ -12,7 +11,7 @@ use crate::{
     error::{FactoryResetError, FilesystemError, InitramfsError, Result},
     filesystem::{
         FsType, MountOptions, PartitionMountSpec, mount_points, mount_tracked_partition, paths,
-        setup_data_overlay_tracked, setup_etc_overlay_tracked, unmount_tracked,
+        reformat_ext4, setup_data_overlay_tracked, setup_etc_overlay_tracked, unmount_tracked,
     },
     mode::{BootContext, FactoryResetTrigger, factory_reset::backup_restore::RestoreResult},
     partition::{PartitionLayout, PartitionName},
@@ -22,7 +21,6 @@ use crate::{
 use crate::mode::factory_reset::{
     backup_restore::{backup_all, restore_all},
     config::{FactoryResetConfig, ResetMode, build_preserve_list},
-    reformat::reformat_ext4,
     wipe::{WipeResult, wipe_discard, wipe_random},
 };
 
@@ -301,7 +299,7 @@ struct RealReformatOps<'a> {
 
 impl ReformatRetryOps for RealReformatOps<'_> {
     fn reformat(&mut self, device: &Path, label: &str) -> Result<()> {
-        reformat_ext4(device, label)
+        reformat_ext4(device, label).map_err(|e| reformat_failed(device, e))
     }
 
     fn mount_all(&mut self) -> Result<()> {
@@ -311,6 +309,16 @@ impl ReformatRetryOps for RealReformatOps<'_> {
             },
         )
     }
+}
+
+/// Keep the factory-reset class: an unreformattable partition degrades the
+/// boot, it does not stop it. The shared helper cannot know that.
+fn reformat_failed(device: &Path, e: crate::error::FilesystemError) -> crate::InitramfsError {
+    FactoryResetError::ReformatFailed {
+        device: device.to_path_buf(),
+        reason: e.to_string(),
+    }
+    .into()
 }
 
 fn join_context(first: Option<String>, second: Option<String>) -> Option<String> {
@@ -691,6 +699,27 @@ fn reformat_and_mount_with_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reformat_failure_keeps_the_factory_reset_class_and_the_mkfs_reason() {
+        let err = reformat_failed(
+            Path::new("/dev/sda7"),
+            crate::error::FilesystemError::FormatFailed {
+                device: PathBuf::from("/dev/sda7"),
+                fstype: "ext4".to_string(),
+                reason: "mkfs.ext4 failed (exit status: 1): Device size reported to be zero"
+                    .to_string(),
+            },
+        );
+        assert!(
+            matches!(
+                &err,
+                InitramfsError::FactoryReset(FactoryResetError::ReformatFailed { reason, .. })
+                    if reason.contains("Device size reported to be zero")
+            ),
+            "got: {err:?}"
+        );
+    }
 
     #[cfg(feature = "factory-reset")]
     mod retry_tests {
@@ -1439,9 +1468,9 @@ mod tests {
             use crate::bootloader::{BootEnvKey, MockBootEnv};
             use crate::mode::BootMode;
 
-            let bl = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, trigger);
+            let mut bl = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, trigger);
             let BootMode::FactoryReset(FactoryResetTrigger::Rejected(e)) =
-                BootMode::detect(Some(&bl)).expect("detect never fails")
+                BootMode::detect(Some(&mut bl)).expect("detect never fails")
             else {
                 panic!("trigger must be rejected: {trigger}");
             };

@@ -80,8 +80,12 @@ impl Log for KmsgLogger {
         let prefix = Self::level_to_kernel_prefix(record.level());
         let message = format!("{}{}{}\n", prefix, LOG_PREFIX, record.args());
 
-        let mut kmsg = self.kmsg.lock().unwrap_or_else(|p| p.into_inner());
-        let _ = kmsg.write_all(message.as_bytes());
+        {
+            let mut kmsg = self.kmsg.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = kmsg.write_all(message.as_bytes());
+        }
+
+        crate::logging::capture_record(record);
     }
 
     fn flush(&self) {
@@ -182,4 +186,37 @@ fn enable_kmsg_ratelimit() {
 /// Best-effort: failures are silently ignored.
 pub fn disable_printk_ratelimit() {
     let _ = std::fs::write(PRINTK_DEVKMSG_PATH, "on\n");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::logging::capture::{SERIALIZE, start_capture, take_capture};
+
+    #[test]
+    fn the_kmsg_logger_feeds_a_running_capture() {
+        let _guard = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
+        let kmsg = tempfile::NamedTempFile::new().unwrap();
+        let logger = KmsgLogger {
+            kmsg: Mutex::new(kmsg.reopen().unwrap()),
+        };
+
+        start_capture();
+        logger.log(
+            &Record::builder()
+                .level(Level::Warn)
+                .args(format_args!("destination /dev/sdb did not appear"))
+                .build(),
+        );
+        let captured = take_capture();
+
+        assert!(
+            captured.contains(&"[WARN] destination /dev/sdb did not appear".to_string()),
+            "got {captured:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(kmsg.path()).unwrap(),
+            "<4>omnect-os-initramfs: destination /dev/sdb did not appear\n"
+        );
+    }
 }

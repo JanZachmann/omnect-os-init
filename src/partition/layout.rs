@@ -122,31 +122,31 @@ impl PartitionLayout {
 }
 
 /// Partition numbers shared by both GPT and DOS layouts
-const PARTITION_NUM_BOOT: u32 = 1;
-const PARTITION_NUM_ROOT_A: u32 = 2;
-const PARTITION_NUM_ROOT_B: u32 = 3;
+pub(crate) const PARTITION_NUM_BOOT: u32 = 1;
+pub(crate) const PARTITION_NUM_ROOT_A: u32 = 2;
+pub(crate) const PARTITION_NUM_ROOT_B: u32 = 3;
 
 /// GPT layout — partitions 4-7 are all primary
 #[cfg(feature = "gpt")]
-const PARTITION_NUM_FACTORY: u32 = 4;
+pub(crate) const PARTITION_NUM_FACTORY: u32 = 4;
 #[cfg(feature = "gpt")]
-const PARTITION_NUM_CERT: u32 = 5;
+pub(crate) const PARTITION_NUM_CERT: u32 = 5;
 #[cfg(feature = "gpt")]
-const PARTITION_NUM_ETC: u32 = 6;
+pub(crate) const PARTITION_NUM_ETC: u32 = 6;
 #[cfg(feature = "gpt")]
-const PARTITION_NUM_DATA: u32 = 7;
+pub(crate) const PARTITION_NUM_DATA: u32 = 7;
 
 /// DOS layout — partition 4 is the extended container; logical partitions start at 5
 #[cfg(feature = "dos")]
-const PARTITION_NUM_EXTENDED: u32 = 4;
+pub(crate) const PARTITION_NUM_EXTENDED: u32 = 4;
 #[cfg(feature = "dos")]
-const PARTITION_NUM_FACTORY: u32 = 5;
+pub(crate) const PARTITION_NUM_FACTORY: u32 = 5;
 #[cfg(feature = "dos")]
-const PARTITION_NUM_CERT: u32 = 6;
+pub(crate) const PARTITION_NUM_CERT: u32 = 6;
 #[cfg(feature = "dos")]
-const PARTITION_NUM_ETC: u32 = 7;
+pub(crate) const PARTITION_NUM_ETC: u32 = 7;
 #[cfg(feature = "dos")]
-const PARTITION_NUM_DATA: u32 = 8;
+pub(crate) const PARTITION_NUM_DATA: u32 = 8;
 
 /// Parse the trailing numeric partition suffix from a device path.
 ///
@@ -155,7 +155,7 @@ const PARTITION_NUM_DATA: u32 = 8;
 ///
 /// Uses the *trailing* digit run, not the first digit found, so that devices
 /// like `mmcblk0p2` (which contain digits in the base name) are handled correctly.
-fn partition_suffix(path: &std::path::Path) -> Option<u32> {
+pub(crate) fn partition_suffix(path: &std::path::Path) -> Option<u32> {
     let s = path.file_name().and_then(|s| s.to_str())?;
     let digit_start = s
         .rfind(|c: char| !c.is_ascii_digit())
@@ -411,5 +411,27 @@ mod tests {
         let layout = PartitionLayout::new(device).unwrap();
         assert!(layout.partitions.contains_key(&PartitionName::Boot));
         assert!(layout.partitions.contains_key(&PartitionName::Data));
+    }
+
+    #[test]
+    fn partition_numbers_match_the_table_layout() {
+        assert_eq!(PARTITION_NUM_BOOT, 1);
+        assert_eq!(PARTITION_NUM_ROOT_A, 2);
+        assert_eq!(PARTITION_NUM_ROOT_B, 3);
+        #[cfg(feature = "gpt")]
+        {
+            assert_eq!(PARTITION_NUM_FACTORY, 4);
+            assert_eq!(PARTITION_NUM_CERT, 5);
+            assert_eq!(PARTITION_NUM_ETC, 6);
+            assert_eq!(PARTITION_NUM_DATA, 7);
+        }
+        #[cfg(feature = "dos")]
+        {
+            assert_eq!(PARTITION_NUM_EXTENDED, 4);
+            assert_eq!(PARTITION_NUM_FACTORY, 5);
+            assert_eq!(PARTITION_NUM_CERT, 6);
+            assert_eq!(PARTITION_NUM_ETC, 7);
+            assert_eq!(PARTITION_NUM_DATA, 8);
+        }
     }
 }

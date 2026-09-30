@@ -14,7 +14,7 @@ src/
 ├── lib.rs                   # Library exports + run_init() + apply_boot_env_decision()
 ├── error.rs                 # Error type hierarchy
 ├── early_init.rs            # Mount /dev, /proc, /sys, /run before logging
-├── recovery.rs              # Recovery policy: error class → reboot / halt / shell / continue
+├── recovery.rs              # RecoveryClass -> Action policy (pure; main.rs executes it)
 ├── bootloader/
 │   ├── mod.rs               # BootEnv trait, BootEnvState, classify_boot_env()
 │   ├── grub.rs              # GRUB implementation (grub-editenv)
@@ -28,19 +28,28 @@ src/
 │   ├── fsck.rs              # e2fsck wrapper (all exit codes handled)
 │   ├── mount.rs             # Mount primitives (RAII, idempotency checks)
 │   ├── overlayfs.rs         # /etc overlay, /home overlay, bind mounts
+│   ├── reformat.rs          # mkfs.ext4 + tune2fs
 │   └── resize_data.rs       # Data partition auto-resize on first boot (feature = resize-data)
 ├── logging/
 │   ├── mod.rs               # KmsgLogger initializer
+│   ├── capture.rs           # In-memory copy of the log, for a mode that powers off
 │   └── kmsg.rs              # /dev/kmsg writer with kernel log levels
 ├── mode/
 │   ├── mod.rs               # BootMode enum, FactoryResetTrigger, BootContext, detect()
 │   ├── normal.rs            # Normal boot handler (post-mount overlays → switch_root)
-│   └── factory_reset/       # Factory reset (feature = factory-reset)
-│       ├── mod.rs           # Reset sequence, status assembly, trigger rejection
-│       ├── config.rs        # Trigger parsing, preserve list from etc/omnect
-│       ├── backup_restore.rs # Preserve-list backup to initramfs RAM and restore
-│       ├── reformat.rs      # mkfs.ext4 + tune2fs
-│       └── wipe.rs          # Mode 2 random overwrite, mode 3 BLKDISCARD
+│   ├── factory_reset/       # Factory reset (feature = factory-reset)
+│   │   ├── mod.rs           # Reset sequence, status assembly, trigger rejection
+│   │   ├── config.rs        # Trigger parsing, preserve list from etc/omnect
+│   │   ├── backup_restore.rs # Preserve-list backup to initramfs RAM and restore
+│   │   └── wipe.rs          # Mode 2 random overwrite, mode 3 BLKDISCARD
+│   └── flash/               # Flash modes (feature = flash-mode)
+│       ├── mod.rs           # Dispatch, terminal action, log capture and persistence
+│       ├── config.rs        # Environment read, validation -> FlashConfig
+│       ├── efi.rs           # efibootmgr handling
+│       ├── clone.rs         # Mode 1 orchestration (feature = flash-mode-1)
+│       ├── sfdisk.rs        # Partition-table dump parsing and rewriting (feature = flash-mode-1)
+│       ├── rawio.rs         # In-process replacement for every `dd` call (feature = flash-mode-1)
+│       └── unmount.rs       # rootfs unmount (feature = flash-mode-1)
 ├── partition/
 │   ├── mod.rs               # Public API
 │   ├── device.rs            # Root device detection (GRUB: blkid/fsuuid, U-Boot: root=)
@@ -48,7 +57,7 @@ src/
 │   └── symlinks.rs          # /dev/omnect/* symlink creation
 ├── init_setup/
 │   ├── mod.rs               # Init setup step runner
-│   ├── extra_bootargs.rs    # omnect_extra_bootargs sync
+│   ├── extra_bootargs.rs    # Sync omnect_extra_bootargs to the bootloader env
 │   └── resize_data.rs       # resize-data step: guard check + degraded-mode dispatch
 └── runtime/
     ├── mod.rs               # Public API
@@ -58,13 +67,21 @@ src/
 ```
 
 ## 3. Build & Test Commands
-- **Build:** `cargo build --features <bootloader>,<table>` (build.rs rejects a build
-  without one of each, so a bare `cargo build` fails)
-- **Check:** `cargo check --features <bootloader>,<table>`
+- **Build:** `cargo build --features <grub|uboot>,<gpt|dos>` / `cargo build --release --features <grub|uboot>,<gpt|dos>`
+- **Check:** `cargo check --features <grub|uboot>,<gpt|dos>`
 - **Format:** `cargo fmt -- --check`
-- **Lint:** `cargo clippy --tests --features <grub|uboot> -- -D warnings -W clippy::items_after_statements -W clippy::items_after_test_module`
-- **Test:** `test-utils` must be included for the `degraded_boot` integration test; the
-  `factory_reset` one additionally needs the `factory-reset` feature. Base combinations:
+- **Lint:** `cargo clippy --tests --features <grub|uboot>,<gpt|dos>,test-utils -- -D warnings -W clippy::items_after_statements -W clippy::items_after_test_module`.
+  `build.rs` panics unless exactly one bootloader feature and exactly one
+  partition-table feature are enabled, so both placeholders above must be
+  substituted for the command to run at all. `test-utils` must be included
+  too: every `[[test]]` target in `Cargo.toml` has
+  `required-features = ["test-utils", ...]`, so without it `--tests` compiles
+  only `device_detection.rs` and `fsck_status.rs` — none of
+  `tests/factory_reset.rs`, `tests/degraded_boot.rs` or `tests/flash_modes.rs`
+  are linted.
+- **Test:** `test-utils` must be included; the `degraded_boot` and `factory_reset`
+  integration tests require it. The `factory-reset` and `flash-mode-1` combinations
+  are listed in the README, which is the complete list. Base combinations:
   ```
   cargo test --features grub,gpt,test-utils
   cargo test --features grub,dos,test-utils
@@ -81,13 +98,16 @@ src/
   cargo test --features grub,gpt,resize-data,release-image,test-utils
   cargo test --features uboot,gpt,resize-data,release-image,test-utils
   ```
-  With `factory-reset`:
+  `flash-mode-1` sits in the default feature set, so every base combination
+  above already builds and tests it, and the `factory-reset` ones also cover
+  the refusal of a flash mode queued together with a factory reset.
+  The flash-free build needs `--no-default-features`, since `--features` is
+  additive and cannot turn a default feature back off:
   ```
-  cargo test --features grub,gpt,factory-reset,test-utils
-  cargo test --features grub,dos,factory-reset,test-utils
-  cargo test --features uboot,gpt,factory-reset,test-utils
-  cargo test --features uboot,dos,factory-reset,test-utils
+  cargo test --no-default-features --features grub,gpt,factory-reset,test-utils
   ```
+  `flash-mode` alone, without a mode feature, is not a supported configuration
+  and no combination here or in the README covers it.
 - **Audit:** `cargo audit`
 
 ## 4. Feature Flags
@@ -102,6 +122,8 @@ src/
 | `release-image` | Release behaviour: loop on fatal error; continue booting in degraded mode |
 | `resize-data` | Expand data partition + filesystem to fill disk on first boot |
 | `factory-reset` | Factory reset, modes 1-3: backup → wipe (2 and 3) → reformat → restore |
+| `flash-mode` | Shared flash layer: trigger detection, dispatch, log capture. Never selected directly — each mode feature pulls it in |
+| `flash-mode-1` | Clone the running disk onto another block device. Part of the default feature set |
 | `test-utils` | Expose `MockBootEnv` for integration tests — never enabled in production builds |
 
 ## 5. Runtime Constraints
@@ -139,12 +161,18 @@ The `BootMode` enum (`src/mode/mod.rs`) has the following implemented variants:
   of the boot continuing in silence.
 
 Data partition resize (feature = `resize-data`) is handled as an init setup step in
-`src/init_setup/resize_data.rs`, not as a separate `BootMode` variant. It runs before
-`BootMode::detect()` and handles both the live-bootloader (guard check) and degraded-boot
-(no guard, resize runs every boot) cases.
+`src/init_setup/resize_data.rs`, not as a separate `BootMode` variant. It runs after
+`BootMode::detect()`, is skipped for a flash mode, and handles both the live-bootloader
+(guard check) and degraded-boot (no guard, resize runs every boot) cases.
 
-The following variants are planned:
-- `FlashMode(FlashKind)` — enables in-field OS flashing
+`Flash(FlashConfig)` is implemented for mode 1 (feature `flash-mode`, pulled in by
+`flash-mode-1`): it clones the running disk onto another block device and powers off
+on success. A queued factory reset together with a flash mode is refused as an error;
+both triggers are cleared before the refusal is raised.
+
+The following are planned:
+- Flash modes 2 and 3 — network push and HTTP/HTTPS download onto the running disk,
+  sharing `Flash(FlashConfig)` with mode 1
 
 When implementing a new variant:
 1. Add the variant to `BootMode` and update `BootMode::detect()` to read the relevant bootloader env key. If the key is absent or the bootloader is unavailable, `detect()` must return `Normal` (degraded boot). A key that is present but unusable belongs to its own mode, which clears it and reports the failure — see `FactoryResetTrigger`.

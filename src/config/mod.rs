@@ -14,6 +14,34 @@ pub mod build {
     include!(concat!(env!("OUT_DIR"), "/build_config.rs"));
 }
 
+/// A build-time constant from `build`, as errors name it.
+#[cfg(feature = "flash-mode")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildConstant {
+    DataSize,
+    BootloaderStart,
+    UbootEnv1Start,
+    #[cfg(feature = "uboot")]
+    UbootEnv2Start,
+    #[cfg(feature = "uboot")]
+    UbootEnvSize,
+}
+
+#[cfg(feature = "flash-mode")]
+impl std::fmt::Display for BuildConstant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::DataSize => "DATA_SIZE",
+            Self::BootloaderStart => "BOOTLOADER_START",
+            Self::UbootEnv1Start => "UBOOT_ENV1_START",
+            #[cfg(feature = "uboot")]
+            Self::UbootEnv2Start => "UBOOT_ENV2_START",
+            #[cfg(feature = "uboot")]
+            Self::UbootEnvSize => "UBOOT_ENV_SIZE",
+        })
+    }
+}
+
 /// Parsed kernel command line parameters.
 ///
 /// Handles both `key=value` pairs and bare flags (e.g. `quiet`, `ro`).

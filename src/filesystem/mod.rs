@@ -4,11 +4,14 @@
 //! - Mounting and unmounting filesystems
 //! - Running fsck before mounting
 //! - Overlayfs setup for etc and home
+//! - Reformatting a partition as ext4
 
 mod boot_sequence;
 mod fsck;
 mod mount;
 mod overlayfs;
+#[cfg(any(feature = "factory-reset", feature = "flash-mode-1"))]
+mod reformat;
 #[cfg(feature = "resize-data")]
 pub mod resize_data;
 
@@ -32,6 +35,8 @@ pub use self::overlayfs::{
 };
 #[cfg(feature = "factory-reset")]
 pub(crate) use self::overlayfs::{paths, setup_data_overlay_tracked, setup_etc_overlay_tracked};
+#[cfg(any(feature = "factory-reset", feature = "flash-mode-1"))]
+pub(crate) use self::reformat::reformat_ext4;
 
 use crate::error::FilesystemError;
 

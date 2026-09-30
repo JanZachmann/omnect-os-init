@@ -29,3 +29,6 @@ rewrite-initramfs-plan.md
 .worktrees/
 
 docs/superpowers/reviews/
+
+# subagent-driven-development scratch directory
+.superpowers/

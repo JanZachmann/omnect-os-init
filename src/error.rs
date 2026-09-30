@@ -44,6 +44,10 @@ pub enum InitramfsError {
     #[error("Factory reset error: {0}")]
     FactoryReset(#[from] FactoryResetError),
 
+    #[cfg(feature = "flash-mode")]
+    #[error("Flash mode error: {0}")]
+    Flash(#[from] FlashError),
+
     #[error("extra bootargs updated; reboot required to apply")]
     ExtraBootArgsUpdated,
 
@@ -94,6 +98,8 @@ impl InitramfsError {
                 | FactoryResetError::MountError(_)
                 | FactoryResetError::Io(_),
             ) => RecoveryClass::ContinueDegraded,
+            #[cfg(feature = "flash-mode")]
+            Self::Flash(_) => RecoveryClass::Fatal,
             Self::ExtraBootArgsUpdated => RecoveryClass::RebootToApply,
             Self::ConflictingUpdateFlags => RecoveryClass::Fatal,
             Self::Io(_) => RecoveryClass::Fatal,
@@ -281,6 +287,101 @@ pub enum FactoryResetError {
 
     #[error("Mount error: {0}")]
     MountError(String),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[cfg(feature = "flash-mode")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionTableOperation {
+    Dump,
+    Apply,
+    Lookup,
+}
+
+#[cfg(feature = "flash-mode")]
+impl std::fmt::Display for PartitionTableOperation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Dump => "dump",
+            Self::Apply => "apply",
+            Self::Lookup => "lookup",
+        })
+    }
+}
+
+/// Errors during a flash mode.
+///
+/// Every variant is fatal: a flash either completes or leaves the operator to
+/// power-cycle.
+#[cfg(feature = "flash-mode")]
+#[derive(Error, Debug)]
+pub enum FlashError {
+    #[error("Missing build-time constant: {0}")]
+    MissingBuildConstant(crate::config::BuildConstant),
+
+    #[error("Build-time constant {name} is unusable: {reason}")]
+    InvalidBuildConstant {
+        name: crate::config::BuildConstant,
+        reason: String,
+    },
+
+    #[error("Destination device {} is unusable: {reason}", device.display())]
+    InvalidDestination { device: PathBuf, reason: String },
+
+    #[error("Boot-env value for '{}' is unusable: {reason}", key.as_str())]
+    InvalidEnvValue {
+        key: crate::bootloader::BootEnvKey,
+        reason: String,
+    },
+
+    #[error(
+        "a factory reset is queued together with a flash mode; both triggers were cleared, \
+         re-queue the one you meant"
+    )]
+    ConflictingTriggers,
+
+    #[error("Destination device {} did not appear within {}s", device.display(), timeout.as_secs())]
+    DestinationTimeout {
+        device: PathBuf,
+        timeout: std::time::Duration,
+    },
+
+    #[error("Partition table {operation} failed for {}: {reason}", device.display())]
+    PartitionTable {
+        device: PathBuf,
+        operation: PartitionTableOperation,
+        reason: String,
+    },
+
+    #[error("Malformed sfdisk dump of {}: {reason}", device.display())]
+    MalformedDump { device: PathBuf, reason: String },
+
+    #[error("Copy from {} to {} failed: {reason}", src.display(), dst.display())]
+    CopyFailed {
+        src: PathBuf,
+        dst: PathBuf,
+        reason: String,
+    },
+
+    #[error("Failed to assign a new UUID to {}: {reason}", device.display())]
+    UuidFailed { device: PathBuf, reason: String },
+
+    #[error("Failed to write the bootloader environment to {}: {reason}", device.display())]
+    BootEnvWriteFailed { device: PathBuf, reason: String },
+
+    #[error("EFI handling failed: {0}")]
+    EfiFailed(String),
+
+    #[error("{}: {source}", path.display())]
+    PathIo {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    #[error("Filesystem error: {0}")]
+    Filesystem(#[from] FilesystemError),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -484,5 +585,14 @@ mod recovery_class_tests {
     fn factory_reset_mount_error_is_continue_degraded() {
         let err = InitramfsError::FactoryReset(FactoryResetError::MountError("no data".into()));
         assert_eq!(err.recovery_class(), RecoveryClass::ContinueDegraded);
+    }
+
+    #[cfg(feature = "flash-mode")]
+    #[test]
+    fn flash_errors_are_fatal() {
+        let err = InitramfsError::Flash(FlashError::MissingBuildConstant(
+            crate::config::BuildConstant::DataSize,
+        ));
+        assert_eq!(err.recovery_class(), RecoveryClass::Fatal);
     }
 }

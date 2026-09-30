@@ -20,10 +20,11 @@ Implemented functionality:
 - **fs-links**: Symlink creation from `etc/omnect/fs-link.json` and `etc/omnect/fs-link.d/`
 - **switch\_root**: MS_MOVE + chroot + exec systemd (`pivot_root(2)` is not used; ramfs does not support it)
 - **Factory reset (modes 1-3)**: Selective-preserve backup → wipe `data`/`etc` (modes 2 and 3 only) → reformat → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
+- **Flash mode 1**: Clones the running disk onto another block device given by the `flash-mode-devpath` bootloader env key, triggered by `flash-mode`; powers off on success so the clone can be moved to its own device (feature `flash-mode-1`, part of the default feature set)
 
 Not yet implemented (planned):
 
-- Flash modes (disk clone, network, HTTP/HTTPS)
+- Flash modes 2 and 3 (network push, HTTP/HTTPS download)
 
 ## Startup Flow
 
@@ -39,7 +40,7 @@ flowchart TD
     EARLY_ERR -->|release| HALT1(["🔴 eprintln loop — halt"])
     EARLY_ERR -->|debug| ESHELL(["🐚 emergency sh — respawn"])
 
-    LOGGER -->|OK| CONFIG["Config::load()\n/proc/cmdline · os-release"]
+    LOGGER -->|OK| CONFIG["Config::load()\n/proc/cmdline"]
     LOGGER -->|Fail| FEB
 
     CONFIG -->|OK| RDEV["detect_root_device()"]
@@ -62,16 +63,22 @@ flowchart TD
     APPLY -->|Fatal| FEB
     APPLY -->|"OK\nDegraded: ods.degraded_boot=true"| FBDETECT["compute_first_boot()\nset_update_pending()"]
 
-    FBDETECT --> ISETUP["init_setup::run()\nextra_bootargs sync — always\nresize-data preflight if feature = resize-data"]
+    FBDETECT --> BMODE{"BootMode::detect()"}
+    BMODE -->|"Fatal: flash and factory reset\nboth queued (both cleared)"| FEB
+    BMODE -->|"Flash(config)\nfeature = flash-mode"| FLASH
+    BMODE -->|"Normal / FactoryReset"| ISETUP["init_setup::run()\nextra_bootargs sync — always\nresize-data preflight if feature = resize-data"]
+
+    FLASH["flash::run()\nclear flash triggers → clone (mode 1)\nrun log → source data partition"]
+    FLASH -->|OK| POWEROFF(["⏻ poweroff"])
+    FLASH -->|Fatal| FEB
+
     ISETUP -->|"FsckRequiresReboot\nExtraBootArgsUpdated"| FEB
-    ISETUP -->|"ResizeData error\nContinueDegraded — warn"| BMODE{"BootMode::detect()"}
+    ISETUP -->|"ResizeData error\nContinueDegraded — warn"| DISPATCH{"dispatch mode"}
     ISETUP -->|"Fatal (non-resize)"| FEB
-    ISETUP -->|OK| BMODE
+    ISETUP -->|OK| DISPATCH
 
-    BMODE -->|Fatal| FEB
-
-    BMODE -->|Normal| MREM["mount_remaining_partitions()\ndata · factory · cert + fsck\npersist_fsck_results — always"]
-    BMODE -->|"FactoryReset(trigger)\nfeature = factory-reset"| FCLEAR
+    DISPATCH -->|Normal| MREM["mount_remaining_partitions()\ndata · factory · cert + fsck\npersist_fsck_results — always"]
+    DISPATCH -->|"FactoryReset(trigger)\nfeature = factory-reset"| FCLEAR
 
     subgraph FRESET["factory_reset::run() — always ContinueDegraded"]
         direction TB
@@ -114,7 +121,7 @@ flowchart TD
     classDef halt fill:#7a1a1a,color:#fff,stroke:#4d0d0d
     classDef shell fill:#7a4a1a,color:#fff,stroke:#4d2d0d
 
-    class SUCCESS success
+    class SUCCESS,POWEROFF success
     class REBOOT reboot
     class HALT1,HALT2 halt
     class ESHELL,DSHELL shell
@@ -125,6 +132,7 @@ flowchart TD
 | Symbol | Outcome | Trigger |
 |--------|---------|---------|
 | ✅ | `switch_root` — systemd takes over | Normal completion |
+| ⏻ | Power off | Flash mode 1 finished; the clone can be moved to its own device |
 | 🔁 | Reboot | `FsckRequiresReboot` (unconditional); or any fatal error while `omnect_validate_update` is set — triggers bootloader OTA rollback |
 | 🔴 | Halt (kmsg loop, infinite) | Fatal error · release image · no OTA in flight |
 | 🐚 | Debug shell (bash → sh fallback, respawning) | Fatal error · debug image · no OTA in flight |
@@ -227,7 +235,7 @@ single failure is `Warning`, two failures are `Error` — an early sign of faili
 # A bootloader and a partition table are both mandatory; build.rs rejects
 # any other combination
 cargo build --features grub,gpt      # x86-64 EFI targets
-cargo build --features uboot,dos     # ARM targets
+cargo build --features uboot,gpt     # ARM targets (dos applies too)
 
 # Release build (optimized for size); U-Boot targets use gpt or dos
 cargo build --release --features grub,gpt
@@ -252,12 +260,43 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 | `resize-data` | Data partition auto-resize on first boot | Implemented |
 | `test-utils` | Expose `MockBootEnv` for integration tests (never enabled in production) | Test only |
 | `factory-reset` | Factory reset support (modes 1-3: selective-preserve backup → wipe → reformat → restore) | Implemented |
-| `flash-mode-1` | Disk cloning | Planned |
+| `flash-mode` | Shared flash layer: trigger detection, dispatch, log capture. Pulled in by a mode feature, never selected on its own | Implemented |
+| `flash-mode-1` | Disk cloning (part of the default feature set) | Implemented |
 | `flash-mode-2` | Network flashing | Planned |
 | `flash-mode-3` | HTTP/HTTPS flashing | Planned |
 
-> **Note:** `grub` and `uboot` are mutually exclusive. Exactly one must be set at build time.
-> The Yocto recipe selects the correct feature via `CARGO_FEATURES` based on `MACHINE_FEATURES`.
+> **Note:** `grub` and `uboot` are mutually exclusive, and so are `gpt` and `dos`.
+> Exactly one of each pair must be set at build time — `build.rs` panics otherwise.
+> The Yocto recipe selects the correct features via `CARGO_FEATURES` based on `MACHINE_FEATURES`.
+> `flash-mode-1` is in the default feature set, so it is already enabled in the
+> `cargo build` examples above; add `--no-default-features` to build without it.
+
+## Runtime Dependencies
+
+The init calls these tools and reads these files from the initramfs image. The
+image recipe has to install them, or the step that needs them fails at run
+time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
+
+| Tool or file | Needed by | Yocto package |
+|--------------|-----------|---------------|
+| `fsck` | `core` | `util-linux-fsck` |
+| `fsck.ext4` backend (`e2fsck`) | `core` | `e2fsprogs-e2fsck` |
+| `fsck.vfat` backend | `core` (boot partition) | `dosfstools` |
+| `blkid` | `core` | `util-linux-blkid` |
+| `gzip`, `gunzip` | `core` (fsck output in the bootloader env) | `busybox` |
+| `base64`, `cp` | `core` | `coreutils` |
+| `sh`, `bash` | emergency and debug shell | `bash` |
+| `grub-editenv` | `grub` | `grub-editenv` |
+| `fw_printenv`, `fw_setenv` | `uboot` | `libubootenv-bin` |
+| `mkfs.ext4`, `tune2fs` | `factory-reset`, `flash-mode-1` | `e2fsprogs-mke2fs`, `e2fsprogs-tune2fs` |
+| `sync` | `factory-reset`, `resize-data` | `busybox` |
+| `sgdisk`, `parted`, `resize2fs` | `resize-data` | `gptfdisk`, `parted`, `e2fsprogs-resize2fs` |
+| `sfdisk` | `flash-mode-1` | `util-linux-sfdisk` |
+| `e2image` | `flash-mode-1` | `e2fsprogs` |
+| `efibootmgr` | `flash-mode-1` on EFI machines | `efibootmgr` |
+| `efivarfs` filesystem | `flash-mode-1` on EFI machines | kernel (`CONFIG_EFIVAR_FS`) |
+| `/etc/omnect/grubenv.in` | `flash-mode-1` with `grub` | `grub-env` |
+| `/etc/omnect/uboot-env.bin` | `flash-mode-1` with `uboot` | image recipe (`add_uboot_env`) |
 
 ## Testing
 
@@ -292,9 +331,22 @@ cargo test --features uboot,dos,release-image,test-utils
 cargo test --features grub,gpt,resize-data,release-image,test-utils
 cargo test --features uboot,gpt,resize-data,release-image,test-utils
 
+# flash-mode-1 is in the default feature set, so every combination above
+# already builds and tests it; the factory-reset ones also cover the refusal
+# of a flash mode queued together with a factory reset.
+
+# Without any flash feature: flash-mode-1 is in the default set, so
+# --no-default-features is required to exclude it; --features alone is
+# additive and cannot turn a default feature off
+cargo test --no-default-features --features grub,gpt,factory-reset,test-utils
+
 # Verbose output
 cargo test --features grub,gpt,test-utils -- --nocapture
 ```
+
+`flash-mode` alone, without `flash-mode-1` (or a future `flash-mode-2`/`-3`),
+is not a supported configuration — no combination above builds it that way,
+and no gate covers it.
 
 Some U-Boot targets are 32-bit ARM, where `usize` is 4 bytes and a cast from
 a 64-bit byte count silently truncates. The test run above is host-only and

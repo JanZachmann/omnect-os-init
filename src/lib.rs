@@ -175,7 +175,19 @@ pub fn run_init() -> Result<()> {
     // on it without threading the value through every return type.
     set_update_pending(update_pending_from_env(&bootloader_env));
 
-    {
+    // Detected once: a second read would log the detection warnings again and
+    // could see a different answer than the one that is dispatched below.
+    let mode = BootMode::detect(bootloader_env.available_mut())?;
+
+    // A flash mode clones the whole disk, so init_setup's work on the running
+    // disk is not carried over, and an extra-bootargs reboot would only delay
+    // the flash.
+    #[cfg(feature = "flash-mode")]
+    let skip_init_setup = matches!(mode, BootMode::Flash(_));
+    #[cfg(not(feature = "flash-mode"))]
+    let skip_init_setup = false;
+
+    if !skip_init_setup {
         let ctx = init_setup::InitSetupCtx {
             layout: &layout,
             boot_env: &mut bootloader_env,
@@ -188,10 +200,12 @@ pub fn run_init() -> Result<()> {
 
     let ctx = BootContext::new(&config, &layout, rootfs, bootloader_env, ods_status);
 
-    match BootMode::detect(ctx.boot_env.available())? {
+    match mode {
         BootMode::Normal => mode::normal::run(ctx),
         #[cfg(feature = "factory-reset")]
         BootMode::FactoryReset(trigger) => mode::factory_reset::run(ctx, trigger),
+        #[cfg(feature = "flash-mode")]
+        BootMode::Flash(flash_config) => mode::flash::run(ctx, flash_config),
     }
 }
 

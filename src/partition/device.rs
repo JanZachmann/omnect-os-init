@@ -10,7 +10,7 @@
 //! - **U-Boot** (`root=/dev/<device>`): full device path set by U-Boot bootargs
 //!   (e.g. `root=/dev/mmcblk1p2`). Base device and separator are derived from the path.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -37,12 +37,7 @@ pub struct RootDevice {
 impl RootDevice {
     /// Constructs the path to a specific partition number.
     pub fn partition_path(&self, partition_num: u32) -> PathBuf {
-        PathBuf::from(format!(
-            "{}{}{}",
-            self.base.display(),
-            self.partition_sep,
-            partition_num
-        ))
+        partition_path(&self.base, self.partition_sep, partition_num)
     }
 }
 
@@ -215,33 +210,47 @@ pub fn device_from_path(path: &str) -> Result<RootDevice> {
     Ok(rd)
 }
 
+/// The separator between a disk name and a partition number. The kernel adds
+/// a `p` when the disk name ends in a digit (`mmcblk2p1`, `nvme0n1p1`).
+fn partition_sep_for_name(disk_name: &str) -> &'static str {
+    if disk_name.ends_with(|c: char| c.is_ascii_digit()) {
+        "p"
+    } else {
+        ""
+    }
+}
+
+#[cfg(feature = "flash-mode-1")]
+pub(crate) fn partition_sep_for(disk: &Path) -> &'static str {
+    disk.file_name()
+        .and_then(|name| name.to_str())
+        .map_or("", partition_sep_for_name)
+}
+
+pub(crate) fn partition_path(disk: &Path, partition_sep: &str, num: u32) -> PathBuf {
+    PathBuf::from(format!("{}{partition_sep}{num}", disk.display()))
+}
+
 /// Splits a partition device name into `(base_name, separator)`.
 ///
 /// Examples: `"sda2"` → `("sda", "")`, `"mmcblk1p2"` → `("mmcblk1", "p")`
 fn split_partition_suffix(name: &str) -> Result<(String, &'static str)> {
-    // NVMe / MMC: partition number follows a "p" separator
-    if (name.contains("nvme") || name.starts_with("mmcblk"))
-        && let Some(pos) = name.rfind('p')
-    {
-        let suffix = &name[pos + 1..];
-        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()) {
-            return Ok((name[..pos].to_string(), "p"));
-        }
+    let stem = name.trim_end_matches(|c: char| c.is_ascii_digit());
+    if stem.is_empty() || stem.len() == name.len() {
+        return Err(PartitionError::DeviceDetection(format!(
+            "could not derive base device from: {}",
+            name
+        )));
     }
 
-    // SATA / virtio: partition number appended directly (e.g. sda2, vda2)
-    let base_end = name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
-    if base_end > 0 && base_end < name.len() {
-        return Ok((name[..base_end].to_string(), ""));
-    }
-
-    Err(PartitionError::DeviceDetection(format!(
-        "could not derive base device from: {}",
-        name
-    )))
+    let base = match stem.strip_suffix('p') {
+        Some(disk) if partition_sep_for_name(disk) == "p" => disk,
+        _ => stem,
+    };
+    Ok((base.to_string(), partition_sep_for_name(base)))
 }
 
-fn wait_for_device(device: &std::path::Path) -> Result<()> {
+fn wait_for_device(device: &Path) -> Result<()> {
     let timeout = Duration::from_secs(DEVICE_WAIT_TIMEOUT_SECS);
     let start = Instant::now();
     loop {
@@ -293,6 +302,14 @@ mod tests {
             split_partition_suffix("vda2").unwrap(),
             ("vda".to_string(), "")
         );
+    }
+
+    #[cfg(feature = "flash-mode-1")]
+    #[test]
+    fn test_partition_sep_for_bare_disks() {
+        assert_eq!(partition_sep_for(Path::new("/dev/sda")), "");
+        assert_eq!(partition_sep_for(Path::new("/dev/mmcblk2")), "p");
+        assert_eq!(partition_sep_for(Path::new("/dev/nvme0n1")), "p");
     }
 
     #[test]
@@ -365,14 +382,28 @@ mod tests {
     }
 
     #[test]
-    fn test_split_partition_suffix_loop_documents_fallback() {
-        // loop devices fall through to the SATA branch because the name doesn't
-        // contain "nvme" or start with "mmcblk". The result is technically wrong
-        // (base="loop0p") but omnect-os does not target loop devices.
+    fn test_split_partition_suffix_loop_and_md() {
         assert_eq!(
             split_partition_suffix("loop0p1").unwrap(),
-            ("loop0p".to_string(), "")
+            ("loop0".to_string(), "p")
         );
+        assert_eq!(
+            split_partition_suffix("md0p1").unwrap(),
+            ("md0".to_string(), "p")
+        );
+    }
+
+    #[test]
+    fn splitting_a_partition_name_inverts_building_it() {
+        for disk in ["sda", "vdb", "mmcblk1", "nvme0n1", "loop0", "md0"] {
+            let sep = partition_sep_for_name(disk);
+            let name = partition_path(Path::new(disk), sep, 7);
+            assert_eq!(
+                split_partition_suffix(name.to_str().unwrap()).unwrap(),
+                (disk.to_string(), sep),
+                "{disk}"
+            );
+        }
     }
 
     #[test]
