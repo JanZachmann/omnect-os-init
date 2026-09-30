@@ -221,9 +221,10 @@ exactly the condition for skipping the second write (§10.7).
 Paths verified against `buildhistory` for a built `omnect-os-initramfs`
 (`raspberrypi4_64`, U-Boot, `flash-mode-2` and `flash-mode-3` both enabled). The
 image is usrmerged — `/bin -> usr/bin` and `/sbin -> usr/sbin` — so the
-`/sbin/...` form the existing code uses resolves correctly.
+`/sbin/...` form the code uses resolves correctly. The table lists the resolved
+path.
 
-| Tool | Path | Package | Modes |
+| Tool | Resolved path | Package | Modes |
 |---|---|---|---|
 | `sfdisk` | `/usr/sbin/sfdisk` | `util-linux-sfdisk` | 1 |
 | `e2image` | `/usr/sbin/e2image` | `e2fsprogs` | 1 |
@@ -360,10 +361,13 @@ Detection follows the legacy order `86-factory-reset`, `87-flash_mode_1`,
 | flag, `flash-mode` `2`, `3`, unknown, blank or unset | Mode 2 |
 | `flash-mode` `2`, no flag | Mode 2 |
 | flag or `flash-mode` `2`, plus a set `factory-reset` | both cleared, then refused |
+| `flash-mode` `2`, no flag, `factory-reset` unreadable | Normal |
+| flag, `factory-reset` unreadable | Mode 2 |
 | flag, boot env unavailable or `flash-mode` unreadable | Mode 2 |
 
-The last row follows legacy, which checks the flag before it reads any
-environment; the conflict check is skipped there because it cannot be made. The
+The flag rows with an unreadable environment follow legacy, which checks the
+flag before it reads any environment; the conflict check is skipped there
+because it cannot be made. The
 flag is checked at run time on purpose: one `omnect-os-init` package goes into
 every initramfs, and the flag is added by a separate image recipe.
 
@@ -569,10 +573,15 @@ flag file shipped by `omnect-os-initramfs-test`. Both are kept.
    - **default** — verify pass first:
      `bmaptool copy --bmap wic.bmap wic.xz /home/omnect/wic`, which consumes the
      FIFO and materializes the mapped, decompressed image as a file in the
-     initramfs tmpfs. Then zero the first `BOOT_START + BOOT_SIZE` KB of the
+     initramfs root. Then zero the first `BOOT_START + BOOT_SIZE` KB of the
      disk, then `bmaptool copy --bmap wic.bmap /home/omnect/wic
      /dev/omnect/rootblk`. The RAM cost of the verify pass is the size of the
-     mapped image; that cost is why the direct path exists.
+     mapped image; that cost is why the direct path exists. The kernel makes
+     the initramfs root a tmpfs when `CONFIG_TMPFS` is set and the command
+     line has no `root=` (GRUB), and a ramfs otherwise (U-Boot passes
+     `root=`). ramfs has no size limit, so an image too big for RAM fails by
+     running out of memory; tmpfs stops at its size limit, half the RAM by
+     default, with `ENOSPC`.
    - **`flash-mode-2-direct`** — zero the head, then
      `bmaptool copy --bmap wic.bmap wic.xz /dev/omnect/rootblk` straight from
      the FIFO. No verification.

@@ -45,14 +45,14 @@ src/
 │   └── flash/               # Flash modes (feature = flash-mode)
 │       ├── mod.rs           # Dispatch, terminal action, log capture and persistence
 │       ├── config.rs        # Environment read, validation -> FlashConfig
-│       ├── efi.rs           # efibootmgr handling
+│       ├── efi.rs           # efibootmgr handling (feature = grub)
 │       ├── net.rs           # eth0 up, dhcpcd, dropbear (feature = flash-mode-2)
 │       ├── scp.rs           # Mode 2 orchestration: fifo for the scp upload (feature = flash-mode-2)
 │       ├── bmap.rs          # bmaptool copy invocation (feature = flash-mode-2)
 │       ├── clone.rs         # Mode 1 orchestration (feature = flash-mode-1)
 │       ├── sfdisk.rs        # Partition-table dump parsing and rewriting (feature = flash-mode-1)
-│       ├── rawio.rs         # In-process replacement for every `dd` call (feature = flash-mode-1)
-│       └── unmount.rs       # rootfs unmount (feature = flash-mode-1)
+│       ├── rawio.rs         # In-process replacement for every `dd` call (feature = flash-mode)
+│       └── unmount.rs       # rootfs and target-disk unmount (feature = flash-mode)
 ├── partition/
 │   ├── mod.rs               # Public API
 │   ├── device.rs            # Root device detection (GRUB: blkid/fsuuid, U-Boot: root=)

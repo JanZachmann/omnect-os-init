@@ -69,8 +69,8 @@ flowchart TD
     BMODE -->|"Flash(config)\nfeature = flash-mode"| FLASH
     BMODE -->|"Normal / FactoryReset"| ISETUP["init_setup::run()\nextra_bootargs sync — always\nresize-data preflight if feature = resize-data"]
 
-    FLASH["flash::run()\nclear flash triggers → clone (mode 1)\nrun log → source data partition"]
-    FLASH -->|OK| POWEROFF(["⏻ poweroff"])
+    FLASH["flash::run()\nclear flash triggers → clone (mode 1) or scp flash (mode 2)\nrun log → data partition"]
+    FLASH -->|OK| POWEROFF(["⏻ poweroff (mode 1) / reboot (mode 2)"])
     FLASH -->|Fatal| FEB
 
     ISETUP -->|"FsckRequiresReboot\nExtraBootArgsUpdated"| FEB
