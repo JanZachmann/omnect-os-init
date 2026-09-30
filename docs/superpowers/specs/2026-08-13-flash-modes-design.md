@@ -138,21 +138,19 @@ src/mode/flash/
   efi.rs        efibootmgr handling                                      flash-mode
   clone.rs      mode 1 orchestration                                     flash-mode-1
   sfdisk.rs     partition-table dump parsing and rewriting      (pure)   flash-mode-1
-  rawio.rs      in-process replacement for every `dd` call               flash-mode-1
-  unmount.rs    rootfs unmount                                           flash-mode-1
+  rawio.rs      in-process replacement for every `dd` call               flash-mode, per item
+  unmount.rs    rootfs unmount, /proc/mounts sweep                       flash-mode
   net.rs        interface up, dhcpcd, dropbear                           flash-mode-2/3
   bmap.rs       bmaptool wrapper                                         flash-mode-2/3
   scp.rs        mode 2 orchestration                                     flash-mode-2
   url.rs        mode 3 orchestration                                     flash-mode-3
 ```
 
-The right column is the gating feature (§3.6). `rawio.rs` and `unmount.rs` were
-not anticipated in the original design; both hold logic modes 2 and 3 are
-expected to reuse (the byte-offset copy, and the rootfs unmount that §5.1
-extends with a `/proc/mounts` sweep), but each is gated on `flash-mode-1` for
-now, since mode 1 is the only mode implemented so far. The sweep is added with
-mode 2, its first caller. Widening the gate is expected once mode 2 or
-3 lands.
+The right column is the gating feature (§3.6). In `rawio.rs` each item is gated
+on the modes that use it: `copy_range` on `flash-mode-1`, `zero_range` on
+`flash-mode-2`, the shared constants on `flash-mode`. The device-number helpers
+that mode 1 uses to refuse a destination are shared with the §5.1 sweep, so they
+move out of `clone.rs` into a module gated on `flash-mode`.
 
 External tools are invoked through `std::process::Command` with named `const`
 paths, as `filesystem/reformat.rs` already does. No new command-runner
@@ -193,21 +191,26 @@ also required whenever `BOOTLOADER_START` is set, on either bootloader, since
 the bootloader-area copy length is `UBOOT_ENV1_START - BOOTLOADER_START`
 (§4.1 step 2, step 8).
 
-Mode 2 adds two through the same mechanism:
+Mode 2 adds three through the same mechanism:
 
-| Yocto variable | Constant | Note |
+| Yocto variable | Constant | Unit |
 |---|---|---|
-| `OMNECT_PART_OFFSET_BOOT` + `OMNECT_PART_SIZE_BOOT` | `ZERO_HEAD_SIZE` | `Option<u64>`, sum in KB |
-| `OMNECT_FLASH_MODE_2_DIRECT_FLASHING` | `DIRECT_FLASHING` | `bool`, `1` → `true`, anything else → `false` |
+| `OMNECT_PART_OFFSET_BOOT` | `BOOT_START` | KB |
+| `OMNECT_PART_SIZE_BOOT` | `BOOT_SIZE` | KB |
+| `OMNECT_USER_ID` | `OMNECT_USER_ID` | uid and gid |
 
-`ZERO_HEAD_SIZE` is `Option<u64>` and absent on builds that do not set it, exactly
-like the existing five; mode 2 treats it as a missing required constant.
-`DIRECT_FLASHING` is a plain `bool` defaulting to `false` when the variable is
-absent or is not `1`, matching the legacy
+All three are `Option<u64>`, like the existing five; mode 2 fails with a missing
+build constant before it touches anything when one is absent. The zeroed head is
+`BOOT_START + BOOT_SIZE` KB, the value legacy computes with `bc` into
+`DD_ZERO_SIZE`; mode 2 sums it with `checked_add` in a tested function.
+`OMNECT_USER_ID` is the fixed id `omnect_user.bbclass` gives both the `omnect`
+user and its group, so the FIFO owner is known at build time and `/etc/passwd`
+is not read.
+
+`OMNECT_FLASH_MODE_2_DIRECT_FLASHING` is a switch, not a value, so it becomes
+the cargo feature `flash-mode-2-direct` (§3.6). The recipe enables it when the
+variable is `1`, matching the legacy
 `oe.utils.conditional('OMNECT_FLASH_MODE_2_DIRECT_FLASHING', '1', 'true', 'false')`.
-The legacy recipe computes the sum with `bc` because bitbake does not evaluate
-shell arithmetic; `build.rs` sums the two values itself and needs only the two
-Yocto variables.
 
 `UBOOT_ENV2_START` stays `Option<u64>` rather than required: it is set per
 machine and absent where no second environment bank is reserved, which is
@@ -231,6 +234,8 @@ image is usrmerged — `/bin -> usr/bin` and `/sbin -> usr/sbin` — so the
 | `dhcpcd` | `/usr/sbin/dhcpcd` | `dhcpcd` | 2, 3 |
 | `dropbear` | `/usr/sbin/dropbear` | `dropbear` | 2 |
 | `efibootmgr` | `/usr/sbin/efibootmgr` | `efibootmgr` | 1, 2, 3, EFI machines only |
+| `ip` | `/usr/sbin/ip` | busybox applet | 2, 3 |
+| `xz` | `/usr/bin/xz` | `xz`, run by `bmaptool` | 2, 3 |
 
 `efibootmgr` is absent from the verified image, which has no `efi` in
 `MACHINE_FEATURES` — consistent with the recipe gating and with §6 applying only
@@ -246,16 +251,18 @@ dependency weight an initramfs can carry: `sfdisk` (partition tables),
 `e2image`, `mkfs.ext4` and `tune2fs` (ext4), `bmaptool` (block maps),
 `efibootmgr` (EFI variables), `curl`, `dhcpcd` and `dropbear`.
 
-Six operations the legacy scripts shell out for are done in-process instead.
-Four use `nix`, which is already a dependency with the required features
-enabled; `uuidgen` needs the new `uuid` crate; `dd` needs nothing:
+Seven operations the legacy scripts shell out for are done in-process instead.
+Five use `nix`, which is already a dependency; `getifaddrs` needs its `net`
+feature, the others are enabled already. `uuidgen` needs the new `uuid` crate;
+`dd` needs nothing:
 
 | Legacy | In-process |
 |---|---|
 | `uuidgen` | 16 bytes from `/dev/urandom` into `uuid::Builder::from_random_bytes` |
 | `dd` | `std::io` read/write at an offset, with `COPY_BUFFER_SIZE` as the buffer |
 | `mkfifo` | `nix::unistd::mkfifo` |
-| `chown omnect:omnect` | `nix::unistd::chown`, with the uid/gid looked up via the `user` feature |
+| `chown omnect:omnect` | `nix::unistd::chown` to `OMNECT_USER_ID` (§2.7) |
+| `ip addr show` | `nix::ifaddrs::getifaddrs` |
 | `sync` | `nix::unistd::sync` |
 | `reboot -f` / `poweroff -f` | `nix::sys::reboot::reboot` with `RB_AUTOBOOT` / `RB_POWER_OFF` |
 
@@ -273,11 +280,10 @@ reachable.
 
 ### 3.0 `build.rs`
 
-Two more `rerun-if-env-changed` lines and two more generated constants for mode 2
-(§2.7): `ZERO_HEAD_SIZE`, summed from `OMNECT_PART_OFFSET_BOOT` and
-`OMNECT_PART_SIZE_BOOT`, and `DIRECT_FLASHING`. The existing `read_u64_env`
-helper covers the first; the second needs a small boolean reader. The
-doc-comment table at the top of `build.rs` gains both rows.
+Three more `rerun-if-env-changed` lines and three more generated constants for
+mode 2 (§2.7): `BOOT_START`, `BOOT_SIZE` and `OMNECT_USER_ID`, all read with the
+existing `read_u64_env`. The doc-comment table at the top of `build.rs` gains the
+three rows.
 
 ### 3.1 `src/bootloader/mod.rs`
 
@@ -345,14 +351,30 @@ inside the initramfs and cannot be cleared. It does not reopen the problem:
 clearing `factory-reset` is enough to remove the conflict, and the next boot
 runs mode 2 alone.
 
+Detection follows the legacy order `86-factory-reset`, `87-flash_mode_1`,
+`87-flash_mode_2` (flag file first, then the key), `87-flash_mode_3`:
+
+| State | Result |
+|---|---|
+| `flash-mode` `1`, with or without the flag | Mode 1 |
+| flag, `flash-mode` `2`, `3`, unknown, blank or unset | Mode 2 |
+| `flash-mode` `2`, no flag | Mode 2 |
+| flag or `flash-mode` `2`, plus a set `factory-reset` | both cleared, then refused |
+| flag, boot env unavailable or `flash-mode` unreadable | Mode 2 |
+
+The last row follows legacy, which checks the flag before it reads any
+environment; the conflict check is skipped there because it cannot be made. The
+flag is checked at run time on purpose: one `omnect-os-init` package goes into
+every initramfs, and the flag is added by a separate image recipe.
+
 The refusal reaches kmsg only. A flash boot never writes the ODS status file:
 `run_init` returns the error and the fatal-error path just logs it, so there is
 no status file for the refusal to appear in.
 
 Note also that the queued `factory-reset` key does not survive modes 2 and 3. On
 U-Boot the environment lives at the `UBOOT_ENV1_START`/`UBOOT_ENV2_START` byte
-offsets, and mode 2's own zeroing of the first `ZERO_HEAD_SIZE` KB reaches through
-that region; on GRUB, `grubenv` sits on the boot partition, which the flash
+offsets, and mode 2's own zeroing of the first `BOOT_START + BOOT_SIZE` KB
+reaches through that region; on GRUB, `grubenv` sits on the boot partition, which the flash
 overwrites. The reset request is destroyed, not deferred.
 
 ### 3.4 `src/lib.rs`
@@ -379,6 +401,7 @@ in images built without the `factory-reset` feature.
 flash-mode = ["core"]                    # shared flash layer; not selected directly
 flash-mode-1 = ["flash-mode"]            # disk cloning; part of the default feature set
 flash-mode-2 = ["flash-mode"]            # scp push over the network
+flash-mode-2-direct = ["flash-mode-2"]   # mode 2 without the verify pass
 flash-mode-3 = ["flash-mode"]            # URL download
 ```
 
@@ -500,9 +523,15 @@ target disk, by sweeping `/proc/mounts`.
 
 ### 5.2 Network setup (`net.rs`)
 
-Restricted to `eth0`, as in legacy. Bring the interface up, start `dhcpcd`, wait
-for an IPv4 address — all waits bounded (§7). Mode 2 additionally mounts
-`devpts` and starts `dropbear -R`, generating the host key at runtime.
+Restricted to `eth0`, as in legacy. Retry `ip link set eth0 up` until it
+succeeds — the interface may be probed late, e.g. a USB NIC — then start
+`dhcpcd eth0` and wait for an IPv4 address. Both waits are bounded (§7). Mode 2
+additionally creates and mounts `devpts` at `/dev/pts`, creates `/etc/dropbear`
+and starts `dropbear -R`, generating the host key at runtime.
+
+Child processes get an explicit `PATH`, as legacy exports it before `bmaptool`:
+PID 1 has no login environment, `bmaptool` runs `xz`, and `dhcpcd` runs hook
+scripts.
 
 ### 5.3 Mode 3 — pull from URL
 
@@ -529,19 +558,22 @@ flag file shipped by `omnect-os-initramfs-test`. Both are kept.
 2. Unmount (§5.1), network up plus `dropbear` (§5.2).
 3. Create the image FIFO at `/home/omnect/wic.xz`, owned by the `omnect` user, so
    `scp` streams directly into `bmaptool`.
-4. Log the two commands the operator must run, with the acquired IP address:
-   `scp <bmap-file> omnect@<ip>:wic.bmap` and
-   `scp <wic-image> omnect@<ip>:wic.xz`.
+4. Log the first command the operator must run, with the acquired IP address:
+   `scp <bmap-file> omnect@<ip>:wic.bmap`.
 5. Wait for `/home/omnect/wic.bmap` to appear, unbounded — this waits for a
-   person (§7).
-6. Flash, according to `DIRECT_FLASHING`:
-   - **`false`** — verify pass first: `bmaptool copy --bmap wic.bmap wic.xz wic`,
-     which consumes the FIFO and materializes the mapped, decompressed image as a
-     file in the initramfs tmpfs. Then zero the first `ZERO_HEAD_SIZE` KB of the
-     disk, then flash from the materialized file. The RAM cost of the verify pass
-     is the size of the mapped image; that cost is why the direct path exists.
-   - **`true`** — zero the first `ZERO_HEAD_SIZE` KB, then `bmaptool` straight from
-     the FIFO onto the disk. No verification.
+   person (§7). Then log the second command, `scp <wic-image> omnect@<ip>:wic.xz`,
+   in the same order as legacy.
+6. Flash. Every `bmaptool` call uses `--bmap /home/omnect/wic.bmap`:
+   - **default** — verify pass first:
+     `bmaptool copy --bmap wic.bmap wic.xz /home/omnect/wic`, which consumes the
+     FIFO and materializes the mapped, decompressed image as a file in the
+     initramfs tmpfs. Then zero the first `BOOT_START + BOOT_SIZE` KB of the
+     disk, then `bmaptool copy --bmap wic.bmap /home/omnect/wic
+     /dev/omnect/rootblk`. The RAM cost of the verify pass is the size of the
+     mapped image; that cost is why the direct path exists.
+   - **`flash-mode-2-direct`** — zero the head, then
+     `bmaptool copy --bmap wic.bmap wic.xz /dev/omnect/rootblk` straight from
+     the FIFO. No verification.
 7. EFI handling (§6), `sync`, log (§8), `reboot`.
 
 Once `bmaptool` starts it blocks reading the FIFO until the operator's `scp`
@@ -677,7 +709,9 @@ runs. Persistence depends on whether a safe target exists:
   and mounting anything on it is unsafe. Persistence is therefore best-effort
   onto the freshly written data partition after a **successful** flash only. On
   failure these modes leave nothing on disk, the same as legacy, and diagnosis
-  stays on kmsg and the console.
+  stays on kmsg and the console. The file is `flash-mode-2.log` for mode 2. The
+  mount uses the kernel's partition view from before the flash, the same as the
+  EFI dump mount (§6 step 5), so no partition table re-read is added.
 
 See §10.5.
 
@@ -780,8 +814,8 @@ Every item below is decided, and the rest of the spec follows that decision.
 
 ### 10.1 Keep `non_bmap_dd_handling`?
 
-Zeroing the first `ZERO_HEAD_SIZE` KB of the disk before flashing in mode 2. The
-legacy comment records post-flash boot failures observed on both GRUB and U-Boot,
+Zeroing the first `BOOT_START + BOOT_SIZE` KB of the disk before flashing in
+mode 2. The legacy comment records post-flash boot failures observed on both GRUB and U-Boot,
 but the root cause was never established, so this may be masking a `bmaptool` or
 partition-alignment problem rather than fixing one.
 
@@ -887,7 +921,10 @@ only smoke-tested. Real end-to-end coverage stays in Concourse CI on hardware.
 | `curl` options selected from `MACHINE_FEATURES` `rtc` | unit | `src/mode/flash/url.rs` |
 | scp instruction text includes the acquired IP | unit | `src/mode/flash/scp.rs` |
 | Detection: both triggers set → both cleared, then refused | unit | `src/mode/mod.rs` |
-| Detection: mode 2 flag-file trigger, present and absent | integration | `tests/flash_modes.rs` |
+| Detection: every row of the §3.3 trigger table | integration | `tests/flash_modes.rs` |
+| `/proc/mounts` sweep: device numbers, deepest first | unit | `src/mode/flash/unmount.rs` |
+| Mode 2 step order, default and `flash-mode-2-direct` | unit | `src/mode/flash/scp.rs` |
+| Mode 2 log written on success only | unit | `src/mode/flash/mod.rs` |
 | Clear-first ordering: a failing mode still leaves its triggers cleared | unit | `src/mode/flash/mod.rs` |
 | Destination refusal by device number, parent disk from a fake sysfs tree | unit | `src/mode/flash/clone.rs` |
 | Boot-env read failure falls back to Normal boot | integration | `tests/flash_modes.rs` |
@@ -903,7 +940,11 @@ Implemented separately, listed here so nothing is lost:
   environment (`omnect-os-init.inc`). Without them every constant is `None`,
   and mode 1 fails with a missing build constant before it writes anything;
 - for mode 2, pass `OMNECT_PART_OFFSET_BOOT`, `OMNECT_PART_SIZE_BOOT` and
-  `OMNECT_FLASH_MODE_2_DIRECT_FLASHING` the same way;
+  `OMNECT_USER_ID` the same way, and enable the cargo feature
+  `flash-mode-2-direct` when `OMNECT_FLASH_MODE_2_DIRECT_FLASHING` is `1`;
+- define `OMNECT_USER_ID ?= "15581"` in `omnect_user.bbclass` and use it for
+  both `groupadd -g` and `useradd -u`, so the recipe and the init share one
+  value;
 - map `DISTRO_FEATURES` `flash-mode-2` and `flash-mode-3` onto the corresponding
   Cargo features;
 - gate mode 1 the same way: map `DISTRO_FEATURES` `flash-mode-1` onto the Cargo
