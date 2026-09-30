@@ -38,6 +38,7 @@ pub(crate) trait EfiOps {
     fn write_entry_dump(&mut self, boot_partition: &Path, dump: &str) -> Result<(), FlashError>;
 }
 
+#[derive(Default)]
 pub(crate) struct RealEfiOps;
 
 impl EfiOps for RealEfiOps {

@@ -162,21 +162,10 @@ trait ScpOps {
     fn sync(&mut self);
 }
 
-struct RealScpOps;
-
-#[cfg(feature = "grub")]
-impl efi::EfiOps for RealScpOps {
-    fn mount_efivarfs(&mut self) -> Result<(), FlashError> {
-        efi::RealEfiOps.mount_efivarfs()
-    }
-
-    fn efibootmgr(&mut self, args: &[String]) -> Result<String, FlashError> {
-        efi::RealEfiOps.efibootmgr(args)
-    }
-
-    fn write_entry_dump(&mut self, boot_partition: &Path, dump: &str) -> Result<(), FlashError> {
-        efi::RealEfiOps.write_entry_dump(boot_partition, dump)
-    }
+#[derive(Default)]
+struct RealScpOps {
+    #[cfg(feature = "grub")]
+    efi: efi::RealEfiOps,
 }
 
 impl ScpOps for RealScpOps {
@@ -214,7 +203,7 @@ impl ScpOps for RealScpOps {
 
     #[cfg(feature = "grub")]
     fn efi(&mut self) -> &mut dyn efi::EfiOps {
-        self
+        &mut self.efi
     }
 
     fn sync(&mut self) {
@@ -224,7 +213,11 @@ impl ScpOps for RealScpOps {
 
 /// Flash the running disk with the image the operator pushes in.
 pub(crate) fn run_scp(ctx: &ScpCtx<'_>) -> Result<(), FlashError> {
-    scp_with(ctx, &BuildConstants::from_build(), &mut RealScpOps)
+    scp_with(
+        ctx,
+        &BuildConstants::from_build(),
+        &mut RealScpOps::default(),
+    )
 }
 
 fn scp_with(
