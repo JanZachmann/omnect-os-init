@@ -1,12 +1,17 @@
 //! Unmounting filesystems before a disk is imaged.
 
+#[cfg(feature = "flash-mode-2")]
 use std::cmp::Reverse;
+#[cfg(feature = "flash-mode-2")]
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "flash-mode-2")]
+use std::path::PathBuf;
 
 use crate::bootloader::sync_filesystems;
 use crate::error::FlashError;
 use crate::filesystem::{is_path_mounted, mount_points, umount};
+#[cfg(feature = "flash-mode-2")]
 use crate::partition::device::{SYS_DEV_BLOCK, block_devnum, whole_disk_devnum};
 
 /// Unmount the rootfs and its boot partition, syncing first.
@@ -22,9 +27,11 @@ pub(crate) fn unmount_rootfs(rootfs: &Path) -> Result<(), FlashError> {
     Ok(())
 }
 
+#[cfg(feature = "flash-mode-2")]
 const PROC_MOUNTS: &str = "/proc/mounts";
 
 /// `/proc/mounts` writes these bytes as a backslash and three octal digits.
+#[cfg(feature = "flash-mode-2")]
 const MOUNTS_ESCAPES: [(&str, char); 4] = [
     ("\\040", ' '),
     ("\\011", '\t'),
@@ -33,8 +40,7 @@ const MOUNTS_ESCAPES: [(&str, char); 4] = [
 ];
 
 /// Unmount the rootfs, then every other mount backed by `disk`.
-// TODO: remove me, as soon as flash mode 2 calls it
-#[allow(dead_code)]
+#[cfg(feature = "flash-mode-2")]
 pub(crate) fn unmount_target_disk(rootfs: &Path, disk: &Path) -> Result<(), FlashError> {
     unmount_rootfs(rootfs)?;
 
@@ -61,6 +67,7 @@ pub(crate) fn unmount_target_disk(rootfs: &Path, disk: &Path) -> Result<(), Flas
 
 /// The mount points whose source sits on `disk`, deepest first so a nested
 /// mount goes before its parent. Device numbers are compared, never names.
+#[cfg(feature = "flash-mode-2")]
 fn mounts_backed_by(
     proc_mounts: &str,
     disk: u64,
@@ -79,6 +86,7 @@ fn mounts_backed_by(
     mount_points
 }
 
+#[cfg(feature = "flash-mode-2")]
 fn decode_mounts_field(field: &str) -> String {
     MOUNTS_ESCAPES
         .iter()
@@ -87,7 +95,7 @@ fn decode_mounts_field(field: &str) -> String {
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "flash-mode-2"))]
 mod tests {
     use super::*;
 

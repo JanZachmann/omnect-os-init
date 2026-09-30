@@ -21,9 +21,10 @@ use crate::filesystem::MountOptions;
 use crate::filesystem::reformat_ext4;
 #[cfg(feature = "grub")]
 use crate::mode::flash::efi;
-use crate::mode::flash::{rawio, sfdisk, unmount};
+use crate::mode::flash::rawio::{self, kb_to_bytes};
 #[cfg(feature = "grub")]
 use crate::mode::flash::{scratch_mounts, with_mount};
+use crate::mode::flash::{sfdisk, unmount};
 use crate::partition::device::{
     REASON_NOT_A_BLOCK_DEVICE, SYS_DEV_BLOCK, block_devnum, partition_path, partition_sep_for,
     whole_disk_devnum,
@@ -131,14 +132,6 @@ struct Constants {
     bootloader_area: Option<ByteRange>,
     #[cfg(feature = "uboot")]
     uboot_env: UbootEnv,
-}
-
-fn kb_to_bytes(kb: u64, name: BuildConstant) -> Result<u64, FlashError> {
-    kb.checked_mul(rawio::KIB)
-        .ok_or_else(|| FlashError::InvalidBuildConstant {
-            name,
-            reason: format!("{kb} KB does not fit a byte offset"),
-        })
 }
 
 /// Validate the build-time constants before anything is written.

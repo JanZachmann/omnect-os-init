@@ -1,8 +1,5 @@
 //! Thin wrapper around `bmaptool copy`.
 
-// TODO: remove me, as soon as flash mode 2 calls it
-#![allow(dead_code)]
-
 use std::ffi::OsStr;
 use std::path::Path;
 

@@ -1,9 +1,6 @@
 //! Network setup for the flash modes that receive their image over the
 //! network: bring the interface up, get an address by DHCP, start dropbear.
 
-// TODO: remove me, as soon as flash mode 2 calls it
-#![allow(dead_code)]
-
 use std::ffi::OsStr;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
