@@ -4,6 +4,7 @@
 #[cfg(feature = "flash-mode-1")]
 pub(crate) mod clone;
 pub mod config;
+#[cfg(feature = "grub")]
 pub(crate) mod efi;
 #[cfg(feature = "flash-mode-1")]
 pub(crate) mod rawio;
@@ -36,6 +37,7 @@ pub(crate) mod scratch_mounts {
     #[cfg(all(feature = "flash-mode-1", feature = "grub"))]
     pub(crate) const CLONE_BOOT: &str = "/tmp/clone-boot";
     /// The target boot partition, while the EFI entry dump is written.
+    #[cfg(feature = "grub")]
     pub(crate) const EFI_BOOT: &str = "/tmp/boot";
 }
 #[cfg(feature = "flash-mode-1")]
@@ -139,7 +141,6 @@ fn run_selected_mode(
             destination: destination(flash_config)?,
             layout: ctx.layout,
             rootfs: ctx.rootfs,
-            machine_features: &ctx.config.machine_features,
         }),
     }
 }
@@ -322,12 +323,14 @@ mod tests {
 
     #[test]
     fn the_scratch_mount_points_stay_outside_the_rootfs_mount() {
-        for mount_point in [
+        let mount_points: &[&str] = &[
             scratch_mounts::LOG_DATA,
+            #[cfg(feature = "grub")]
             scratch_mounts::EFI_BOOT,
             #[cfg(all(feature = "flash-mode-1", feature = "grub"))]
             scratch_mounts::CLONE_BOOT,
-        ] {
+        ];
+        for mount_point in mount_points {
             assert!(!Path::new(mount_point).starts_with(crate::ROOTFS_DIR));
         }
     }

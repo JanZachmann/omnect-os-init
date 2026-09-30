@@ -21,7 +21,9 @@ use crate::error::{FlashError, PartitionTableOperation};
 #[cfg(feature = "grub")]
 use crate::filesystem::MountOptions;
 use crate::filesystem::reformat_ext4;
-use crate::mode::flash::{efi, rawio, sfdisk, unmount};
+#[cfg(feature = "grub")]
+use crate::mode::flash::efi;
+use crate::mode::flash::{rawio, sfdisk, unmount};
 #[cfg(feature = "grub")]
 use crate::mode::flash::{scratch_mounts, with_mount};
 use crate::partition::device::{partition_path, partition_sep_for};
@@ -85,7 +87,6 @@ pub(crate) struct CloneCtx<'a> {
     pub(crate) destination: &'a Path,
     pub(crate) layout: &'a PartitionLayout,
     pub(crate) rootfs: &'a Path,
-    pub(crate) machine_features: &'a str,
 }
 
 /// The build-time constants as `build.rs` generated them, KB-valued.
@@ -417,7 +418,7 @@ fn copy_grubenv(target: &Path) -> Result<(), FlashError> {
 }
 
 /// The side effects of the clone, so a test can pin their order.
-trait CloneOps: efi::EfiOps {
+trait CloneOps {
     #[cfg(feature = "gpt")]
     fn fresh_uuid(&mut self) -> Result<String, FlashError>;
     /// Wait for `destination` and resolve it to the device node.
@@ -442,11 +443,14 @@ trait CloneOps: efi::EfiOps {
     fn set_part_uuid(&mut self, device: &Path, num: u32, uuid: &str) -> Result<(), FlashError>;
     #[cfg(feature = "grub")]
     fn write_grubenv(&mut self, boot_partition: &Path) -> Result<(), FlashError>;
+    #[cfg(feature = "grub")]
+    fn efi(&mut self) -> &mut dyn efi::EfiOps;
     fn sync(&mut self);
 }
 
 struct RealCloneOps;
 
+#[cfg(feature = "grub")]
 impl efi::EfiOps for RealCloneOps {
     fn mount_efivarfs(&mut self) -> Result<(), FlashError> {
         efi::RealEfiOps.mount_efivarfs()
@@ -550,6 +554,11 @@ impl CloneOps for RealCloneOps {
         )
     }
 
+    #[cfg(feature = "grub")]
+    fn efi(&mut self) -> &mut dyn efi::EfiOps {
+        self
+    }
+
     fn sync(&mut self) {
         sync_filesystems();
     }
@@ -651,10 +660,12 @@ fn clone_with(
         ops.set_part_uuid(destination, *num, uuid)?;
     }
 
-    let boot_partition = destination_partition(destination, PARTITION_NUM_BOOT);
-
     #[cfg(feature = "grub")]
-    ops.write_grubenv(&boot_partition)?;
+    {
+        let boot_partition = destination_partition(destination, PARTITION_NUM_BOOT);
+        ops.write_grubenv(&boot_partition)?;
+        efi::handle(ops.efi(), destination, &boot_partition)?;
+    }
 
     #[cfg(feature = "uboot")]
     for &offset in &constants.uboot_env.offsets {
@@ -670,8 +681,6 @@ fn clone_with(
             Some(constants.uboot_env.size),
         )?;
     }
-
-    efi::handle(ops, destination, &boot_partition, ctx.machine_features)?;
 
     log::info!("flash mode 1 finished");
     ops.sync();
@@ -1024,6 +1033,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "grub")]
     impl efi::EfiOps for RecordingCloneOps {
         fn mount_efivarfs(&mut self) -> Result<(), FlashError> {
             self.record("mount efivarfs".to_string())
@@ -1123,6 +1133,11 @@ mod tests {
             self.record(format!("write grubenv to {}", boot_partition.display()))
         }
 
+        #[cfg(feature = "grub")]
+        fn efi(&mut self) -> &mut dyn efi::EfiOps {
+            self
+        }
+
         fn sync(&mut self) {
             self.calls.push("sync".to_string());
         }
@@ -1143,7 +1158,6 @@ mod tests {
             destination: Path::new("/dev/sdb"),
             layout: &layout,
             rootfs: Path::new("/rootfs"),
-            machine_features: "efi",
         };
         clone_with(&ctx, constants, ops)
     }
@@ -1203,20 +1217,20 @@ mod tests {
             "set uuid uuid-1 on /dev/sdb 1".to_string(),
             "set uuid uuid-2 on /dev/sdb 2".to_string(),
         ]);
-        #[cfg(feature = "grub")]
-        expected.push("write grubenv to /dev/sdb1".to_string());
         #[cfg(feature = "uboot")]
         expected.push(
             "copy /etc/omnect/uboot-env.bin@0 to /dev/sdb@4194304 len Some(65536)".to_string(),
         );
+        #[cfg(feature = "grub")]
         expected.extend([
+            "write grubenv to /dev/sdb1".to_string(),
             "mount efivarfs".to_string(),
             "efibootmgr".to_string(),
             r"efibootmgr -c -d /dev/sdb -p 1 -L omnect_os -l \EFI\BOOT\bootx64.efi".to_string(),
             "efibootmgr -v".to_string(),
             "write entry dump to /dev/sdb1".to_string(),
-            "sync".to_string(),
         ]);
+        expected.push("sync".to_string());
 
         assert_eq!(ops.calls, expected);
     }

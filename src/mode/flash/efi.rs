@@ -13,7 +13,6 @@ use crate::mode::flash::{scratch_mounts, with_mount};
 use crate::partition::layout::PARTITION_NUM_BOOT;
 
 const EFIBOOTMGR_CMD: &str = "/sbin/efibootmgr";
-const EFI_MACHINE_FEATURE: &str = "efi";
 const EFI_BOOT_ENTRY_LABEL: &str = "omnect_os";
 const EFI_LOADER_PATH: &str = r"\EFI\BOOT\bootx64.efi";
 const EFI_ENTRY_DUMP_FILE: &str = "EFI/BOOT/efibootmgr_entry";
@@ -90,12 +89,6 @@ impl EfiOps for RealEfiOps {
     }
 }
 
-pub(crate) fn has_efi(machine_features: &str) -> bool {
-    machine_features
-        .split_ascii_whitespace()
-        .any(|feature| feature == EFI_MACHINE_FEATURE)
-}
-
 pub(crate) fn entry_args(target_disk: &Path) -> Vec<String> {
     vec![
         EFIBOOTMGR_CREATE_FLAG.to_string(),
@@ -147,13 +140,7 @@ pub(crate) fn handle(
     ops: &mut (impl EfiOps + ?Sized),
     target_disk: &Path,
     boot_partition: &Path,
-    machine_features: &str,
 ) -> Result<(), FlashError> {
-    if !has_efi(machine_features) {
-        log::info!("EFI handling skipped, machine features: '{machine_features}'");
-        return Ok(());
-    }
-
     ops.mount_efivarfs()?;
     let old_entries = boot_entry_ids(&ops.efibootmgr(&[])?);
     ops.efibootmgr(&entry_args(target_disk))?;
@@ -214,13 +201,7 @@ Boot0002* omnect_os
     #[test]
     fn the_new_entry_is_created_before_the_old_ones_are_deleted() {
         let mut ops = RecordingEfiOps::default();
-        handle(
-            &mut ops,
-            Path::new("/dev/sdb"),
-            Path::new("/dev/sdb1"),
-            "usbhost efi",
-        )
-        .unwrap();
+        handle(&mut ops, Path::new("/dev/sdb"), Path::new("/dev/sdb1")).unwrap();
         assert_eq!(
             ops.calls,
             [
@@ -234,30 +215,6 @@ Boot0002* omnect_os
                 "write entry dump to /dev/sdb1",
             ]
         );
-    }
-
-    #[test]
-    fn a_machine_without_efi_gets_no_efi_handling() {
-        let mut ops = RecordingEfiOps::default();
-        handle(
-            &mut ops,
-            Path::new("/dev/sdb"),
-            Path::new("/dev/sdb1"),
-            "usbhost",
-        )
-        .unwrap();
-        assert!(ops.calls.is_empty());
-    }
-
-    #[test]
-    fn efi_handling_applies_only_where_the_machine_declares_efi() {
-        assert!(has_efi("efi"));
-        assert!(has_efi("usbhost efi vfat"));
-        assert!(!has_efi(""));
-        assert!(!has_efi("usbhost vfat"));
-        // A substring of another feature must not enable it.
-        assert!(!has_efi("efirtc"));
-        assert!(!has_efi("no-efi-here"));
     }
 
     #[test]

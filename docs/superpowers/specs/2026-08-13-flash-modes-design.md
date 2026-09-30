@@ -555,7 +555,9 @@ see §10.1.
 
 ## 6. EFI handling
 
-Applies on machines whose `MACHINE_FEATURES` contains `efi`. Ported from
+Applies to `grub` builds: the recipe selects the `grub` feature exactly for
+machines whose `MACHINE_FEATURES` contain `efi`, so the check is made at build
+time. Ported from
 `flash_mode_efi_handling` in `common-sh`, with the order changed so the machine
 always keeps a boot entry:
 

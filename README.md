@@ -40,7 +40,7 @@ flowchart TD
     EARLY_ERR -->|release| HALT1(["🔴 eprintln loop — halt"])
     EARLY_ERR -->|debug| ESHELL(["🐚 emergency sh — respawn"])
 
-    LOGGER -->|OK| CONFIG["Config::load()\n/proc/cmdline · os-release"]
+    LOGGER -->|OK| CONFIG["Config::load()\n/proc/cmdline"]
     LOGGER -->|Fail| FEB
 
     CONFIG -->|OK| RDEV["detect_root_device()"]
