@@ -22,7 +22,7 @@ pub(crate) mod unmount;
 #[cfg(feature = "flash-mode-2")]
 use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "flash-mode-2")]
 use std::process::Command;
 
@@ -107,6 +107,16 @@ fn keeps_log_on_failure(mode: config::FlashMode) -> bool {
     }
 }
 
+/// Mode 2 rewrites the partition table of the disk that holds the log.
+fn rewrites_running_disk(mode: config::FlashMode) -> bool {
+    match mode {
+        #[cfg(feature = "flash-mode-1")]
+        config::FlashMode::Mode1 => false,
+        #[cfg(feature = "flash-mode-2")]
+        config::FlashMode::Mode2 => true,
+    }
+}
+
 fn terminal_action(mode: config::FlashMode) -> RebootMode {
     match mode {
         #[cfg(feature = "flash-mode-1")]
@@ -169,7 +179,7 @@ pub(crate) fn layout_partition(
 ) -> Result<&Path, FlashError> {
     layout
         .get(name)
-        .map(std::path::PathBuf::as_path)
+        .map(PathBuf::as_path)
         .ok_or_else(|| FlashError::PartitionTable {
             device: layout.device.base.clone(),
             operation: crate::error::PartitionTableOperation::Lookup,
@@ -189,6 +199,21 @@ fn write_log(data_partition: &Path, file: &str, lines: &[String]) -> Result<(), 
                 .map_err(|source| FlashError::PathIo { path, source })
         },
     )
+}
+
+/// The kernel keeps the partition table from before the flash until it re-reads
+/// it, and the data partition may have moved since.
+fn log_writer(
+    mode: config::FlashMode,
+    disk: PathBuf,
+) -> impl FnMut(&Path, &str, &[String]) -> Result<(), FlashError> {
+    let reread = rewrites_running_disk(mode);
+    move |data_partition, file, lines| {
+        if reread {
+            rawio::reread_partition_table(&disk)?;
+        }
+        write_log(data_partition, file, lines)
+    }
 }
 
 /// Persist the run log, best-effort: losing it must not change the outcome.
@@ -271,12 +296,8 @@ pub(crate) fn run(
     mut ctx: BootContext<'_>,
     flash_config: config::FlashConfig,
 ) -> crate::Result<()> {
-    run_and_persist(
-        &mut ctx,
-        &flash_config,
-        &mut run_selected_mode,
-        &mut write_log,
-    )?;
+    let mut write = log_writer(flash_config.mode, ctx.layout.device.base.clone());
+    run_and_persist(&mut ctx, &flash_config, &mut run_selected_mode, &mut write)?;
 
     let Err(e) = reboot(terminal_action(flash_config.mode));
     Err(FlashError::Io(e.into()).into())
@@ -555,6 +576,25 @@ mod tests {
             terminal_action(config::FlashMode::Mode2),
             RebootMode::RB_AUTOBOOT
         );
+    }
+
+    #[cfg(feature = "flash-mode-2")]
+    #[test]
+    fn the_mode_2_log_is_not_written_when_the_partition_table_cannot_be_re_read() {
+        let disk = tempfile::NamedTempFile::new().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut write = log_writer(config::FlashMode::Mode2, disk.path().to_path_buf());
+        let err = write(data.path(), MODE_2_LOG_FILE, &["line".to_string()]).unwrap_err();
+        assert!(
+            matches!(&err, FlashError::PathIo { path, .. } if path == disk.path()),
+            "got: {err}"
+        );
+    }
+
+    #[cfg(feature = "flash-mode-1")]
+    #[test]
+    fn mode_1_does_not_re_read_the_source_partition_table() {
+        assert!(!rewrites_running_disk(config::FlashMode::Mode1));
     }
 
     #[cfg(feature = "flash-mode-1")]

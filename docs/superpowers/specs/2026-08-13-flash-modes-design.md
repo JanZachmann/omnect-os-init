@@ -723,8 +723,9 @@ runs. Persistence depends on whether a safe target exists:
   onto the freshly written data partition after a **successful** flash only. On
   failure these modes leave nothing on disk, the same as legacy, and diagnosis
   stays on kmsg and the console. The file is `flash-mode-2.log` for mode 2. The
-  mount uses the kernel's partition view from before the flash, the same as the
-  EFI dump mount (§6 step 5), so no partition table re-read is added.
+  new image may place the data partition elsewhere, so the kernel re-reads the
+  partition table (`BLKRRPART`) before the mount; when that fails, no log is
+  written.
 
 See §10.5.
 

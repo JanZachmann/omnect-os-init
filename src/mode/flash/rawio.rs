@@ -4,6 +4,7 @@ use std::fs::OpenOptions;
 #[cfg(feature = "flash-mode-1")]
 use std::io::{ErrorKind, Read};
 use std::io::{Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use crate::config::BuildConstant;
@@ -144,6 +145,25 @@ pub fn zero_range(dst: &Path, offset: u64, len: u64) -> Result<(), FlashError> {
     dst_file.sync_all().map_err(io_failed)
 }
 
+// BLKRRPART from <linux/fs.h>.
+const BLK_IOC_MAGIC: u8 = 0x12;
+const BLKRRPART_NR: u8 = 95;
+
+nix::ioctl_none!(blkrrpart, BLK_IOC_MAGIC, BLKRRPART_NR);
+
+/// Make the kernel re-read the partition table of `disk`. Fails while any
+/// partition of `disk` is mounted.
+pub fn reread_partition_table(disk: &Path) -> Result<(), FlashError> {
+    let io_failed = |source| FlashError::PathIo {
+        path: disk.to_path_buf(),
+        source,
+    };
+    let file = std::fs::File::open(disk).map_err(io_failed)?;
+    // SAFETY: BLKRRPART takes no argument; the fd is open for the call.
+    unsafe { blkrrpart(file.as_raw_fd()) }.map_err(|errno| io_failed(errno.into()))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +289,14 @@ mod tests {
         let dst = dir.path().join("sdz");
         assert!(zero_range(&dst, 0, 1).is_err());
         assert!(!dst.exists());
+    }
+
+    #[test]
+    fn reread_partition_table_fails_on_a_regular_file() {
+        let disk = file_with(b"");
+        assert!(matches!(
+            reread_partition_table(disk.path()),
+            Err(FlashError::PathIo { path, .. }) if path == disk.path()
+        ));
     }
 }
