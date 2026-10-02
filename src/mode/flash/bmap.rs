@@ -73,14 +73,8 @@ mod tests {
     #[test]
     fn the_flash_pass_copies_the_file_to_the_root_block_device() {
         assert_eq!(
-            args_of("/home/omnect/wic", "/dev/omnect/rootblk"),
-            [
-                "copy",
-                "--bmap",
-                BMAP,
-                "/home/omnect/wic",
-                "/dev/omnect/rootblk"
-            ]
+            args_of("/home/omnect/wic", "/dev/sda"),
+            ["copy", "--bmap", BMAP, "/home/omnect/wic", "/dev/sda"]
         );
     }
 

@@ -1,6 +1,6 @@
 # Flash Modes 1, 2, 3 — Design
 
-**Status:** In review (PR #27)
+**Status:** Accepted
 
 Port the three flash modes from the legacy scripted initramfs
 (`meta-omnect/recipes-omnect/initrdscripts/omnect-os-initramfs/flash-mode-{1,2,3}`)
@@ -135,7 +135,7 @@ Relative to the legacy scripts this is partly a match and partly a deviation:
 src/mode/flash/
   mod.rs        dispatch, terminal action, log capture and persistence   flash-mode
   config.rs     environment read, validation -> FlashConfig     (pure)   flash-mode
-  efi.rs        efibootmgr handling                                      flash-mode
+  efi.rs        efibootmgr handling                                      grub
   clone.rs      mode 1 orchestration                                     flash-mode-1
   sfdisk.rs     partition-table dump parsing and rewriting      (pure)   flash-mode-1
   rawio.rs      in-process replacement for every `dd` call               flash-mode, per item
@@ -149,8 +149,8 @@ src/mode/flash/
 The right column is the gating feature (§3.6). In `rawio.rs` each item is gated
 on the modes that use it: `copy_range` on `flash-mode-1`, `zero_range` on
 `flash-mode-2`, the shared constants on `flash-mode`. The device-number helpers
-that mode 1 uses to refuse a destination are shared with the §5.1 sweep, so they
-move out of `clone.rs` into a module gated on `flash-mode`.
+(`block_devnum`, `whole_disk_devnum`) are in `partition/device.rs`, gated on
+`flash-mode`, and shared by the mode 1 refusal and the §5.1 sweep.
 
 External tools are invoked through `std::process::Command` with named `const`
 paths, as `filesystem/reformat.rs` already does. No new command-runner
@@ -517,7 +517,9 @@ path and each role resolved with `partition_path(PARTITION_NUM_*)`.
 ## 5. Modes 2 and 3 — network flashing
 
 Both overwrite the running disk. Both share: unmount everything on the disk,
-bring up the network, flash, EFI handling, `sync`, `reboot`.
+bring up the network, flash, EFI handling, `sync`, `reboot`. The disk is named
+`/dev/omnect/rootblk` below; the code addresses the same device by the root
+device's base path.
 
 ### 5.1 Unmounting
 
@@ -785,6 +787,8 @@ Behaviour changes, as opposed to bug fixes:
   than dropping one silently. Both triggers are cleared before the error, so a
   power cycle boots normally (§3.3, §10.6);
 - modes 2 and 3 may persist a log where legacy did not (§8.3, §10.5);
+- a failed unmount in the §5.1 sweep fails the run; legacy ignored it
+  (`umount ... 2>/dev/null`);
 - modes 2 and 3 make the kernel re-read the partition table after the flash,
   before the EFI step mounts the boot partition; legacy mounted it through the
   table from before the flash (§8.3);

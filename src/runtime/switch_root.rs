@@ -1,8 +1,8 @@
 //! Switch root to final rootfs and exec init
 //!
 //! Implements the switch_root operation using MS_MOVE + chroot to transition
-//! from initramfs to the real rootfs. pivot_root(2) is not used because ramfs
-//! does not support it (returns EINVAL).
+//! from initramfs to the real rootfs. pivot_root(2) is not used because the
+//! initramfs root cannot be pivoted (returns EINVAL).
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

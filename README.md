@@ -18,7 +18,7 @@ Implemented functionality:
 - **Logging**: Kernel ring buffer (`/dev/kmsg`) with log level prefixes
 - **ODS integration**: Runtime files for `omnect-device-service`
 - **fs-links**: Symlink creation from `etc/omnect/fs-link.json` and `etc/omnect/fs-link.d/`
-- **switch\_root**: MS_MOVE + chroot + exec systemd (`pivot_root(2)` is not used; the initial rootfs does not support it)
+- **switch\_root**: MS_MOVE + chroot + exec systemd
 - **Factory reset (modes 1-3)**: Selective-preserve backup → wipe `data`/`etc` (modes 2 and 3 only) → reformat → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
 - **Flash mode 1**: Clones the running disk onto another block device given by the `flash-mode-devpath` bootloader env key, triggered by `flash-mode`; powers off on success so the clone can be moved to its own device (feature `flash-mode-1`, part of the default feature set)
 - **Flash mode 2**: Brings up `eth0` with DHCP and starts `dropbear`; the operator pushes a `wic.xz` with `scp`, and `bmaptool` flashes it onto the running disk. Triggered by `flash-mode=2` in the bootloader env or by the flag file `/etc/enforce_flash_mode` (feature `flash-mode-2`)
@@ -264,7 +264,7 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 | `flash-mode` | Shared flash layer: trigger detection, dispatch, log capture. Pulled in by a mode feature, never selected on its own | Implemented |
 | `flash-mode-1` | Disk cloning (part of the default feature set) | Implemented |
 | `flash-mode-2` | Flash a `wic.xz` pushed in over `scp` | Implemented |
-| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream | Implemented |
+| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream. The disk head is zeroed before the image arrives, so if no image is pushed the disk no longer boots | Implemented |
 | `flash-mode-3` | HTTP/HTTPS flashing | Planned |
 
 > **Note:** `grub` and `uboot` are mutually exclusive, and so are `gpt` and `dos`.
@@ -360,13 +360,13 @@ cargo test --features uboot,gpt,resize-data,release-image,test-utils
 # additive and cannot turn a default feature off
 cargo test --no-default-features --features grub,gpt,factory-reset,test-utils
 
-# Flash mode 2: default enables mode 1, so a mode-2-only build needs
-# --no-default-features
+# Flash mode 2 (mode-2-only build)
 cargo test --no-default-features --features core,grub,gpt,flash-mode-2,test-utils
 cargo test --no-default-features --features core,grub,dos,flash-mode-2,test-utils
 cargo test --no-default-features --features core,uboot,gpt,flash-mode-2,test-utils
 cargo test --no-default-features --features core,uboot,dos,flash-mode-2,test-utils
 cargo test --no-default-features --features core,uboot,gpt,flash-mode-2-direct,test-utils
+cargo test --no-default-features --features core,grub,gpt,flash-mode-2-direct,test-utils
 
 # Flash modes 1 and 2 together
 cargo test --features uboot,gpt,flash-mode-1,flash-mode-2,factory-reset,test-utils
