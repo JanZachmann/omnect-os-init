@@ -548,7 +548,8 @@ scripts.
    checked.
 4. Verify the image against the downloaded sha256.
 5. `bmaptool copy --nobmap <image> /dev/omnect/rootblk`.
-6. EFI handling (§6), `sync`, log (§8), `reboot`.
+6. Re-read the partition table (§8.3), EFI handling (§6), `sync`, log (§8),
+   `reboot`.
 
 Legacy mode 3 computes a `dest_blk` and a partition suffix from `rootA` and never
 uses them; not ported.
@@ -587,7 +588,8 @@ flag file shipped by `omnect-os-initramfs-test`. Both are kept.
    - **`flash-mode-2-direct`** — zero the head, then
      `bmaptool copy --bmap wic.bmap wic.xz /dev/omnect/rootblk` straight from
      the FIFO. No verification.
-7. EFI handling (§6), `sync`, log (§8), `reboot`.
+7. Re-read the partition table (§8.3), EFI handling (§6), `sync`, log (§8),
+   `reboot`.
 
 Once `bmaptool` starts it blocks reading the FIFO until the operator's `scp`
 feeds it, and that wait stays unbounded too: a timeout there would kill a flash
@@ -720,14 +722,13 @@ runs. Persistence depends on whether a safe target exists:
 - **Modes 2 and 3** — the whole disk is overwritten. A failure while the disk
   is written leaves it in an unknown partly written state, and mounting anything
   on it is unsafe. That failure is `FlashError::DiskPartlyWritten`, and it leaves
-  nothing on disk; diagnosis stays on kmsg and the console. Every other outcome,
-  success or a failure before the disk is written, writes the log best-effort to
-  the data partition. The file is `flash-mode-2.log` for mode 2. The
-  new image may place the data partition elsewhere, so after a successful flash
-  the kernel re-reads the partition table (`BLKRRPART`) before the mount; when
-  that fails, no log is written. A failed run did not change the table. The EFI
-  dump mount (§6 step 5) runs before the re-read and uses the old table, as
-  legacy does.
+  nothing on disk; diagnosis stays on kmsg and the console. The new image may
+  place partitions elsewhere, so right after the flash pass the kernel re-reads
+  the partition table (`BLKRRPART`), before the EFI dump mount (§6 step 5) and
+  the log mount. A failed re-read is `FlashError::StalePartitionTable` and also
+  leaves no log. Every other outcome, success or a failure before the disk is
+  written or after the re-read, writes the log best-effort to the data
+  partition. The file is `flash-mode-2.log` for mode 2.
 
 See §10.5.
 
@@ -784,6 +785,9 @@ Behaviour changes, as opposed to bug fixes:
   than dropping one silently. Both triggers are cleared before the error, so a
   power cycle boots normally (§3.3, §10.6);
 - modes 2 and 3 may persist a log where legacy did not (§8.3, §10.5);
+- modes 2 and 3 make the kernel re-read the partition table after the flash,
+  before the EFI step mounts the boot partition; legacy mounted it through the
+  table from before the flash (§8.3);
 - the `check_fs` on the source data partition before the log mount is dropped.
   Legacy runs it in `flash_mode_1_run` just before mounting; the port mounts
   directly. Bounded: the log write is best-effort either way, so a mount that

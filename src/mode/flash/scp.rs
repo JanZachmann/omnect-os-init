@@ -139,6 +139,7 @@ trait ScpOps {
     fn wait_for_bmap(&mut self, path: &Path);
     fn bmap_copy(&mut self, args: &BmapArgs<'_>) -> Result<(), FlashError>;
     fn zero_range(&mut self, dst: &Path, offset: u64, len: u64) -> Result<(), FlashError>;
+    fn reread_table(&mut self, disk: &Path) -> Result<(), FlashError>;
     #[cfg(feature = "grub")]
     fn efi(&mut self) -> &mut dyn efi::EfiOps;
     fn sync(&mut self);
@@ -181,6 +182,10 @@ impl ScpOps for RealScpOps {
 
     fn zero_range(&mut self, dst: &Path, offset: u64, len: u64) -> Result<(), FlashError> {
         rawio::zero_range(dst, offset, len)
+    }
+
+    fn reread_table(&mut self, disk: &Path) -> Result<(), FlashError> {
+        rawio::reread_partition_table(disk)
     }
 
     #[cfg(feature = "grub")]
@@ -270,6 +275,14 @@ fn scp_with(
         destination: disk,
     })
     .map_err(partly_written)?;
+
+    // The new image may move partitions. Everything after this point mounts
+    // them, so the kernel must drop the table from before the flash first.
+    ops.reread_table(disk)
+        .map_err(|source| FlashError::StalePartitionTable {
+            disk: disk.to_path_buf(),
+            source: Box::new(source),
+        })?;
 
     #[cfg(feature = "grub")]
     efi::handle(ops.efi(), disk, boot_partition)?;
@@ -447,7 +460,7 @@ mod tests {
     }
 
     /// Records every mode 2 side effect as one line, in call order, and fails
-    /// the first call whose line starts with `fail_on`.
+    /// the first call whose line starts or ends with `fail_on`.
     struct RecordingScpOps {
         calls: Vec<String>,
         fail_on: Option<&'static str>,
@@ -455,7 +468,9 @@ mod tests {
 
     impl RecordingScpOps {
         fn record(&mut self, call: String) -> Result<(), FlashError> {
-            let fail = self.fail_on.is_some_and(|prefix| call.starts_with(prefix));
+            let fail = self
+                .fail_on
+                .is_some_and(|step| call.starts_with(step) || call.ends_with(step));
             self.calls.push(call);
             if fail {
                 return Err(FlashError::EfiFailed("injected".to_string()));
@@ -531,6 +546,10 @@ mod tests {
             self.record(format!("zero {}@{offset} len {len}", dst.display()))
         }
 
+        fn reread_table(&mut self, disk: &Path) -> Result<(), FlashError> {
+            self.record(format!("reread {}", disk.display()))
+        }
+
         #[cfg(feature = "grub")]
         fn efi(&mut self) -> &mut dyn efi::EfiOps {
             self
@@ -590,6 +609,7 @@ mod tests {
             "zero /dev/sda@0 len 46137344".to_string(),
             "bmap /home/omnect/wic.bmap /home/omnect/wic.xz to /dev/sda".to_string(),
         ]);
+        expected.push("reread /dev/sda".to_string());
         #[cfg(feature = "grub")]
         expected.extend([
             "mount efivarfs".to_string(),
@@ -627,27 +647,55 @@ mod tests {
 
     #[test]
     fn a_failed_step_stops_mode_2_there() {
-        // Without the verify pass, the first `bmap` call writes the disk.
+        use crate::mode::flash::keeps_log;
+
+        const FLASH_PASS: &str = "to /dev/sda";
+        // Without the verify pass, the first `bmap` call is the flash pass.
         let direct = cfg!(feature = "flash-mode-2-direct");
-        for (step, writes_disk) in [
-            ("unmount", false),
-            ("network", false),
-            ("fifo", false),
-            ("dropbear", false),
-            ("bmap", direct),
-            ("zero", true),
-        ] {
+        let steps = [
+            ("unmount", true),
+            ("network", true),
+            ("fifo", true),
+            ("dropbear", true),
+            ("bmap", !direct),
+            ("zero", false),
+            (FLASH_PASS, false),
+            ("reread", false),
+            #[cfg(feature = "grub")]
+            ("mount efivarfs", true),
+            #[cfg(feature = "grub")]
+            ("efibootmgr", true),
+            #[cfg(feature = "grub")]
+            ("write entry dump", true),
+        ];
+        for (step, log_is_kept) in steps {
             let (result, calls) = run_recorded(&raw_constants(), Some(step));
+            let last = calls.last().unwrap();
             assert!(
-                calls.last().unwrap().starts_with(step),
+                last.starts_with(step) || last.ends_with(step),
                 "{step} must be the last step, got {calls:?}"
             );
-            assert_eq!(
-                matches!(result, Err(FlashError::DiskPartlyWritten { .. })),
-                writes_disk,
-                "{step}: {result:?}"
-            );
+            assert!(result.is_err(), "{step}");
+            assert_eq!(keeps_log(&result), log_is_kept, "{step}: {result:?}");
         }
+    }
+
+    #[test]
+    fn a_failed_flash_pass_is_a_partly_written_disk() {
+        let (result, _) = run_recorded(&raw_constants(), Some("to /dev/sda"));
+        assert!(
+            matches!(result, Err(FlashError::DiskPartlyWritten { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[cfg(feature = "grub")]
+    #[test]
+    fn the_efi_step_uses_the_re_read_table() {
+        let (_, calls) = run_recorded(&raw_constants(), Some("mount efivarfs"));
+        let reread = calls.iter().position(|call| call == "reread /dev/sda");
+        let efi = calls.iter().position(|call| call == "mount efivarfs");
+        assert!(reread.is_some() && reread < efi, "got {calls:?}");
     }
 
     #[cfg(not(feature = "flash-mode-2-direct"))]
