@@ -467,6 +467,17 @@ mod tests {
     }
 
     #[cfg(feature = "flash-mode-2")]
+    fn mode_2_cleared() -> Vec<crate::bootloader::BootEnvKey> {
+        use crate::bootloader::BootEnvKey;
+        [
+            BootEnvKey::FlashMode,
+            #[cfg(feature = "flash-mode-1")]
+            BootEnvKey::FlashModeDevPath,
+        ]
+        .to_vec()
+    }
+
+    #[cfg(feature = "flash-mode-2")]
     fn run_mode_2(
         result: fn() -> Result<(), FlashError>,
         write: LogWriter<'_>,
@@ -477,6 +488,7 @@ mod tests {
 
         let mock = MockBootEnv::new();
         let cleared = mock.shared_set_env_calls();
+        let cleared_at_start = cleared.clone();
         let config = Config::default();
         let layout = source_layout();
         let mut ctx = BootContext::new(
@@ -489,7 +501,14 @@ mod tests {
         let outcome = run_and_persist(
             &mut ctx,
             &crate::mode::mode_2_config(),
-            &mut |_, _| result(),
+            &mut |_, _| {
+                assert_eq!(
+                    *cleared_at_start.lock().unwrap(),
+                    mode_2_cleared(),
+                    "the selector must be cleared before the mode runs"
+                );
+                result()
+            },
             write,
         )
         .map_err(Into::into);
@@ -527,7 +546,7 @@ mod tests {
             });
             assert!(outcome.is_err());
             assert_eq!(writes, 0, "the data partition must not be mounted");
-            assert!(!cleared.is_empty(), "the triggers must be cleared");
+            assert_eq!(cleared, mode_2_cleared(), "the triggers must be cleared");
         }
     }
 
@@ -565,7 +584,7 @@ mod tests {
             Ok(())
         });
         assert!(outcome.is_ok());
-        assert!(!cleared.is_empty());
+        assert_eq!(cleared, mode_2_cleared());
         let [(partition, file, lines)] = written.as_slice() else {
             panic!("the run log must be written once, got {written:?}");
         };
