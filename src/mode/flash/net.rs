@@ -220,11 +220,13 @@ mod tests {
     }
 
     /// Records every side effect as one line. `link_failures` link attempts
-    /// fail first; the address shows up after `address_misses` empty polls.
+    /// fail first; the address shows up after `address_errors` failed and
+    /// `address_misses` empty polls.
     #[derive(Default)]
     struct FakeNetOps {
         calls: Vec<String>,
         link_failures: usize,
+        address_errors: usize,
         address_misses: usize,
     }
 
@@ -245,6 +247,10 @@ mod tests {
 
         fn addresses(&mut self) -> Result<Vec<(String, Option<IpAddr>)>, FlashError> {
             self.calls.push("addresses".to_string());
+            if self.address_errors > 0 {
+                self.address_errors -= 1;
+                return Err(FlashError::NetworkFailed("netlink busy".to_string()));
+            }
             if self.address_misses > 0 {
                 self.address_misses -= 1;
                 return Ok(vec![addr("lo", Some("127.0.0.1"))]);
@@ -281,6 +287,18 @@ mod tests {
                 "addresses",
             ]
         );
+    }
+
+    #[test]
+    fn a_failed_address_lookup_is_retried() {
+        let _guard = serialized();
+        let mut ops = FakeNetOps {
+            address_errors: 2,
+            ..Default::default()
+        };
+        let ip = bring_up_with(&mut ops, STEP * 5, STEP * 5, STEP).unwrap();
+        assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(ops.calls.iter().filter(|c| *c == "sleep").count(), 2);
     }
 
     #[test]

@@ -586,6 +586,15 @@ mod devnum_tests {
     }
 
     #[test]
+    fn a_regular_file_has_no_block_device_number() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert_eq!(
+            block_devnum(file.path()),
+            Err(REASON_NOT_A_BLOCK_DEVICE.to_string())
+        );
+    }
+
+    #[test]
     fn a_device_sysfs_does_not_list_has_no_disk() {
         let sys = fake_sys_dev_block();
         let by_number = sys.path().join("dev/block");

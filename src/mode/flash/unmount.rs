@@ -119,6 +119,16 @@ mod tests {
     }
 
     #[test]
+    fn a_disk_that_is_not_a_block_device_is_refused() {
+        let disk = tempfile::NamedTempFile::new().unwrap();
+        let err = unmount_target_disk(Path::new("/nonexistent/rootfs"), disk.path()).unwrap_err();
+        assert!(
+            matches!(&err, FlashError::InvalidDestination { device, .. } if device == disk.path()),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn mounts_on_the_disk_are_kept_and_the_rest_dropped() {
         let text = "\
 tmpfs /run tmpfs rw 0 0
