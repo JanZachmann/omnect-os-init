@@ -29,6 +29,8 @@ pub(crate) fn unmount_rootfs(rootfs: &Path) -> Result<(), FlashError> {
 
 #[cfg(feature = "flash-mode-2")]
 const PROC_MOUNTS: &str = "/proc/mounts";
+#[cfg(feature = "flash-mode-2")]
+const DEV_DIR: &str = "/dev";
 
 /// `/proc/mounts` writes these bytes as a backslash and three octal digits.
 #[cfg(feature = "flash-mode-2")]
@@ -54,8 +56,16 @@ pub(crate) fn unmount_target_disk(rootfs: &Path, disk: &Path) -> Result<(), Flas
     })?;
 
     let disk_of = |source: &Path| {
-        let devnum = block_devnum(source).ok()?;
-        whole_disk_devnum(Path::new(SYS_DEV_BLOCK), devnum)
+        let disk = block_devnum(source)
+            .ok()
+            .and_then(|devnum| whole_disk_devnum(Path::new(SYS_DEV_BLOCK), devnum));
+        if disk.is_none() && source.starts_with(DEV_DIR) {
+            log::warn!(
+                "cannot tell which disk {} is on; it stays mounted",
+                source.display()
+            );
+        }
+        disk
     };
     for mount_point in mounts_backed_by(&proc_mounts, disk_dev, disk_of) {
         log::info!("unmounting {}", mount_point.display());
