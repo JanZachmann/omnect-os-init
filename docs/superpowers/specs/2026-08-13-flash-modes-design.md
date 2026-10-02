@@ -717,12 +717,12 @@ runs. Persistence depends on whether a safe target exists:
 
   Stating it as "the source is never written" would be wrong, and would invite
   a later change to break the property while the doc still reads as true.
-- **Modes 2 and 3** — the whole disk is overwritten. Before flashing the outcome
-  is not yet known; after a failure the disk is in an unknown half-written state
-  and mounting anything on it is unsafe. Persistence is therefore best-effort
-  onto the freshly written data partition after a **successful** flash only. On
-  failure these modes leave nothing on disk, the same as legacy, and diagnosis
-  stays on kmsg and the console. The file is `flash-mode-2.log` for mode 2. The
+- **Modes 2 and 3** — the whole disk is overwritten. A failure while the disk
+  is written leaves it in an unknown partly written state, and mounting anything
+  on it is unsafe. That failure is `FlashError::DiskPartlyWritten`, and it leaves
+  nothing on disk; diagnosis stays on kmsg and the console. Every other outcome,
+  success or a failure before the disk is written, writes the log best-effort to
+  the data partition. The file is `flash-mode-2.log` for mode 2. The
   new image may place the data partition elsewhere, so the kernel re-reads the
   partition table (`BLKRRPART`) before the mount; when that fails, no log is
   written.
@@ -870,12 +870,12 @@ must move, and a reboot would come back up on the source disk.
 
 ### 10.5 Persist a log for modes 2 and 3 at all?
 
-§8.3 specifies a best-effort write after a successful flash, which costs
-an extra mount of a just-written partition and yields nothing on the failures
-where a log would help most.
+§8.3 specifies a best-effort write unless the disk may be partly written, which
+costs an extra mount of the data partition and yields nothing on the failures
+during the disk write.
 
-**Decided: best-effort after success.** The alternative would be kmsg and
-console only, exactly like legacy.
+**Decided: best-effort, unless the disk may be partly written.** The
+alternative would be kmsg and console only, exactly like legacy.
 
 ### 10.6 Should a queued factory reset still run before mode 1?
 
@@ -942,7 +942,7 @@ only smoke-tested. Real end-to-end coverage stays in Concourse CI on hardware.
 | Detection: every row of the §3.3 trigger table | integration | `tests/flash_modes.rs` |
 | `/proc/mounts` sweep: device numbers, deepest first | unit | `src/mode/flash/unmount.rs` |
 | Mode 2 step order, default and `flash-mode-2-direct` | unit | `src/mode/flash/scp.rs` |
-| Mode 2 log written on success only | unit | `src/mode/flash/mod.rs` |
+| Mode 2 log skipped only on a partly written disk | unit | `src/mode/flash/mod.rs`, `src/mode/flash/scp.rs` |
 | Clear-first ordering: a failing mode still leaves its triggers cleared | unit | `src/mode/flash/mod.rs` |
 | Destination refusal by device number, parent disk from a fake sysfs tree | unit | `src/mode/flash/clone.rs` |
 | Boot-env read failure falls back to Normal boot | integration | `tests/flash_modes.rs` |

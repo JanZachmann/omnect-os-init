@@ -251,19 +251,25 @@ fn scp_with(
     // Without this, GRUB devices sometimes could not boot after a flash
     // (`bootx64.efi` on the disk differed from the image), and U-Boot devices
     // had errors on the boot partition after `bmaptool`.
+    let partly_written = |source| FlashError::DiskPartlyWritten {
+        disk: disk.to_path_buf(),
+        source: Box::new(source),
+    };
     log::info!(
         "zeroing the first {} bytes of {}",
         constants.zero_head_bytes,
         disk.display()
     );
-    ops.zero_range(disk, 0, constants.zero_head_bytes)?;
+    ops.zero_range(disk, 0, constants.zero_head_bytes)
+        .map_err(partly_written)?;
 
     log::info!("flashing {} onto {}", source.display(), disk.display());
     ops.bmap_copy(&BmapArgs {
         bmap: &bmap,
         source: &source,
         destination: disk,
-    })?;
+    })
+    .map_err(partly_written)?;
 
     #[cfg(feature = "grub")]
     efi::handle(ops.efi(), disk, boot_partition)?;
@@ -621,12 +627,25 @@ mod tests {
 
     #[test]
     fn a_failed_step_stops_mode_2_there() {
-        for step in ["unmount", "network", "fifo", "dropbear", "bmap", "zero"] {
+        // Without the verify pass, the first `bmap` call writes the disk.
+        let direct = cfg!(feature = "flash-mode-2-direct");
+        for (step, writes_disk) in [
+            ("unmount", false),
+            ("network", false),
+            ("fifo", false),
+            ("dropbear", false),
+            ("bmap", direct),
+            ("zero", true),
+        ] {
             let (result, calls) = run_recorded(&raw_constants(), Some(step));
-            assert!(result.is_err(), "{step}");
             assert!(
                 calls.last().unwrap().starts_with(step),
                 "{step} must be the last step, got {calls:?}"
+            );
+            assert_eq!(
+                matches!(result, Err(FlashError::DiskPartlyWritten { .. })),
+                writes_disk,
+                "{step}: {result:?}"
             );
         }
     }

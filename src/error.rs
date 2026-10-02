@@ -375,6 +375,13 @@ pub enum FlashError {
     EfiFailed(String),
 
     #[cfg(feature = "flash-mode-2")]
+    #[error("{} may be partly written: {source}", disk.display())]
+    DiskPartlyWritten {
+        disk: PathBuf,
+        source: Box<FlashError>,
+    },
+
+    #[cfg(feature = "flash-mode-2")]
     #[error("Network setup failed: {0}")]
     NetworkFailed(String),
 

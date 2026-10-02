@@ -96,14 +96,12 @@ fn log_file(mode: config::FlashMode) -> &'static str {
 type ModeRunner<'a> =
     &'a mut dyn FnMut(&config::FlashConfig, &BootContext<'_>) -> Result<(), FlashError>;
 
-/// A failed mode 2 run may have left the disk partly written, so it is not
-/// mounted for a log.
-fn keeps_log_on_failure(mode: config::FlashMode) -> bool {
-    match mode {
-        #[cfg(feature = "flash-mode-1")]
-        config::FlashMode::Mode1 => true,
+/// A partly written disk is not mounted for a log.
+fn keeps_log(outcome: &Result<(), FlashError>) -> bool {
+    match outcome {
         #[cfg(feature = "flash-mode-2")]
-        config::FlashMode::Mode2 => false,
+        Err(FlashError::DiskPartlyWritten { .. }) => false,
+        _ => true,
     }
 }
 
@@ -276,7 +274,7 @@ fn run_and_persist(
         Err(e) => log::error!("flash mode failed: {e}"),
     }
     let lines = take_capture();
-    if outcome.is_ok() || keeps_log_on_failure(flash_config.mode) {
+    if keeps_log(&outcome) {
         persist_log(ctx.layout, log_file(flash_config.mode), &lines, write);
     }
 
@@ -517,7 +515,7 @@ mod tests {
 
     #[cfg(feature = "flash-mode-2")]
     #[test]
-    fn a_failing_mode_2_run_clears_its_triggers_and_writes_no_log() {
+    fn a_partly_written_disk_gets_no_mode_2_log() {
         let _guard = crate::logging::capture::SERIALIZE
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -525,15 +523,40 @@ mod tests {
 
         let mut writes = 0;
         let (outcome, cleared) = run_mode_2(
-            || Err(FlashError::Io(std::io::Error::other("half written"))),
+            || {
+                Err(FlashError::DiskPartlyWritten {
+                    disk: PathBuf::from("/dev/sda"),
+                    source: Box::new(FlashError::Io(std::io::Error::other("write failed"))),
+                })
+            },
             &mut |_, _, _| {
                 writes += 1;
                 Ok(())
             },
         );
         assert!(outcome.is_err());
-        assert_eq!(writes, 0, "a half-written disk must not be mounted");
+        assert_eq!(writes, 0, "a partly written disk must not be mounted");
         assert!(!cleared.is_empty(), "the triggers must be cleared");
+    }
+
+    #[cfg(feature = "flash-mode-2")]
+    #[test]
+    fn a_mode_2_run_that_fails_before_the_disk_is_written_keeps_its_log() {
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::logging::capture::install_test_logger();
+
+        let mut writes = 0;
+        let (outcome, _) = run_mode_2(
+            || Err(FlashError::NetworkFailed("no lease".to_string())),
+            &mut |_, _, _| {
+                writes += 1;
+                Ok(())
+            },
+        );
+        assert!(outcome.is_err());
+        assert_eq!(writes, 1);
     }
 
     #[cfg(feature = "flash-mode-2")]
