@@ -84,6 +84,9 @@ const MODE_2_LOG_FILE: &str = "flash-mode-2.log";
 /// Writes the run log: the data partition, the file name, the captured lines.
 type LogWriter<'a> = &'a mut dyn FnMut(&Path, &str, &[String]) -> Result<(), FlashError>;
 
+/// Makes the kernel re-read the partition table of a disk.
+type TableRereader<'a> = &'a mut dyn FnMut(&Path) -> Result<(), FlashError>;
+
 fn log_file(mode: config::FlashMode) -> &'static str {
     match mode {
         #[cfg(feature = "flash-mode-1")]
@@ -199,21 +202,6 @@ fn write_log(data_partition: &Path, file: &str, lines: &[String]) -> Result<(), 
     )
 }
 
-/// The kernel keeps the partition table from before the flash until it re-reads
-/// it, and the data partition may have moved since.
-fn log_writer(
-    mode: config::FlashMode,
-    disk: PathBuf,
-) -> impl FnMut(&Path, &str, &[String]) -> Result<(), FlashError> {
-    let reread = rewrites_running_disk(mode);
-    move |data_partition, file, lines| {
-        if reread {
-            rawio::reread_partition_table(&disk)?;
-        }
-        write_log(data_partition, file, lines)
-    }
-}
-
 /// Persist the run log, best-effort: losing it must not change the outcome.
 fn persist_log(layout: &PartitionLayout, file: &str, lines: &[String], write: LogWriter<'_>) {
     // A run always logs its own outcome, so an empty capture means the capture
@@ -258,6 +246,7 @@ fn run_and_persist(
     flash_config: &config::FlashConfig,
     run_mode: ModeRunner<'_>,
     write: LogWriter<'_>,
+    reread: TableRereader<'_>,
 ) -> Result<(), FlashError> {
     // First, so a failed trigger clear reaches the run log too. kmsg is gone
     // after the power off or reboot, so the file on the data partition is the
@@ -275,7 +264,18 @@ fn run_and_persist(
     }
     let lines = take_capture();
     if keeps_log(&outcome) {
-        persist_log(ctx.layout, log_file(flash_config.mode), &lines, write);
+        // The kernel keeps the table from before the flash until it re-reads
+        // it, and the data partition may have moved since. Only a finished
+        // flash changes the table; before that the disk may still be mounted.
+        let disk = ctx.layout.device.base.as_path();
+        let table_is_current = outcome.is_err()
+            || !rewrites_running_disk(flash_config.mode)
+            || reread(disk)
+                .inspect_err(|e| log::warn!("flash mode: no run log is written: {e}"))
+                .is_ok();
+        if table_is_current {
+            persist_log(ctx.layout, log_file(flash_config.mode), &lines, write);
+        }
     }
 
     // The run log is written after the sequence's own sync. On error the
@@ -294,8 +294,13 @@ pub(crate) fn run(
     mut ctx: BootContext<'_>,
     flash_config: config::FlashConfig,
 ) -> crate::Result<()> {
-    let mut write = log_writer(flash_config.mode, ctx.layout.device.base.clone());
-    run_and_persist(&mut ctx, &flash_config, &mut run_selected_mode, &mut write)?;
+    run_and_persist(
+        &mut ctx,
+        &flash_config,
+        &mut run_selected_mode,
+        &mut write_log,
+        &mut rawio::reread_partition_table,
+    )?;
 
     let Err(e) = reboot(terminal_action(flash_config.mode));
     Err(FlashError::Io(e.into()).into())
@@ -369,8 +374,14 @@ mod tests {
         };
 
         // Fails before any device is touched.
-        let err =
-            run_and_persist(&mut ctx, &flash_config, &mut run_selected_mode, write).unwrap_err();
+        let err = run_and_persist(
+            &mut ctx,
+            &flash_config,
+            &mut run_selected_mode,
+            write,
+            &mut |_| unreachable!("mode 1 does not rewrite the source disk"),
+        )
+        .unwrap_err();
         let cleared = cleared.lock().unwrap().clone();
         (err, cleared)
     }
@@ -486,6 +497,7 @@ mod tests {
     fn run_mode_2(
         result: fn() -> Result<(), FlashError>,
         write: LogWriter<'_>,
+        reread: TableRereader<'_>,
     ) -> (crate::Result<()>, Vec<crate::bootloader::BootEnvKey>) {
         use crate::bootloader::{BootEnvState, MockBootEnv};
         use crate::config::Config;
@@ -507,6 +519,7 @@ mod tests {
             &crate::mode::mode_2_config(),
             &mut |_, _| result(),
             write,
+            reread,
         )
         .map_err(Into::into);
         let cleared = cleared.lock().unwrap().clone();
@@ -533,6 +546,7 @@ mod tests {
                 writes += 1;
                 Ok(())
             },
+            &mut |_| unreachable!("no log, so no re-read"),
         );
         assert!(outcome.is_err());
         assert_eq!(writes, 0, "a partly written disk must not be mounted");
@@ -554,6 +568,8 @@ mod tests {
                 writes += 1;
                 Ok(())
             },
+            // The disk may still be mounted, so a re-read would fail.
+            &mut |_| unreachable!("the table did not change"),
         );
         assert!(outcome.is_err());
         assert_eq!(writes, 1);
@@ -568,10 +584,19 @@ mod tests {
         crate::logging::capture::install_test_logger();
 
         let mut written: Vec<(std::path::PathBuf, String, Vec<String>)> = Vec::new();
-        let (outcome, cleared) = run_mode_2(|| Ok(()), &mut |partition, file, lines| {
-            written.push((partition.to_path_buf(), file.to_string(), lines.to_vec()));
-            Ok(())
-        });
+        let mut rereads = 0;
+        let (outcome, cleared) = run_mode_2(
+            || Ok(()),
+            &mut |partition, file, lines| {
+                written.push((partition.to_path_buf(), file.to_string(), lines.to_vec()));
+                Ok(())
+            },
+            &mut |_| {
+                rereads += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(rereads, 1);
         assert!(outcome.is_ok());
         assert!(!cleared.is_empty());
         let [(partition, file, lines)] = written.as_slice() else {
@@ -603,21 +628,28 @@ mod tests {
 
     #[cfg(feature = "flash-mode-2")]
     #[test]
-    fn the_mode_2_log_is_not_written_when_the_partition_table_cannot_be_re_read() {
-        let disk = tempfile::NamedTempFile::new().unwrap();
-        let data = tempfile::tempdir().unwrap();
-        let mut write = log_writer(config::FlashMode::Mode2, disk.path().to_path_buf());
-        let err = write(data.path(), MODE_2_LOG_FILE, &["line".to_string()]).unwrap_err();
-        assert!(
-            matches!(&err, FlashError::PathIo { path, .. } if path == disk.path()),
-            "got: {err}"
-        );
-    }
+    fn a_mode_2_log_after_the_flash_needs_a_re_read_partition_table() {
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::logging::capture::install_test_logger();
 
-    #[cfg(feature = "flash-mode-1")]
-    #[test]
-    fn mode_1_does_not_re_read_the_source_partition_table() {
-        assert!(!rewrites_running_disk(config::FlashMode::Mode1));
+        let mut writes = 0;
+        let mut rereads = Vec::new();
+        let (outcome, _) = run_mode_2(
+            || Ok(()),
+            &mut |_, _, _| {
+                writes += 1;
+                Ok(())
+            },
+            &mut |disk| {
+                rereads.push(disk.to_path_buf());
+                Err(FlashError::Io(std::io::Error::other("busy")))
+            },
+        );
+        assert!(outcome.is_ok(), "a lost log must not fail the flash");
+        assert_eq!(rereads, [PathBuf::from("/dev/sda")]);
+        assert_eq!(writes, 0, "the old table must not be used for the log");
     }
 
     #[cfg(feature = "flash-mode-1")]

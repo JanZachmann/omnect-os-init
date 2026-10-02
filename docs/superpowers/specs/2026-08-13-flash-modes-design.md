@@ -639,7 +639,7 @@ timeout the mode fails into the normal fatal-error path (§8).
 |---|---|---|---|
 | Mode 1 destination block device | 30 s, off-by-one bug | 30 s | unchanged, bug fixed |
 | Interface up | unbounded | 60 s | machine-driven, should be immediate |
-| DHCP IPv4 address | unbounded | 120 s | covers a slow DHCP server |
+| IPv4 address after `dhcpcd` returns | unbounded | 120 s | `dhcpcd` returns after its own 30 s timeout and keeps trying in the background; without a DHCP server it assigns an IPv4LL address |
 | Mode 2 `wic.bmap` arrival | unbounded | unbounded | waits for a person to start the `scp` (§10.8) |
 
 The values are proposals — reviewers should say if any is wrong for their
@@ -723,9 +723,11 @@ runs. Persistence depends on whether a safe target exists:
   nothing on disk; diagnosis stays on kmsg and the console. Every other outcome,
   success or a failure before the disk is written, writes the log best-effort to
   the data partition. The file is `flash-mode-2.log` for mode 2. The
-  new image may place the data partition elsewhere, so the kernel re-reads the
-  partition table (`BLKRRPART`) before the mount; when that fails, no log is
-  written.
+  new image may place the data partition elsewhere, so after a successful flash
+  the kernel re-reads the partition table (`BLKRRPART`) before the mount; when
+  that fails, no log is written. A failed run did not change the table. The EFI
+  dump mount (§6 step 5) runs before the re-read and uses the old table, as
+  legacy does.
 
 See §10.5.
 
