@@ -1,6 +1,6 @@
 # Flash Modes 1, 2, 3 — Design
 
-**Status:** Accepted
+**Status:** Approved
 
 Port the three flash modes from the legacy scripted initramfs
 (`meta-omnect/recipes-omnect/initrdscripts/omnect-os-initramfs/flash-mode-{1,2,3}`)
@@ -316,8 +316,9 @@ own.
 A `FlashError` variant hierarchy alongside `FactoryResetError`, covering:
 destination device missing or not a block device, destination equal to source,
 missing build-time constant, partition-table dump or apply failure, image copy
-failure, network setup failure, download failure, checksum mismatch, and
-bootloader-environment write failure on the destination.
+failure, network setup failure, download failure, checksum mismatch,
+bootloader-environment write failure on the destination, and a failed
+partition-table re-read after a flash.
 
 ### 3.3 `src/mode/mod.rs`
 
@@ -690,6 +691,7 @@ See §10.4.
 | Network setup or wait timeout | Fatal |
 | Download failure or checksum mismatch | Fatal |
 | `bmaptool` failure | Fatal |
+| Partition-table re-read failure after the flash (§8.3) | Fatal, no log. The image is on the disk, but the EFI step and the log mount must not use the old table |
 | EFI handling failure | Fatal. The machine keeps its old entries if the create failed, and the new entry plus any not yet deleted if a delete failed |
 | Log persistence failure | Log warn → continue |
 
