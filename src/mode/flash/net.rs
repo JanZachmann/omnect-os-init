@@ -25,6 +25,8 @@ const TMP_DIR: &str = "/tmp";
 const INTERFACE_UP_TIMEOUT: Duration = Duration::from_secs(60);
 const DHCP_ADDRESS_TIMEOUT: Duration = Duration::from_secs(120);
 const NET_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// A "still waiting" line per poll would flood kmsg and the run log.
+const NET_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 const IP_LINK_ARGS: [&str; 4] = ["link", "set", FLASH_INTERFACE, "up"];
 
@@ -86,7 +88,8 @@ pub(crate) fn ipv4_of(addrs: &[(String, Option<IpAddr>)], iface: &str) -> Option
     })
 }
 
-/// The bound is the sum of the sleeps.
+/// The bound is the sum of the sleeps. Progress is logged every
+/// `NET_WAIT_LOG_INTERVAL`, and at once when the reason for the wait changes.
 fn wait_for<T>(
     ops: &mut dyn NetOps,
     what: &str,
@@ -96,6 +99,8 @@ fn wait_for<T>(
 ) -> Result<T, FlashError> {
     log::info!("waiting for {what} (up to {}s)", timeout.as_secs());
     let mut waited = Duration::ZERO;
+    let mut next_log = NET_WAIT_LOG_INTERVAL;
+    let mut logged_error = String::new();
     loop {
         let last_error = match attempt(&mut *ops) {
             Ok(Some(value)) => return Ok(value),
@@ -108,7 +113,11 @@ fn wait_for<T>(
                 timeout.as_secs()
             )));
         }
-        log::info!("still waiting for {what}{last_error}");
+        if waited >= next_log || last_error != logged_error {
+            log::info!("still waiting for {what}{last_error}");
+            next_log = waited + NET_WAIT_LOG_INTERVAL;
+            logged_error = last_error;
+        }
         ops.sleep(interval);
         waited += interval;
     }
@@ -202,6 +211,14 @@ mod tests {
         assert_eq!(ipv4_of(&addrs, "eth0"), None);
     }
 
+    /// The log capture is global, so a test that logs "still waiting" must not
+    /// run while another one captures.
+    fn serialized() -> std::sync::MutexGuard<'static, ()> {
+        crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Records every side effect as one line. `link_failures` link attempts
     /// fail first; the address shows up after `address_misses` empty polls.
     #[derive(Default)]
@@ -242,6 +259,7 @@ mod tests {
 
     #[test]
     fn link_up_is_retried_then_dhcpcd_runs_once_then_the_address_is_polled() {
+        let _guard = serialized();
         let mut ops = FakeNetOps {
             link_failures: 2,
             address_misses: 1,
@@ -267,6 +285,7 @@ mod tests {
 
     #[test]
     fn a_link_that_never_comes_up_fails_after_the_bound() {
+        let _guard = serialized();
         let mut ops = FakeNetOps {
             link_failures: usize::MAX,
             ..Default::default()
@@ -281,6 +300,7 @@ mod tests {
 
     #[test]
     fn no_address_fails_after_the_bound_with_dhcpcd_run_once() {
+        let _guard = serialized();
         let mut ops = FakeNetOps {
             address_misses: usize::MAX,
             ..Default::default()
@@ -289,5 +309,48 @@ mod tests {
         assert!(matches!(err, FlashError::NetworkFailed(_)), "{err}");
         assert_eq!(ops.calls.iter().filter(|c| *c == "dhcpcd").count(), 1);
         assert_eq!(ops.calls.iter().filter(|c| *c == "addresses").count(), 2);
+    }
+
+    fn still_waiting_lines(ops: &mut FakeNetOps, timeout: Duration) -> Vec<String> {
+        let _guard = serialized();
+        crate::logging::capture::install_test_logger();
+        crate::logging::start_capture();
+        bring_up_with(ops, timeout, timeout, STEP).unwrap_err();
+        crate::logging::take_capture()
+            .into_iter()
+            .filter(|line| line.contains("still waiting"))
+            .collect()
+    }
+
+    #[test]
+    fn a_long_wait_logs_its_progress_once_per_log_interval() {
+        let mut ops = FakeNetOps {
+            address_misses: usize::MAX,
+            ..Default::default()
+        };
+        let polls = 25;
+        let lines = still_waiting_lines(&mut ops, STEP * polls);
+        let expected = (STEP * polls).as_secs() / NET_WAIT_LOG_INTERVAL.as_secs();
+        assert_eq!(lines.len() as u64, expected, "{lines:?}");
+    }
+
+    #[test]
+    fn a_wait_logs_its_reason_at_once() {
+        let mut ops = FakeNetOps {
+            link_failures: usize::MAX,
+            ..Default::default()
+        };
+        let lines = still_waiting_lines(&mut ops, STEP * 3);
+        assert!(
+            lines
+                .first()
+                .is_some_and(|line| line.contains("no such device")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.len(),
+            1,
+            "an unchanged reason is not repeated: {lines:?}"
+        );
     }
 }
