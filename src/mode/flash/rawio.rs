@@ -1,6 +1,6 @@
 //! Raw byte-range writes to block devices and files.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 #[cfg(feature = "flash-mode-1")]
 use std::io::{ErrorKind, Read};
 use std::io::{Seek, SeekFrom, Write};
@@ -17,6 +17,12 @@ pub const KIB: u64 = 1024;
 
 /// Copy buffer: 1 MiB is enough to keep a block device streaming.
 pub const COPY_BUFFER_SIZE: usize = 1024 * 1024;
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ByteRange {
+    pub offset: u64,
+    pub len: u64,
+}
 
 pub fn kb_to_bytes(kb: u64, name: BuildConstant) -> Result<u64, FlashError> {
     kb.checked_mul(KIB)
@@ -51,11 +57,7 @@ pub fn copy_range(
         .seek(SeekFrom::Start(src_offset))
         .map_err(|e| copy_failed(format!("seeking source: {e}")))?;
 
-    // The destination must already exist: a mistyped device path has to fail
-    // here instead of creating a regular file that makes the copy look done.
-    let mut dst_file = OpenOptions::new()
-        .write(true)
-        .open(dst)
+    let mut dst_file = open_existing_for_write(dst)
         .map_err(|e| copy_failed(format!("opening destination: {e}")))?;
     dst_file
         .seek(SeekFrom::Start(dst_offset))
@@ -120,23 +122,26 @@ pub fn copy_range(
     Ok(copied)
 }
 
-/// Overwrite `len` bytes of `dst` at `offset` with zeros.
+/// The destination must already exist: a mistyped device path has to fail
+/// instead of creating a regular file that makes the write look done.
+fn open_existing_for_write(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().write(true).open(path)
+}
+
 #[cfg(feature = "flash-mode-2")]
-pub fn zero_range(dst: &Path, offset: u64, len: u64) -> Result<(), FlashError> {
+pub fn zero_range(dst: &Path, range: &ByteRange) -> Result<(), FlashError> {
     let io_failed = |source| FlashError::PathIo {
         path: dst.to_path_buf(),
         source,
     };
 
-    // A mistyped device path must fail here instead of creating a file.
-    let mut dst_file = OpenOptions::new()
-        .write(true)
-        .open(dst)
+    let mut dst_file = open_existing_for_write(dst).map_err(io_failed)?;
+    dst_file
+        .seek(SeekFrom::Start(range.offset))
         .map_err(io_failed)?;
-    dst_file.seek(SeekFrom::Start(offset)).map_err(io_failed)?;
 
     let buf = vec![0u8; COPY_BUFFER_SIZE];
-    let mut left = len;
+    let mut left = range.len;
     while left > 0 {
         let chunk = usize::try_from(left).unwrap_or(buf.len()).min(buf.len());
         dst_file.write_all(&buf[..chunk]).map_err(io_failed)?;
@@ -268,7 +273,7 @@ mod tests {
     #[test]
     fn zero_range_zeroes_exactly_the_asked_range() {
         let dst = file_with(b"xxxxxxxxxx");
-        zero_range(dst.path(), 3, 4).unwrap();
+        zero_range(dst.path(), &ByteRange { offset: 3, len: 4 }).unwrap();
         assert_eq!(std::fs::read(dst.path()).unwrap(), b"xxx\0\0\0\0xxx");
     }
 
@@ -279,7 +284,14 @@ mod tests {
         let len = 2 * COPY_BUFFER_SIZE + 1;
         let dst = file_with(&vec![0xff; len + 2 * TAIL]);
 
-        zero_range(dst.path(), 1, len as u64).unwrap();
+        zero_range(
+            dst.path(),
+            &ByteRange {
+                offset: 1,
+                len: len as u64,
+            },
+        )
+        .unwrap();
 
         let out = std::fs::read(dst.path()).unwrap();
         assert_eq!(out[0], 0xff);
@@ -292,7 +304,7 @@ mod tests {
     fn zero_range_does_not_create_a_missing_destination() {
         let dir = tempfile::tempdir().unwrap();
         let dst = dir.path().join("sdz");
-        assert!(zero_range(&dst, 0, 1).is_err());
+        assert!(zero_range(&dst, &ByteRange { offset: 0, len: 1 }).is_err());
         assert!(!dst.exists());
     }
 

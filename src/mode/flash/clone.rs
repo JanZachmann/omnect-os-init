@@ -21,7 +21,7 @@ use crate::filesystem::MountOptions;
 use crate::filesystem::reformat_ext4;
 #[cfg(feature = "grub")]
 use crate::mode::flash::efi;
-use crate::mode::flash::rawio::{self, kb_to_bytes};
+use crate::mode::flash::rawio::{self, ByteRange, kb_to_bytes};
 use crate::mode::flash::{layout_partition, sfdisk, unmount};
 #[cfg(feature = "grub")]
 use crate::mode::flash::{scratch_mounts, with_mount};
@@ -109,12 +109,6 @@ impl BuildConstants {
             uboot_env_size: build::UBOOT_ENV_SIZE,
         }
     }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct ByteRange {
-    offset: u64,
-    len: u64,
 }
 
 #[cfg(feature = "uboot")]

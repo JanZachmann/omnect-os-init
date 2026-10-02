@@ -16,7 +16,7 @@ use crate::bootloader::sync_filesystems;
 use crate::config::{BuildConstant, build};
 use crate::error::FlashError;
 use crate::mode::flash::bmap::{self, BmapArgs};
-use crate::mode::flash::rawio::{self, kb_to_bytes};
+use crate::mode::flash::rawio::{self, ByteRange, kb_to_bytes};
 #[cfg(feature = "grub")]
 use crate::mode::flash::{efi, layout_partition};
 use crate::mode::flash::{net, unmount};
@@ -147,7 +147,7 @@ trait ScpOps {
     fn tell_operator(&mut self, message: &str);
     fn wait_for_bmap(&mut self, path: &Path);
     fn bmap_copy(&mut self, args: &BmapArgs<'_>) -> Result<(), FlashError>;
-    fn zero_range(&mut self, dst: &Path, offset: u64, len: u64) -> Result<(), FlashError>;
+    fn zero_range(&mut self, dst: &Path, range: &ByteRange) -> Result<(), FlashError>;
     #[cfg(not(feature = "flash-mode-2-direct"))]
     fn discard(&mut self, path: &Path);
     fn reread_table(&mut self, disk: &Path) -> Result<(), FlashError>;
@@ -191,8 +191,8 @@ impl ScpOps for RealScpOps {
         bmap::copy(args)
     }
 
-    fn zero_range(&mut self, dst: &Path, offset: u64, len: u64) -> Result<(), FlashError> {
-        rawio::zero_range(dst, offset, len)
+    fn zero_range(&mut self, dst: &Path, range: &ByteRange) -> Result<(), FlashError> {
+        rawio::zero_range(dst, range)
     }
 
     #[cfg(not(feature = "flash-mode-2-direct"))]
@@ -288,8 +288,11 @@ fn scp_with(
         constants.zero_head_bytes,
         disk.display()
     );
-    ops.zero_range(disk, 0, constants.zero_head_bytes)
-        .map_err(partly_written)?;
+    let head = ByteRange {
+        offset: 0,
+        len: constants.zero_head_bytes,
+    };
+    ops.zero_range(disk, &head).map_err(partly_written)?;
 
     log::info!("flashing {} onto {}", source.display(), disk.display());
     ops.bmap_copy(&BmapArgs {
@@ -581,8 +584,13 @@ mod tests {
             ))
         }
 
-        fn zero_range(&mut self, dst: &Path, offset: u64, len: u64) -> Result<(), FlashError> {
-            self.record(format!("zero {}@{offset} len {len}", dst.display()))
+        fn zero_range(&mut self, dst: &Path, range: &ByteRange) -> Result<(), FlashError> {
+            self.record(format!(
+                "zero {}@{} len {}",
+                dst.display(),
+                range.offset,
+                range.len
+            ))
         }
 
         #[cfg(not(feature = "flash-mode-2-direct"))]
