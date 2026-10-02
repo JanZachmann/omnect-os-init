@@ -22,7 +22,9 @@ pub(crate) mod unmount;
 #[cfg(feature = "flash-mode-2")]
 use std::ffi::OsStr;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(any(feature = "flash-mode-1", feature = "grub"))]
+use std::path::PathBuf;
 #[cfg(feature = "flash-mode-2")]
 use std::process::Command;
 
@@ -311,6 +313,8 @@ mod tests {
     use super::*;
     #[cfg(feature = "flash-mode-1")]
     use crate::bootloader::{BootEnv, MockBootEnv};
+    #[cfg(not(any(feature = "flash-mode-1", feature = "grub")))]
+    use std::path::PathBuf;
 
     #[cfg(feature = "flash-mode-2")]
     #[test]
