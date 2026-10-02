@@ -4,8 +4,6 @@
 use std::fs;
 use std::net::Ipv4Addr;
 use std::path::Path;
-#[cfg(feature = "grub")]
-use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 
@@ -16,12 +14,10 @@ use nix::unistd::{Gid, Uid, chown, mkfifo};
 use crate::bootloader::sync_filesystems;
 use crate::config::{BuildConstant, build};
 use crate::error::FlashError;
-#[cfg(feature = "grub")]
-use crate::error::PartitionTableOperation;
 use crate::mode::flash::bmap::{self, BmapArgs};
-#[cfg(feature = "grub")]
-use crate::mode::flash::efi;
 use crate::mode::flash::rawio::{self, kb_to_bytes};
+#[cfg(feature = "grub")]
+use crate::mode::flash::{efi, layout_partition};
 use crate::mode::flash::{net, unmount};
 use crate::partition::PartitionLayout;
 #[cfg(feature = "grub")]
@@ -103,18 +99,6 @@ fn bmap_instruction(ip: Ipv4Addr) -> String {
 
 fn image_instruction(ip: Ipv4Addr) -> String {
     format!("please run: scp <wic-image> {OMNECT_USER}@{ip}:{WIC_FIFO_NAME}")
-}
-
-#[cfg(feature = "grub")]
-fn boot_partition(layout: &PartitionLayout) -> Result<&Path, FlashError> {
-    layout
-        .get(PartitionName::Boot)
-        .map(PathBuf::as_path)
-        .ok_or_else(|| FlashError::PartitionTable {
-            device: layout.device.base.clone(),
-            operation: PartitionTableOperation::Lookup,
-            reason: format!("the layout has no {} partition", PartitionName::Boot),
-        })
 }
 
 /// The FIFO lets `bmaptool` read the image while `scp` is still writing it.
@@ -226,7 +210,7 @@ fn scp_with(
     let constants = required_constants(raw)?;
     let disk = ctx.layout.device.base.as_path();
     #[cfg(feature = "grub")]
-    let boot_partition = boot_partition(ctx.layout)?;
+    let boot_partition = layout_partition(ctx.layout, PartitionName::Boot)?;
 
     let home = Path::new(OMNECT_HOME);
     let fifo = home.join(WIC_FIFO_NAME);
@@ -456,24 +440,36 @@ mod tests {
         );
     }
 
-    /// Records every mode 2 side effect as one line, in call order.
+    /// Records every mode 2 side effect as one line, in call order, and fails
+    /// the first call whose line starts with `fail_on`.
     struct RecordingScpOps {
         calls: Vec<String>,
+        fail_on: Option<&'static str>,
+    }
+
+    impl RecordingScpOps {
+        fn record(&mut self, call: String) -> Result<(), FlashError> {
+            let fail = self.fail_on.is_some_and(|prefix| call.starts_with(prefix));
+            self.calls.push(call);
+            if fail {
+                return Err(FlashError::EfiFailed("injected".to_string()));
+            }
+            Ok(())
+        }
     }
 
     #[cfg(feature = "grub")]
     impl efi::EfiOps for RecordingScpOps {
         fn mount_efivarfs(&mut self) -> Result<(), FlashError> {
-            self.calls.push("mount efivarfs".to_string());
-            Ok(())
+            self.record("mount efivarfs".to_string())
         }
 
         fn efibootmgr(&mut self, args: &[String]) -> Result<String, FlashError> {
-            self.calls.push(
+            self.record(
                 format!("efibootmgr {}", args.join(" "))
                     .trim_end()
                     .to_string(),
-            );
+            )?;
             Ok(String::new())
         }
 
@@ -482,36 +478,30 @@ mod tests {
             boot_partition: &Path,
             _dump: &str,
         ) -> Result<(), FlashError> {
-            self.calls
-                .push(format!("write entry dump to {}", boot_partition.display()));
-            Ok(())
+            self.record(format!("write entry dump to {}", boot_partition.display()))
         }
     }
 
     impl ScpOps for RecordingScpOps {
         fn unmount(&mut self, rootfs: &Path, disk: &Path) -> Result<(), FlashError> {
-            self.calls.push(format!(
+            self.record(format!(
                 "unmount {} and {}",
                 rootfs.display(),
                 disk.display()
-            ));
-            Ok(())
+            ))
         }
 
         fn bring_up_network(&mut self) -> Result<Ipv4Addr, FlashError> {
-            self.calls.push("network".to_string());
+            self.record("network".to_string())?;
             Ok(IP)
         }
 
         fn start_dropbear(&mut self) -> Result<(), FlashError> {
-            self.calls.push("dropbear".to_string());
-            Ok(())
+            self.record("dropbear".to_string())
         }
 
         fn create_fifo(&mut self, path: &Path, owner: u32) -> Result<(), FlashError> {
-            self.calls
-                .push(format!("fifo {} owned by {owner}", path.display()));
-            Ok(())
+            self.record(format!("fifo {} owned by {owner}", path.display()))
         }
 
         fn tell_operator(&mut self, message: &str) {
@@ -523,19 +513,16 @@ mod tests {
         }
 
         fn bmap_copy(&mut self, args: &BmapArgs<'_>) -> Result<(), FlashError> {
-            self.calls.push(format!(
+            self.record(format!(
                 "bmap {} {} to {}",
                 args.bmap.display(),
                 args.source.display(),
                 args.destination.display()
-            ));
-            Ok(())
+            ))
         }
 
         fn zero_range(&mut self, dst: &Path, offset: u64, len: u64) -> Result<(), FlashError> {
-            self.calls
-                .push(format!("zero {}@{offset} len {len}", dst.display()));
-            Ok(())
+            self.record(format!("zero {}@{offset} len {len}", dst.display()))
         }
 
         #[cfg(feature = "grub")]
@@ -548,7 +535,10 @@ mod tests {
         }
     }
 
-    fn run_recorded(raw: &BuildConstants) -> (Result<(), FlashError>, Vec<String>) {
+    fn run_recorded(
+        raw: &BuildConstants,
+        fail_on: Option<&'static str>,
+    ) -> (Result<(), FlashError>, Vec<String>) {
         let layout = PartitionLayout::new(RootDevice {
             base: PathBuf::from("/dev/sda"),
             partition_sep: "",
@@ -559,7 +549,10 @@ mod tests {
             layout: &layout,
             rootfs: Path::new("/rootfs"),
         };
-        let mut ops = RecordingScpOps { calls: Vec::new() };
+        let mut ops = RecordingScpOps {
+            calls: Vec::new(),
+            fail_on,
+        };
         let result = scp_with(&ctx, raw, &mut ops);
         (result, ops.calls)
     }
@@ -568,7 +561,7 @@ mod tests {
     /// disk head is zeroed right before the flash.
     #[test]
     fn mode_2_runs_its_steps_in_the_spec_order() {
-        let (result, calls) = run_recorded(&raw_constants());
+        let (result, calls) = run_recorded(&raw_constants(), None);
         result.unwrap();
 
         let mut expected = vec![
@@ -620,9 +613,33 @@ mod tests {
                 ..raw_constants()
             },
         ] {
-            let (result, calls) = run_recorded(&raw);
+            let (result, calls) = run_recorded(&raw, None);
             assert!(matches!(result, Err(FlashError::MissingBuildConstant(_))));
             assert!(calls.is_empty(), "touched: {calls:?}");
         }
+    }
+
+    #[test]
+    fn a_failed_step_stops_mode_2_there() {
+        for step in ["unmount", "network", "fifo", "dropbear", "bmap", "zero"] {
+            let (result, calls) = run_recorded(&raw_constants(), Some(step));
+            assert!(result.is_err(), "{step}");
+            assert!(
+                calls.last().unwrap().starts_with(step),
+                "{step} must be the last step, got {calls:?}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "flash-mode-2-direct"))]
+    #[test]
+    fn a_failed_verify_pass_stops_mode_2_before_the_disk_is_written() {
+        let (result, calls) = run_recorded(&raw_constants(), Some("bmap"));
+        assert!(result.is_err());
+        assert!(
+            calls.last().unwrap().ends_with("to /home/omnect/wic"),
+            "got {calls:?}"
+        );
+        assert!(!calls.iter().any(|call| call.starts_with("zero")));
     }
 }
