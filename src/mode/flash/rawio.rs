@@ -2,8 +2,8 @@
 
 use std::fs::OpenOptions;
 #[cfg(feature = "flash-mode-1")]
-use std::io::Read;
-use std::io::{ErrorKind, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::config::BuildConstant;
@@ -134,22 +134,11 @@ pub fn zero_range(dst: &Path, offset: u64, len: u64) -> Result<(), FlashError> {
     dst_file.seek(SeekFrom::Start(offset)).map_err(io_failed)?;
 
     let buf = vec![0u8; COPY_BUFFER_SIZE];
-    let mut zeroed: u64 = 0;
-    while zeroed < len {
-        let want = usize::try_from(len - zeroed)
-            .unwrap_or(buf.len())
-            .min(buf.len());
-        match dst_file.write(&buf[..want]) {
-            Ok(0) => {
-                return Err(io_failed(std::io::Error::new(
-                    ErrorKind::WriteZero,
-                    format!("stopped accepting zeros after {zeroed} of {len} bytes"),
-                )));
-            }
-            Ok(w) => zeroed += w as u64,
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(io_failed(e)),
-        }
+    let mut left = len;
+    while left > 0 {
+        let chunk = usize::try_from(left).unwrap_or(buf.len()).min(buf.len());
+        dst_file.write_all(&buf[..chunk]).map_err(io_failed)?;
+        left -= chunk as u64;
     }
 
     dst_file.sync_all().map_err(io_failed)

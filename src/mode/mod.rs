@@ -100,7 +100,7 @@ pub(crate) fn enforce_flag_present(root: &Path) -> bool {
 }
 
 #[cfg(feature = "flash-mode-2")]
-fn mode_2_config() -> flash::config::FlashConfig {
+pub(crate) fn mode_2_config() -> flash::config::FlashConfig {
     flash::config::FlashConfig {
         mode: flash::config::FlashMode::Mode2,
         #[cfg(feature = "flash-mode-1")]

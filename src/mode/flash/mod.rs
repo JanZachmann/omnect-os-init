@@ -96,8 +96,8 @@ fn log_file(mode: config::FlashMode) -> &'static str {
 type ModeRunner<'a> =
     &'a mut dyn FnMut(&config::FlashConfig, &BootContext<'_>) -> Result<(), FlashError>;
 
-/// After a failed mode 2 run the disk is half-written, so mounting it for a log
-/// is not safe.
+/// A failed mode 2 run may have left the disk partly written, so it is not
+/// mounted for a log.
 fn keeps_log_on_failure(mode: config::FlashMode) -> bool {
     match mode {
         #[cfg(feature = "flash-mode-1")]
@@ -160,6 +160,21 @@ fn destination(flash_config: &config::FlashConfig) -> Result<&Path, FlashError> 
         config::Devpath::NotSet => Err(invalid("not set".to_string())),
         config::Devpath::Unreadable(e) => Err(invalid(format!("failed to read env: {e}"))),
     }
+}
+
+#[cfg(any(feature = "flash-mode-1", feature = "grub"))]
+pub(crate) fn layout_partition(
+    layout: &PartitionLayout,
+    name: PartitionName,
+) -> Result<&Path, FlashError> {
+    layout
+        .get(name)
+        .map(std::path::PathBuf::as_path)
+        .ok_or_else(|| FlashError::PartitionTable {
+            device: layout.device.base.clone(),
+            operation: crate::error::PartitionTableOperation::Lookup,
+            reason: format!("the layout has no {name} partition"),
+        })
 }
 
 /// Write the captured log onto the data partition.
@@ -449,15 +464,6 @@ mod tests {
     }
 
     #[cfg(feature = "flash-mode-2")]
-    fn mode_2_config() -> config::FlashConfig {
-        config::FlashConfig {
-            mode: config::FlashMode::Mode2,
-            #[cfg(feature = "flash-mode-1")]
-            devpath: config::Devpath::NotSet,
-        }
-    }
-
-    #[cfg(feature = "flash-mode-2")]
     fn run_mode_2(
         result: fn() -> Result<(), FlashError>,
         write: LogWriter<'_>,
@@ -477,8 +483,13 @@ mod tests {
             BootEnvState::Available(Box::new(mock)),
             OdsStatus::default(),
         );
-        let outcome = run_and_persist(&mut ctx, &mode_2_config(), &mut |_, _| result(), write)
-            .map_err(Into::into);
+        let outcome = run_and_persist(
+            &mut ctx,
+            &crate::mode::mode_2_config(),
+            &mut |_, _| result(),
+            write,
+        )
+        .map_err(Into::into);
         let cleared = cleared.lock().unwrap().clone();
         (outcome, cleared)
     }

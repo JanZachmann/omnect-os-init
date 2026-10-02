@@ -15,16 +15,16 @@ use std::time::{Duration, Instant};
 
 use crate::bootloader::sync_filesystems;
 use crate::config::{BuildConstant, build};
-use crate::error::{FlashError, PartitionTableOperation};
+use crate::error::FlashError;
 #[cfg(feature = "grub")]
 use crate::filesystem::MountOptions;
 use crate::filesystem::reformat_ext4;
 #[cfg(feature = "grub")]
 use crate::mode::flash::efi;
 use crate::mode::flash::rawio::{self, kb_to_bytes};
+use crate::mode::flash::{layout_partition, sfdisk, unmount};
 #[cfg(feature = "grub")]
 use crate::mode::flash::{scratch_mounts, with_mount};
-use crate::mode::flash::{sfdisk, unmount};
 use crate::partition::device::{
     REASON_NOT_A_BLOCK_DEVICE, SYS_DEV_BLOCK, block_devnum, partition_path, partition_sep_for,
     whole_disk_devnum,
@@ -288,17 +288,6 @@ fn verify_destination_partitions(destination: &Path) -> Result<(), FlashError> {
         });
     }
     Ok(())
-}
-
-fn source_partition(layout: &PartitionLayout, name: PartitionName) -> Result<&Path, FlashError> {
-    layout
-        .get(name)
-        .map(PathBuf::as_path)
-        .ok_or_else(|| FlashError::PartitionTable {
-            device: layout.device.base.clone(),
-            operation: PartitionTableOperation::Lookup,
-            reason: format!("the source layout has no {name} partition"),
-        })
 }
 
 fn output_tail(output: &[u8]) -> String {
@@ -590,7 +579,7 @@ fn clone_with(
         (PartitionName::Factory, PARTITION_NUM_FACTORY),
         (PartitionName::Cert, PARTITION_NUM_CERT),
     ] {
-        let src = source_partition(ctx.layout, name)?;
+        let src = layout_partition(ctx.layout, name)?;
         let dst = destination_partition(destination, num);
         log::info!("copying {} onto {}", src.display(), dst.display());
         ops.copy_range(src, 0, &dst, 0, None)?;
