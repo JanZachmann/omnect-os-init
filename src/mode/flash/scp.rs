@@ -195,8 +195,11 @@ impl ScpOps for RealScpOps {
 
     #[cfg(not(feature = "flash-mode-2-direct"))]
     fn discard(&mut self, path: &Path) {
-        if let Err(e) = std::fs::remove_file(path) {
-            log::warn!("failed to remove {}: {e}", path.display());
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                log::warn!("failed to remove {}: {e}", path.display());
+            }
+            _ => {}
         }
     }
 
