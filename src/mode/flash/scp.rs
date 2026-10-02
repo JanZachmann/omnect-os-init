@@ -1,7 +1,8 @@
 //! Flash mode 2: flash the running disk with a `wic.xz` the operator pushes in
 //! over `scp`.
 
-use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
 use std::path::Path;
 use std::thread;
@@ -31,8 +32,10 @@ const WIC_BMAP_NAME: &str = "wic.bmap";
 #[cfg(not(feature = "flash-mode-2-direct"))]
 const WIC_MATERIALIZED_NAME: &str = "wic";
 const BMAP_POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// The last element of a bmap file.
 const BMAP_CLOSING_TAG: &str = "</bmap>";
+/// Enough for the closing tag and the whitespace an editor or generator
+/// leaves after it.
+const BMAP_TAIL_LEN: u64 = 64;
 
 pub(crate) struct ScpCtx<'a> {
     pub(crate) layout: &'a PartitionLayout,
@@ -111,15 +114,22 @@ fn create_owned_fifo(path: &Path, uid: Uid, gid: Gid) -> Result<(), FlashError> 
     chown(path, Some(uid), Some(gid)).map_err(failed)
 }
 
-/// With `flash-mode-2-direct` the disk head is zeroed before `bmaptool` reads
-/// the bmap, so a half-written bmap must not end the wait.
+/// A half-copied bmap must not end the wait: `bmaptool` fails on it, and with
+/// `flash-mode-2-direct` only after the disk head was zeroed. Only the tail is
+/// read, so a large file pushed under the bmap name costs no RAM.
 fn bmap_is_complete(path: &Path) -> bool {
     path.is_file()
-        && fs::read(path).is_ok_and(|content| {
-            content
-                .trim_ascii_end()
-                .ends_with(BMAP_CLOSING_TAG.as_bytes())
-        })
+        && read_tail(path)
+            .is_ok_and(|tail| tail.trim_ascii_end().ends_with(BMAP_CLOSING_TAG.as_bytes()))
+}
+
+fn read_tail(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(BMAP_TAIL_LEN)))?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail)?;
+    Ok(tail)
 }
 
 fn wait_for_bmap(path: &Path, interval: Duration, sleep: &mut dyn FnMut(Duration)) {
@@ -426,6 +436,22 @@ mod tests {
 
         std::fs::write(&path, format!("{PARTIAL_BMAP}{BMAP_CLOSING_TAG}\n")).unwrap();
         assert!(bmap_is_complete(&path), "closing tag and trailing newline");
+    }
+
+    #[test]
+    fn only_the_tail_of_the_bmap_is_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WIC_BMAP_NAME);
+        let long_body = "x".repeat(usize::try_from(BMAP_TAIL_LEN).unwrap() * 4);
+
+        std::fs::write(&path, format!("{BMAP_CLOSING_TAG}{long_body}")).unwrap();
+        assert!(!bmap_is_complete(&path), "closing tag before the tail");
+
+        std::fs::write(&path, format!("{long_body}{BMAP_CLOSING_TAG}")).unwrap();
+        assert!(
+            bmap_is_complete(&path),
+            "closing tag at the end of a long file"
+        );
     }
 
     #[test]
