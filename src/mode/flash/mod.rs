@@ -42,28 +42,7 @@ use crate::partition::{PartitionLayout, PartitionName};
 /// `PATH` for child processes: PID 1 has no login environment, and tools such
 /// as `dhcpcd` run hook scripts that look up their own helpers.
 #[cfg(feature = "flash-mode-2")]
-pub(crate) const CHILD_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
-
-#[cfg(feature = "flash-mode-2")]
-fn child(cmd: &str) -> Command {
-    let mut command = Command::new(cmd);
-    command.env("PATH", CHILD_PATH);
-    command
-}
-
-/// Run `cmd` with inherited stdout and stderr, so the operator sees its
-/// output. The error is the reason the run failed.
-#[cfg(feature = "flash-mode-2")]
-pub(crate) fn run_inherited(cmd: &str, args: &[&OsStr]) -> Result<(), String> {
-    let status = child(cmd)
-        .args(args)
-        .status()
-        .map_err(|e| format!("failed to run {cmd}: {e}"))?;
-    if !status.success() {
-        return Err(format!("{cmd} {args:?} failed ({status})"));
-    }
-    Ok(())
-}
+const CHILD_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Scratch mount points. They sit outside the rootfs mount, which is unmounted
 /// before the disk is written.
@@ -86,6 +65,30 @@ const MODE_2_LOG_FILE: &str = "flash-mode-2.log";
 /// Writes the run log: the data partition, the file name, the captured lines.
 type LogWriter<'a> = &'a mut dyn FnMut(&Path, &str, &[String]) -> Result<(), FlashError>;
 
+type ModeRunner<'a> =
+    &'a mut dyn FnMut(&config::FlashConfig, &BootContext<'_>) -> Result<(), FlashError>;
+
+#[cfg(feature = "flash-mode-2")]
+fn child(cmd: &str) -> Command {
+    let mut command = Command::new(cmd);
+    command.env("PATH", CHILD_PATH);
+    command
+}
+
+/// Run `cmd` with inherited stdout and stderr, so the operator sees its
+/// output.
+#[cfg(feature = "flash-mode-2")]
+pub(crate) fn run_inherited(cmd: &str, args: &[&OsStr]) -> Result<(), String> {
+    let status = child(cmd)
+        .args(args)
+        .status()
+        .map_err(|e| format!("failed to run {cmd}: {e}"))?;
+    if !status.success() {
+        return Err(format!("{cmd} {args:?} failed ({status})"));
+    }
+    Ok(())
+}
+
 fn log_file(mode: config::FlashMode) -> &'static str {
     match mode {
         #[cfg(feature = "flash-mode-1")]
@@ -94,9 +97,6 @@ fn log_file(mode: config::FlashMode) -> &'static str {
         config::FlashMode::Mode2 => MODE_2_LOG_FILE,
     }
 }
-
-type ModeRunner<'a> =
-    &'a mut dyn FnMut(&config::FlashConfig, &BootContext<'_>) -> Result<(), FlashError>;
 
 /// The data partition is not mounted on a partly written disk, or through a
 /// partition table the disk no longer has.

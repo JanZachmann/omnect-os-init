@@ -30,18 +30,16 @@ const NET_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 const IP_LINK_ARGS: [&str; 4] = ["link", "set", FLASH_INTERFACE, "up"];
 
-/// The side effects of the network setup, so a test can pin their order.
-pub(crate) trait NetOps {
-    /// `ip link set eth0 up`; an error means "try again later".
+trait NetOps {
+    /// An error means "try again later".
     fn link_up(&mut self) -> Result<(), FlashError>;
-    /// `dhcpcd eth0`; it must return, then the address is polled with a bound.
+    /// Returns once dhcpcd has daemonized; the address is polled afterwards.
     fn run_dhcpcd(&mut self) -> Result<(), FlashError>;
-    /// Every interface address as `(interface name, address)`.
     fn addresses(&mut self) -> Result<Vec<(String, Option<IpAddr>)>, FlashError>;
     fn sleep(&mut self, duration: Duration);
 }
 
-pub(crate) struct RealNetOps;
+struct RealNetOps;
 
 fn run_visible(cmd: &str, args: &[&str]) -> Result<(), FlashError> {
     let args: Vec<&OsStr> = args.iter().map(OsStr::new).collect();
@@ -81,7 +79,7 @@ impl NetOps for RealNetOps {
     }
 }
 
-pub(crate) fn ipv4_of(addrs: &[(String, Option<IpAddr>)], iface: &str) -> Option<Ipv4Addr> {
+fn ipv4_of(addrs: &[(String, Option<IpAddr>)], iface: &str) -> Option<Ipv4Addr> {
     addrs.iter().find_map(|(name, ip)| match ip {
         Some(IpAddr::V4(v4)) if name == iface => Some(*v4),
         _ => None,

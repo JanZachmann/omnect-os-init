@@ -15,6 +15,13 @@ pub mod factory_reset;
 #[cfg(feature = "flash-mode")]
 pub mod flash;
 
+/// An image recipe adds the flag to the initramfs, so it is checked at run time.
+#[cfg(feature = "flash-mode-2")]
+const ENFORCE_FLASH_MODE_FLAG: &str = "etc/enforce_flash_mode";
+
+#[cfg(feature = "flash-mode-2")]
+const INITRAMFS_ROOT: &str = "/";
+
 /// Runtime context passed to the active boot-mode handler.
 pub struct BootContext<'a> {
     pub(crate) config: &'a Config,
@@ -87,13 +94,6 @@ fn clear_flash_and_reset_triggers(bl: &mut dyn BootEnv) {
     }
 }
 
-/// An image recipe adds the flag to the initramfs, so it is checked at run time.
-#[cfg(feature = "flash-mode-2")]
-pub(crate) const ENFORCE_FLASH_MODE_FLAG: &str = "etc/enforce_flash_mode";
-
-#[cfg(feature = "flash-mode-2")]
-const INITRAMFS_ROOT: &str = "/";
-
 /// Whether the running initramfs carries the enforce flag file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnforceFlag {
@@ -102,7 +102,7 @@ pub enum EnforceFlag {
 }
 
 #[cfg(feature = "flash-mode-2")]
-pub(crate) fn enforce_flag(root: &Path) -> EnforceFlag {
+fn enforce_flag(root: &Path) -> EnforceFlag {
     if root.join(ENFORCE_FLASH_MODE_FLAG).is_file() {
         EnforceFlag::Present
     } else {

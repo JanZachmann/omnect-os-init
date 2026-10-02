@@ -18,6 +18,15 @@ pub const KIB: u64 = 1024;
 /// Copy buffer: 1 MiB is enough to keep a block device streaming.
 pub const COPY_BUFFER_SIZE: usize = 1024 * 1024;
 
+// BLKRRPART from <linux/fs.h>.
+#[cfg(feature = "flash-mode-2")]
+const BLK_IOC_MAGIC: u8 = 0x12;
+#[cfg(feature = "flash-mode-2")]
+const BLKRRPART_NR: u8 = 95;
+
+#[cfg(feature = "flash-mode-2")]
+nix::ioctl_none!(blkrrpart, BLK_IOC_MAGIC, BLKRRPART_NR);
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct ByteRange {
     pub offset: u64,
@@ -150,15 +159,6 @@ pub fn zero_range(dst: &Path, range: &ByteRange) -> Result<(), FlashError> {
 
     dst_file.sync_all().map_err(io_failed)
 }
-
-// BLKRRPART from <linux/fs.h>.
-#[cfg(feature = "flash-mode-2")]
-const BLK_IOC_MAGIC: u8 = 0x12;
-#[cfg(feature = "flash-mode-2")]
-const BLKRRPART_NR: u8 = 95;
-
-#[cfg(feature = "flash-mode-2")]
-nix::ioctl_none!(blkrrpart, BLK_IOC_MAGIC, BLKRRPART_NR);
 
 /// Make the kernel re-read the partition table of `disk`. Fails while any
 /// partition of `disk` is mounted.

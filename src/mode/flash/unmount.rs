@@ -14,19 +14,6 @@ use crate::filesystem::{is_path_mounted, mount_points, umount};
 #[cfg(feature = "flash-mode-2")]
 use crate::partition::device::{SYS_DEV_BLOCK, block_devnum, whole_disk_devnum};
 
-/// Unmount the rootfs and its boot partition, syncing first.
-pub(crate) fn unmount_rootfs(rootfs: &Path) -> Result<(), FlashError> {
-    sync_filesystems();
-
-    for path in [rootfs.join(mount_points::BOOT), rootfs.to_path_buf()] {
-        if is_path_mounted(&path)? {
-            umount(&path)?;
-        }
-    }
-
-    Ok(())
-}
-
 #[cfg(feature = "flash-mode-2")]
 const PROC_MOUNTS: &str = "/proc/mounts";
 #[cfg(feature = "flash-mode-2")]
@@ -40,6 +27,19 @@ const MOUNTS_ESCAPES: [(&str, char); 4] = [
     ("\\012", '\n'),
     ("\\134", '\\'),
 ];
+
+/// Unmount the rootfs and its boot partition, syncing first.
+pub(crate) fn unmount_rootfs(rootfs: &Path) -> Result<(), FlashError> {
+    sync_filesystems();
+
+    for path in [rootfs.join(mount_points::BOOT), rootfs.to_path_buf()] {
+        if is_path_mounted(&path)? {
+            umount(&path)?;
+        }
+    }
+
+    Ok(())
+}
 
 /// Unmount the rootfs, then every other mount backed by `disk`.
 #[cfg(feature = "flash-mode-2")]
@@ -76,7 +76,7 @@ pub(crate) fn unmount_target_disk(rootfs: &Path, disk: &Path) -> Result<(), Flas
 }
 
 /// The mount points whose source sits on `disk`, deepest first so a nested
-/// mount goes before its parent. Sources are matched by device number.
+/// mount goes before its parent.
 #[cfg(feature = "flash-mode-2")]
 fn mounts_backed_by(
     proc_mounts: &str,

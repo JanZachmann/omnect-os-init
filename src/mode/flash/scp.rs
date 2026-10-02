@@ -41,7 +41,6 @@ pub(crate) struct ScpCtx<'a> {
     pub(crate) rootfs: &'a Path,
 }
 
-/// The build-time constants as `build.rs` generated them.
 struct BuildConstants {
     boot_start: Option<u64>,
     boot_size: Option<u64>,
@@ -138,7 +137,6 @@ fn wait_for_bmap(path: &Path, interval: Duration, sleep: &mut dyn FnMut(Duration
     }
 }
 
-/// The side effects of mode 2, so a test can pin their order.
 trait ScpOps {
     fn unmount(&mut self, rootfs: &Path, disk: &Path) -> Result<(), FlashError>;
     fn bring_up_network(&mut self) -> Result<Ipv4Addr, FlashError>;
@@ -276,9 +274,8 @@ fn scp_with(
     #[cfg(feature = "flash-mode-2-direct")]
     let source = fifo;
 
-    // Without this, GRUB devices sometimes could not boot after a flash
-    // (`bootx64.efi` on the disk differed from the image), and U-Boot devices
-    // had errors on the boot partition after `bmaptool`.
+    // bmaptool writes only mapped blocks, so bytes of the old image in unmapped
+    // ranges of the boot area would survive the flash.
     let partly_written = |source| FlashError::DiskPartlyWritten {
         disk: disk.to_path_buf(),
         source: Box::new(source),
@@ -420,6 +417,8 @@ mod tests {
         assert!(image_instruction(IP).contains("scp -O <wic-image> omnect@192.168.0.7:wic.xz"));
     }
 
+    // Without root the FIFO can only go to the current user, so this does not
+    // catch a missing `chown`.
     #[test]
     fn the_fifo_is_private_to_its_owner() {
         let dir = tempfile::tempdir().unwrap();
@@ -433,7 +432,6 @@ mod tests {
         assert_eq!(meta.gid(), Gid::current().as_raw());
     }
 
-    /// Enough polls for the test sequence; more means the wait never ends.
     const MAX_TEST_POLLS: usize = 10;
     const PARTIAL_BMAP: &str = "<?xml version=\"1.0\" ?>\n<bmap version=\"2.0\">\n";
 
@@ -637,7 +635,7 @@ mod tests {
     /// The operator is asked for the image only after the bmap arrived, and the
     /// disk head is zeroed right before the flash.
     #[test]
-    fn mode_2_runs_its_steps_in_the_spec_order() {
+    fn mode_2_runs_its_steps_in_order() {
         let (result, calls) = run_recorded(&raw_constants(), None);
         result.unwrap();
 

@@ -30,6 +30,14 @@ const DEVICE_POLL_INTERVAL_MS: u64 = 100;
 #[cfg(feature = "grub")]
 const BLKID_CMD: &str = "/sbin/blkid";
 
+/// Block devices by device number, each a link to the device's sysfs
+/// directory.
+#[cfg(feature = "flash-mode")]
+pub(crate) const SYS_DEV_BLOCK: &str = "/sys/dev/block";
+
+#[cfg(feature = "flash-mode")]
+pub(crate) const REASON_NOT_A_BLOCK_DEVICE: &str = "not a block device";
+
 /// Represents the detected root block device and its properties.
 #[derive(Debug, Clone)]
 pub struct RootDevice {
@@ -274,14 +282,6 @@ fn wait_for_device(device: &Path) -> Result<()> {
         thread::sleep(Duration::from_millis(DEVICE_POLL_INTERVAL_MS));
     }
 }
-
-/// Block devices by device number, each a link to the device's sysfs
-/// directory.
-#[cfg(feature = "flash-mode")]
-pub(crate) const SYS_DEV_BLOCK: &str = "/sys/dev/block";
-
-#[cfg(feature = "flash-mode")]
-pub(crate) const REASON_NOT_A_BLOCK_DEVICE: &str = "not a block device";
 
 #[cfg(feature = "flash-mode")]
 pub(crate) fn block_devnum(path: &Path) -> std::result::Result<u64, String> {
