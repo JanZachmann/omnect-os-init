@@ -959,9 +959,9 @@ Implemented separately, listed here so nothing is lost:
 - for mode 2, pass `OMNECT_PART_OFFSET_BOOT`, `OMNECT_PART_SIZE_BOOT` and
   `OMNECT_USER_ID` the same way, and enable the cargo feature
   `flash-mode-2-direct` when `OMNECT_FLASH_MODE_2_DIRECT_FLASHING` is `1`;
-- define `OMNECT_USER_ID ?= "15581"` in `omnect_user.bbclass` and use it for
-  both `groupadd -g` and `useradd -u`, so the recipe and the init share one
-  value;
+- define `OMNECT_USER_ID ?= "15581"` in the distro configuration and use it in
+  `omnect_user.bbclass` for both `groupadd -g` and `useradd -u`, so the class
+  and the init recipe, which does not inherit the class, share one value;
 - map `DISTRO_FEATURES` `flash-mode-2` and `flash-mode-3` onto the corresponding
   Cargo features;
 - gate mode 1 the same way: map `DISTRO_FEATURES` `flash-mode-1` onto the Cargo

@@ -306,8 +306,8 @@ time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
 | `sgdisk`, `parted`, `resize2fs` | `resize-data` | `gptfdisk`, `parted`, `e2fsprogs-resize2fs` |
 | `sfdisk` | `flash-mode-1` | `util-linux-sfdisk` |
 | `e2image` | `flash-mode-1` | `e2fsprogs` |
-| `efibootmgr` | `flash-mode-1` on EFI machines | `efibootmgr` |
-| `efivarfs` filesystem | `flash-mode-1` on EFI machines | kernel (`CONFIG_EFIVAR_FS`) |
+| `efibootmgr` | `flash-mode-1`, `flash-mode-2` on EFI machines | `efibootmgr` |
+| `efivarfs` filesystem | `flash-mode-1`, `flash-mode-2` on EFI machines | kernel (`CONFIG_EFIVAR_FS`) |
 | `/etc/omnect/grubenv.in` | `flash-mode-1` with `grub` | `grub-env` |
 | `/etc/omnect/uboot-env.bin` | `flash-mode-1` with `uboot` | image recipe (`add_uboot_env`) |
 | `/sbin/ip` | `flash-mode-2` | `busybox` |
@@ -315,6 +315,8 @@ time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
 | `/sbin/dropbear` | `flash-mode-2` | `dropbear` |
 | `/usr/bin/bmaptool` | `flash-mode-2` | `bmaptool` |
 | `xz` (run by `bmaptool`) | `flash-mode-2` | `xz` |
+| `omnect` user and `/home/omnect` | `flash-mode-2` | image recipe (`inherit omnect_user`) |
+| `devpts` filesystem | `flash-mode-2` | kernel (`CONFIG_UNIX98_PTYS`) |
 
 ## Testing
 
