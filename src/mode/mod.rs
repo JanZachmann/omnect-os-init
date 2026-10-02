@@ -94,9 +94,20 @@ pub(crate) const ENFORCE_FLASH_MODE_FLAG: &str = "etc/enforce_flash_mode";
 #[cfg(feature = "flash-mode-2")]
 const INITRAMFS_ROOT: &str = "/";
 
+/// Whether the running initramfs carries the enforce flag file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnforceFlag {
+    Absent,
+    Present,
+}
+
 #[cfg(feature = "flash-mode-2")]
-pub(crate) fn enforce_flag_present(root: &Path) -> bool {
-    root.join(ENFORCE_FLASH_MODE_FLAG).is_file()
+pub(crate) fn enforce_flag(root: &Path) -> EnforceFlag {
+    if root.join(ENFORCE_FLASH_MODE_FLAG).is_file() {
+        EnforceFlag::Present
+    } else {
+        EnforceFlag::Absent
+    }
 }
 
 #[cfg(feature = "flash-mode-2")]
@@ -137,10 +148,10 @@ impl BootMode {
     /// built in, the enforce flag file in the running initramfs.
     pub fn detect(bl: Option<&mut dyn BootEnv>) -> Result<Self> {
         #[cfg(feature = "flash-mode-2")]
-        let flag_present = enforce_flag_present(Path::new(INITRAMFS_ROOT));
+        let flag = enforce_flag(Path::new(INITRAMFS_ROOT));
         #[cfg(not(feature = "flash-mode-2"))]
-        let flag_present = false;
-        Self::detect_with(bl, flag_present)
+        let flag = EnforceFlag::Absent;
+        Self::detect_with(bl, flag)
     }
 
     /// Detect the boot mode, with the enforce flag state given.
@@ -164,8 +175,10 @@ impl BootMode {
     )]
     pub fn detect_with(
         bl: Option<&mut dyn BootEnv>,
-        #[cfg_attr(not(feature = "flash-mode-2"), allow(unused_variables))] flag_present: bool,
+        #[cfg_attr(not(feature = "flash-mode-2"), allow(unused_variables))] flag: EnforceFlag,
     ) -> Result<Self> {
+        #[cfg(feature = "flash-mode-2")]
+        let flag_present = flag == EnforceFlag::Present;
         let Some(bl) = bl else {
             #[cfg(feature = "flash-mode-2")]
             if flag_present {
@@ -270,13 +283,13 @@ mod tests {
     #[test]
     fn detect_normal_with_live_bootloader() {
         let mut mock = create_mock_bootloader();
-        let mode = BootMode::detect_with(Some(&mut mock), false).unwrap();
+        let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
         assert!(matches!(mode, BootMode::Normal));
     }
 
     #[test]
     fn detect_normal_degraded_boot_no_bootloader() {
-        let mode = BootMode::detect_with(None, false).unwrap();
+        let mode = BootMode::detect_with(None, EnforceFlag::Absent).unwrap();
         assert!(matches!(mode, BootMode::Normal));
     }
 
@@ -288,7 +301,7 @@ mod tests {
         #[test]
         fn detect_normal_when_factory_reset_key_absent() {
             let mut mock = create_mock_bootloader();
-            let mode = BootMode::detect_with(Some(&mut mock), false).unwrap();
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
             assert!(matches!(mode, BootMode::Normal));
         }
 
@@ -296,7 +309,7 @@ mod tests {
         fn detect_factory_reset_when_key_present_valid_json() {
             let mut mock = create_mock_bootloader()
                 .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
-            let mode = BootMode::detect_with(Some(&mut mock), false).unwrap();
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
             let BootMode::FactoryReset(FactoryResetTrigger::Accepted(config)) = mode else {
                 panic!("a usable trigger must be accepted");
             };
@@ -318,7 +331,7 @@ mod tests {
                 r#"{"mode":1,"preserve":""}"#,
             ] {
                 let mut mock = create_mock_bootloader().with_env(BootEnvKey::FactoryReset, trigger);
-                let mode = BootMode::detect_with(Some(&mut mock), false).unwrap();
+                let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
                 assert!(
                     matches!(
                         mode,
@@ -333,7 +346,7 @@ mod tests {
         fn detect_normal_when_the_trigger_is_blank() {
             for trigger in ["", " ", "\n"] {
                 let mut mock = create_mock_bootloader().with_env(BootEnvKey::FactoryReset, trigger);
-                let mode = BootMode::detect_with(Some(&mut mock), false).unwrap();
+                let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
                 assert!(
                     matches!(mode, BootMode::Normal),
                     "a blank trigger must not start a reset: {trigger:?}"
@@ -343,14 +356,14 @@ mod tests {
 
         #[test]
         fn detect_normal_when_bootloader_unavailable() {
-            let mode = BootMode::detect_with(None, false).unwrap();
+            let mode = BootMode::detect_with(None, EnforceFlag::Absent).unwrap();
             assert!(matches!(mode, BootMode::Normal));
         }
 
         #[test]
         fn detect_normal_when_get_env_fails() {
             let mut mock = create_mock_bootloader().with_get_env_error();
-            let mode = BootMode::detect_with(Some(&mut mock), false).unwrap();
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
             assert!(matches!(mode, BootMode::Normal));
         }
     }
@@ -362,19 +375,20 @@ mod tests {
         #[test]
         fn the_enforce_flag_is_a_file_under_etc() {
             let root = tempfile::tempdir().unwrap();
-            assert!(!enforce_flag_present(root.path()));
+            assert_eq!(enforce_flag(root.path()), EnforceFlag::Absent);
 
             let flag = root.path().join(ENFORCE_FLASH_MODE_FLAG);
             std::fs::create_dir_all(flag.parent().unwrap()).unwrap();
             std::fs::create_dir(&flag).unwrap();
-            assert!(
-                !enforce_flag_present(root.path()),
+            assert_eq!(
+                enforce_flag(root.path()),
+                EnforceFlag::Absent,
                 "a directory is not the flag"
             );
 
             std::fs::remove_dir(&flag).unwrap();
             std::fs::write(&flag, "").unwrap();
-            assert!(enforce_flag_present(root.path()));
+            assert_eq!(enforce_flag(root.path()), EnforceFlag::Present);
         }
     }
 
@@ -392,7 +406,7 @@ mod tests {
             let mut mock = create_mock_bootloader()
                 .with_env(BootEnvKey::FlashMode, "1")
                 .with_env(BootEnvKey::FlashModeDevPath, "/dev/mmcblk2");
-            let mode = BootMode::detect_with(Some(&mut mock), false).unwrap();
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
             let BootMode::Flash(config) = mode else {
                 panic!("a set flash-mode must select the flash mode");
             };
@@ -412,7 +426,7 @@ mod tests {
                 let mut mock = create_mock_bootloader()
                     .with_env(BootEnvKey::FlashMode, unknown)
                     .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
-                let mode = BootMode::detect_with(Some(&mut mock), false).unwrap();
+                let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
                 assert!(
                     matches!(
                         mode,
@@ -430,7 +444,7 @@ mod tests {
                 .with_env(BootEnvKey::FlashMode, "1")
                 .with_env(BootEnvKey::FlashModeDevPath, "/dev/mmcblk2")
                 .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
-            let err = BootMode::detect_with(Some(&mut mock), false).unwrap_err();
+            let err = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -455,7 +469,7 @@ mod tests {
                     .with_env(BootEnvKey::FlashMode, "1")
                     .with_env(BootEnvKey::FlashModeDevPath, "/dev/mmcblk2")
                     .with_env(BootEnvKey::FactoryReset, blank);
-                let mode = BootMode::detect_with(Some(&mut mock), false).unwrap();
+                let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
                 assert!(
                     matches!(mode, BootMode::Flash(_)),
                     "a blank reset key is no trigger, so there is nothing to conflict with: {blank:?}"
@@ -472,7 +486,7 @@ mod tests {
                 .with_env(BootEnvKey::FlashMode, "1")
                 .with_env(BootEnvKey::FlashModeDevPath, "/dev/mmcblk2")
                 .with_get_env_error_after(1);
-            let mode = BootMode::detect_with(Some(&mut mock), false).unwrap();
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
             assert!(matches!(mode, BootMode::Normal));
             assert!(mock.set_env_calls.is_empty());
         }
@@ -485,7 +499,7 @@ mod tests {
             let mut mock = create_mock_bootloader()
                 .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#)
                 .with_get_env_error_for(BootEnvKey::FlashMode);
-            let mode = BootMode::detect_with(Some(&mut mock), false).unwrap();
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
             assert!(matches!(mode, BootMode::Normal));
             assert!(mock.set_env_calls.is_empty());
         }
@@ -496,7 +510,9 @@ mod tests {
             use crate::mode::flash::config::Devpath;
 
             let mut unset = create_mock_bootloader().with_env(BootEnvKey::FlashMode, "1");
-            let Ok(BootMode::Flash(config)) = BootMode::detect_with(Some(&mut unset), false) else {
+            let Ok(BootMode::Flash(config)) =
+                BootMode::detect_with(Some(&mut unset), EnforceFlag::Absent)
+            else {
                 panic!("an unset destination must still select the flash mode");
             };
             assert_eq!(config.devpath, Devpath::NotSet);
@@ -504,7 +520,8 @@ mod tests {
             let mut unreadable = create_mock_bootloader()
                 .with_env(BootEnvKey::FlashMode, "1")
                 .with_get_env_error_for(BootEnvKey::FlashModeDevPath);
-            let Ok(BootMode::Flash(config)) = BootMode::detect_with(Some(&mut unreadable), false)
+            let Ok(BootMode::Flash(config)) =
+                BootMode::detect_with(Some(&mut unreadable), EnforceFlag::Absent)
             else {
                 panic!("an unreadable destination must still select the flash mode");
             };
