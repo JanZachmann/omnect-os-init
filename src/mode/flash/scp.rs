@@ -28,7 +28,6 @@ const OMNECT_HOME: &str = "/home/omnect";
 const OMNECT_USER: &str = "omnect";
 const WIC_FIFO_NAME: &str = "wic.xz";
 const WIC_BMAP_NAME: &str = "wic.bmap";
-/// The verify pass writes the mapped, decompressed image here, in RAM.
 #[cfg(not(feature = "flash-mode-2-direct"))]
 const WIC_MATERIALIZED_NAME: &str = "wic";
 const BMAP_POLL_INTERVAL: Duration = Duration::from_secs(1);
@@ -97,11 +96,11 @@ fn required_constants(raw: &BuildConstants) -> Result<Constants, FlashError> {
 }
 
 fn bmap_instruction(ip: Ipv4Addr) -> String {
-    format!("please run: scp <bmap-file> {OMNECT_USER}@{ip}:{WIC_BMAP_NAME}")
+    format!("please run: scp -O <bmap-file> {OMNECT_USER}@{ip}:{WIC_BMAP_NAME}")
 }
 
 fn image_instruction(ip: Ipv4Addr) -> String {
-    format!("please run: scp <wic-image> {OMNECT_USER}@{ip}:{WIC_FIFO_NAME}")
+    format!("please run: scp -O <wic-image> {OMNECT_USER}@{ip}:{WIC_FIFO_NAME}")
 }
 
 /// The FIFO lets `bmaptool` read the image while `scp` is still writing it.
@@ -149,6 +148,8 @@ trait ScpOps {
     fn wait_for_bmap(&mut self, path: &Path);
     fn bmap_copy(&mut self, args: &BmapArgs<'_>) -> Result<(), FlashError>;
     fn zero_range(&mut self, dst: &Path, offset: u64, len: u64) -> Result<(), FlashError>;
+    #[cfg(not(feature = "flash-mode-2-direct"))]
+    fn discard(&mut self, path: &Path);
     fn reread_table(&mut self, disk: &Path) -> Result<(), FlashError>;
     #[cfg(feature = "grub")]
     fn efi(&mut self) -> &mut dyn efi::EfiOps;
@@ -192,6 +193,13 @@ impl ScpOps for RealScpOps {
 
     fn zero_range(&mut self, dst: &Path, offset: u64, len: u64) -> Result<(), FlashError> {
         rawio::zero_range(dst, offset, len)
+    }
+
+    #[cfg(not(feature = "flash-mode-2-direct"))]
+    fn discard(&mut self, path: &Path) {
+        if let Err(e) = std::fs::remove_file(path) {
+            log::warn!("failed to remove {}: {e}", path.display());
+        }
     }
 
     fn reread_table(&mut self, disk: &Path) -> Result<(), FlashError> {
@@ -253,11 +261,16 @@ fn scp_with(
     let source = {
         let image = home.join(WIC_MATERIALIZED_NAME);
         log::info!("verifying {}", fifo.display());
-        ops.bmap_copy(&BmapArgs {
+        // The image is held in the initramfs root, so it must fit in RAM; a
+        // partial copy is removed so the RAM is free for the rest of the run.
+        if let Err(e) = ops.bmap_copy(&BmapArgs {
             bmap: &bmap,
             source: &fifo,
             destination: &image,
-        })?;
+        }) {
+            ops.discard(&image);
+            return Err(e);
+        }
         image
     };
     #[cfg(feature = "flash-mode-2-direct")]
@@ -400,8 +413,8 @@ mod tests {
 
     #[test]
     fn the_operator_is_told_both_scp_commands_with_the_address() {
-        assert!(bmap_instruction(IP).contains("scp <bmap-file> omnect@192.168.0.7:wic.bmap"));
-        assert!(image_instruction(IP).contains("scp <wic-image> omnect@192.168.0.7:wic.xz"));
+        assert!(bmap_instruction(IP).contains("scp -O <bmap-file> omnect@192.168.0.7:wic.bmap"));
+        assert!(image_instruction(IP).contains("scp -O <wic-image> omnect@192.168.0.7:wic.xz"));
     }
 
     #[test]
@@ -572,6 +585,11 @@ mod tests {
             self.record(format!("zero {}@{offset} len {len}", dst.display()))
         }
 
+        #[cfg(not(feature = "flash-mode-2-direct"))]
+        fn discard(&mut self, path: &Path) {
+            self.calls.push(format!("discard {}", path.display()));
+        }
+
         fn reread_table(&mut self, disk: &Path) -> Result<(), FlashError> {
             self.record(format!("reread {}", disk.display()))
         }
@@ -620,9 +638,9 @@ mod tests {
             "network".to_string(),
             "fifo /home/omnect/wic.xz owned by 1000".to_string(),
             "dropbear".to_string(),
-            "tell please run: scp <bmap-file> omnect@192.168.0.7:wic.bmap".to_string(),
+            "tell please run: scp -O <bmap-file> omnect@192.168.0.7:wic.bmap".to_string(),
             "wait for /home/omnect/wic.bmap".to_string(),
-            "tell please run: scp <wic-image> omnect@192.168.0.7:wic.xz".to_string(),
+            "tell please run: scp -O <wic-image> omnect@192.168.0.7:wic.xz".to_string(),
         ];
         #[cfg(not(feature = "flash-mode-2-direct"))]
         expected.extend([
@@ -696,7 +714,10 @@ mod tests {
         ];
         for (step, log_is_kept) in steps {
             let (result, calls) = run_recorded(&raw_constants(), Some(step));
-            let last = calls.last().unwrap();
+            let last = calls
+                .iter()
+                .rfind(|call| !call.starts_with("discard"))
+                .unwrap();
             assert!(
                 last.starts_with(step) || last.ends_with(step),
                 "{step} must be the last step, got {calls:?}"
@@ -730,7 +751,10 @@ mod tests {
         let (result, calls) = run_recorded(&raw_constants(), Some("bmap"));
         assert!(result.is_err());
         assert!(
-            calls.last().unwrap().ends_with("to /home/omnect/wic"),
+            calls.ends_with(&[
+                "bmap /home/omnect/wic.bmap /home/omnect/wic.xz to /home/omnect/wic".to_string(),
+                "discard /home/omnect/wic".to_string(),
+            ]),
             "got {calls:?}"
         );
         assert!(!calls.iter().any(|call| call.starts_with("zero")));
