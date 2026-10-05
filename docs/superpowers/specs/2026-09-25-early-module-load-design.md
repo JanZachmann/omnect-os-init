@@ -85,7 +85,8 @@ example_mod debug=1 mode=fast
   line; the second line is logged as a warning.
 - The files are read from the rootfs image, before the etc overlay is mounted.
   A file changed or added on the device has no effect; the list belongs to the
-  image, like the modules it names.
+  image, like the modules it names. A customer layer changes the list at build
+  time: it adds a file, or replaces or removes one in a bbappend.
 
 ## 5. Load sequence
 
@@ -173,13 +174,16 @@ returned as an error, and none changes the ODS status.
 | module is built in, or already loaded | `info`, skip |
 | `modules.dep` or `modules.builtin` cannot be read | `warn`, skip all loads, `firmware_class.path` unchanged |
 | module name not in `modules.dep` | `warn`, skip the module |
-| a dependency fails to load | `warn`, skip the module that needs it |
+| a dependency fails to load | `warn`, skip the module that needs it; dependencies loaded before stay loaded |
 | module file cannot be opened | `warn`, skip the module |
 | `firmware_class.path` cannot be written | `warn`, skip all loads (without the path a firmware request finds nothing in the initramfs and waits for the sysfs fallback, 60 s by default) |
 | `finit_module` fails with `EEXIST` | `info` (loaded in the meantime) |
 | compressed module, kernel without `CONFIG_MODULE_DECOMPRESS` | `finit_module` fails; `warn`, skip the module |
 | `finit_module` fails otherwise | `warn`, skip the module |
 | rootfs mount failed | the step does not run |
+
+When a listed module did not load, the step ends with one `warn` line that
+names all of them.
 
 A release image must never stop in the fatal-error loop because of this step,
 so no path returns an error.
