@@ -1,6 +1,6 @@
 # Flash Modes 1, 2, 3 — Design
 
-**Status:** Approved
+**Status:** Approved, two open questions in PR #29
 
 Port the three flash modes from the legacy scripted initramfs
 (`meta-omnect/recipes-omnect/initrdscripts/omnect-os-initramfs/flash-mode-{1,2,3}`)
