@@ -1,6 +1,6 @@
 # Flash Modes 1, 2, 3 — Design
 
-**Status:** Approved, two open questions in PR #29
+**Status:** Approved
 
 Port the three flash modes from the legacy scripted initramfs
 (`meta-omnect/recipes-omnect/initrdscripts/omnect-os-initramfs/flash-mode-{1,2,3}`)
@@ -368,7 +368,8 @@ Detection follows the legacy order `86-factory-reset`, `87-flash_mode_1`,
 
 The flag rows with an unreadable environment follow legacy, which checks the
 flag before it reads any environment; the conflict check is skipped there
-because it cannot be made. The
+because it cannot be made. Only `omnect-os-initramfs-test` ships the flag, so
+the skipped check affects test images only. The
 flag is checked at run time on purpose: one `omnect-os-init` package goes into
 every initramfs, and the flag is added by a separate image recipe.
 
