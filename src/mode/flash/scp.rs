@@ -4,7 +4,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ use nix::unistd::{Gid, Uid, chown, mkfifo};
 use crate::bootloader::sync_filesystems;
 use crate::config::{BuildConstant, build};
 use crate::error::FlashError;
-use crate::mode::flash::bmap::{self, BmapArgs};
+use crate::mode::flash::bmap::{self, Bmap, Destination, Source};
 use crate::mode::flash::rawio::{self, ByteRange, kb_to_bytes};
 #[cfg(feature = "grub")]
 use crate::mode::flash::{efi, layout_partition};
@@ -29,7 +29,7 @@ const OMNECT_USER: &str = "omnect";
 const WIC_FIFO_NAME: &str = "wic.xz";
 const WIC_BMAP_NAME: &str = "wic.bmap";
 #[cfg(not(feature = "flash-mode-2-direct"))]
-const WIC_MATERIALIZED_NAME: &str = "wic";
+const WIC_DECODED_NAME: &str = "wic";
 const BMAP_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const BMAP_CLOSING_TAG: &str = "</bmap>";
 /// Enough for the closing tag and the whitespace an editor or generator
@@ -59,13 +59,13 @@ impl BuildConstants {
 
 #[derive(Debug, PartialEq, Eq)]
 struct Constants {
-    zero_head_bytes: u64,
+    head_bytes: u64,
     omnect_user_id: u32,
 }
 
-/// The disk head that is zeroed before the flash: everything up to the end
-/// of the boot partition.
-fn zero_head_kib(boot_start: Option<u64>, boot_size: Option<u64>) -> Result<u64, FlashError> {
+/// The disk head: everything up to the end of the boot partition. Its parts
+/// the image does not write are zeroed after the flash.
+fn head_kib(boot_start: Option<u64>, boot_size: Option<u64>) -> Result<u64, FlashError> {
     let start = boot_start.ok_or(FlashError::MissingBuildConstant(BuildConstant::BootStart))?;
     let size = boot_size.ok_or(FlashError::MissingBuildConstant(BuildConstant::BootSize))?;
     start
@@ -77,8 +77,8 @@ fn zero_head_kib(boot_start: Option<u64>, boot_size: Option<u64>) -> Result<u64,
 }
 
 fn required_constants(raw: &BuildConstants) -> Result<Constants, FlashError> {
-    let zero_head_bytes = kb_to_bytes(
-        zero_head_kib(raw.boot_start, raw.boot_size)?,
+    let head_bytes = kb_to_bytes(
+        head_kib(raw.boot_start, raw.boot_size)?,
         BuildConstant::BootSize,
     )?;
     let id = raw.omnect_user_id.ok_or(FlashError::MissingBuildConstant(
@@ -89,7 +89,7 @@ fn required_constants(raw: &BuildConstants) -> Result<Constants, FlashError> {
         reason: format!("{id} does not fit a user id"),
     })?;
     Ok(Constants {
-        zero_head_bytes,
+        head_bytes,
         omnect_user_id,
     })
 }
@@ -102,7 +102,7 @@ fn image_instruction(ip: Ipv4Addr) -> String {
     format!("please run: scp -O <wic-image> {OMNECT_USER}@{ip}:{WIC_FIFO_NAME}")
 }
 
-/// The FIFO lets `bmaptool` read the image while `scp` is still writing it.
+/// The FIFO lets the flash read the image while `scp` is still writing it.
 fn create_owned_fifo(path: &Path, uid: Uid, gid: Gid) -> Result<(), FlashError> {
     let failed = |errno: Errno| FlashError::PathIo {
         path: path.to_path_buf(),
@@ -112,9 +112,9 @@ fn create_owned_fifo(path: &Path, uid: Uid, gid: Gid) -> Result<(), FlashError> 
     chown(path, Some(uid), Some(gid)).map_err(failed)
 }
 
-/// A half-copied bmap must not end the wait: `bmaptool` fails on it, and with
-/// `flash-mode-2-direct` only after the disk head was zeroed. Only the tail is
-/// read, so a large file pushed under the bmap name costs no RAM.
+/// A half-copied bmap must not end the wait, or the operator would be asked
+/// again for no reason. Only the tail is read, so a large file pushed under
+/// the bmap name costs no RAM.
 fn bmap_is_complete(path: &Path) -> bool {
     path.is_file()
         && read_tail(path)
@@ -144,10 +144,15 @@ trait ScpOps {
     fn create_fifo(&mut self, path: &Path, owner: u32) -> Result<(), FlashError>;
     fn tell_operator(&mut self, message: &str);
     fn wait_for_bmap(&mut self, path: &Path);
-    fn bmap_copy(&mut self, args: &BmapArgs<'_>) -> Result<(), FlashError>;
+    fn read_bmap(&mut self, path: &Path, disk: &Path) -> Result<Bmap, FlashError>;
+    fn bmap_copy(
+        &mut self,
+        bmap: &Bmap,
+        source: &Source<'_>,
+        destination: &Destination<'_>,
+    ) -> Result<(), FlashError>;
     fn zero_range(&mut self, dst: &Path, range: &ByteRange) -> Result<(), FlashError>;
-    #[cfg(not(feature = "flash-mode-2-direct"))]
-    fn discard(&mut self, path: &Path);
+    fn remove(&mut self, path: &Path);
     fn reread_table(&mut self, disk: &Path) -> Result<(), FlashError>;
     #[cfg(feature = "grub")]
     fn efi(&mut self) -> &mut dyn efi::EfiOps;
@@ -185,16 +190,26 @@ impl ScpOps for RealScpOps {
         wait_for_bmap(path, BMAP_POLL_INTERVAL, &mut thread::sleep);
     }
 
-    fn bmap_copy(&mut self, args: &BmapArgs<'_>) -> Result<(), FlashError> {
-        bmap::copy(args)
+    fn read_bmap(&mut self, path: &Path, disk: &Path) -> Result<Bmap, FlashError> {
+        let map = bmap::read(path)?;
+        bmap::check_fits(&map, disk)?;
+        Ok(map)
+    }
+
+    fn bmap_copy(
+        &mut self,
+        bmap: &Bmap,
+        source: &Source<'_>,
+        destination: &Destination<'_>,
+    ) -> Result<(), FlashError> {
+        bmap::copy(bmap, source, destination)
     }
 
     fn zero_range(&mut self, dst: &Path, range: &ByteRange) -> Result<(), FlashError> {
         rawio::zero_range(dst, range)
     }
 
-    #[cfg(not(feature = "flash-mode-2-direct"))]
-    fn discard(&mut self, path: &Path) {
+    fn remove(&mut self, path: &Path) {
         match std::fs::remove_file(path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 log::warn!("failed to remove {}: {e}", path.display());
@@ -217,6 +232,27 @@ impl ScpOps for RealScpOps {
     }
 }
 
+struct Upload {
+    fifo: PathBuf,
+    bmap: PathBuf,
+    /// The verify pass decodes the image here. It is held in the initramfs
+    /// root, so it must fit in RAM.
+    #[cfg(not(feature = "flash-mode-2-direct"))]
+    decoded: PathBuf,
+}
+
+impl Upload {
+    fn in_home() -> Self {
+        let home = Path::new(OMNECT_HOME);
+        Self {
+            fifo: home.join(WIC_FIFO_NAME),
+            bmap: home.join(WIC_BMAP_NAME),
+            #[cfg(not(feature = "flash-mode-2-direct"))]
+            decoded: home.join(WIC_DECODED_NAME),
+        }
+    }
+}
+
 /// Flash the running disk with the image the operator pushes in.
 pub(crate) fn run_scp(ctx: &ScpCtx<'_>) -> Result<(), FlashError> {
     scp_with(
@@ -235,10 +271,11 @@ fn scp_with(
     let disk = ctx.layout.device.base.as_path();
     #[cfg(feature = "grub")]
     let boot_partition = layout_partition(ctx.layout, PartitionName::Boot)?;
-
-    let home = Path::new(OMNECT_HOME);
-    let fifo = home.join(WIC_FIFO_NAME);
-    let bmap = home.join(WIC_BMAP_NAME);
+    let upload = Upload::in_home();
+    let head = ByteRange {
+        offset: 0,
+        len: constants.head_bytes,
+    };
 
     log::info!(
         "flash mode 2: flashing {} with an image pushed in over scp",
@@ -248,59 +285,22 @@ fn scp_with(
     ops.unmount(ctx.rootfs, disk)?;
     let ip = ops.bring_up_network()?;
     // Before dropbear, so a client that can log in always finds the FIFO.
-    ops.create_fifo(&fifo, constants.omnect_user_id)?;
+    ops.create_fifo(&upload.fifo, constants.omnect_user_id)?;
     ops.start_dropbear()?;
 
-    ops.tell_operator(&bmap_instruction(ip));
-    // Unbounded: this waits for a person to start the `scp`.
-    ops.wait_for_bmap(&bmap);
-    ops.tell_operator(&image_instruction(ip));
-
-    // The verify pass reads the whole stream first, so a broken transfer
-    // fails before the disk is written.
-    #[cfg(not(feature = "flash-mode-2-direct"))]
-    let source = {
-        let image = home.join(WIC_MATERIALIZED_NAME);
-        log::info!("verifying {}", fifo.display());
-        // The image is held in the initramfs root, so it must fit in RAM; a
-        // partial copy is removed so the RAM is free for the rest of the run.
-        if let Err(e) = ops.bmap_copy(&BmapArgs {
-            bmap: &bmap,
-            source: &fifo,
-            destination: &image,
-        }) {
-            ops.discard(&image);
-            return Err(e);
-        }
-        image
-    };
-    #[cfg(feature = "flash-mode-2-direct")]
-    let source = fifo;
-
-    // bmaptool writes only mapped blocks, so bytes of the old image in unmapped
-    // ranges of the boot area would survive the flash.
-    let partly_written = |source| FlashError::DiskPartlyWritten {
-        disk: disk.to_path_buf(),
-        source: Box::new(source),
-    };
-    log::info!(
-        "zeroing the first {} bytes of {}",
-        constants.zero_head_bytes,
-        disk.display()
-    );
-    let head = ByteRange {
-        offset: 0,
-        len: constants.zero_head_bytes,
-    };
-    ops.zero_range(disk, &head).map_err(partly_written)?;
-
-    log::info!("flashing {} onto {}", source.display(), disk.display());
-    ops.bmap_copy(&BmapArgs {
-        bmap: &bmap,
-        source: &source,
-        destination: disk,
-    })
-    .map_err(partly_written)?;
+    // The system runs from RAM, so a failed attempt, even one that left the
+    // disk unbootable, can be repaired by a new upload as long as the device
+    // stays powered.
+    while let Err(e) = flash_once(ops, &upload, disk, &head, ip) {
+        log::error!("{e}");
+        ops.tell_operator("flash failed, asking for the bmap and the image again");
+        ops.remove(&upload.bmap);
+        #[cfg(not(feature = "flash-mode-2-direct"))]
+        ops.remove(&upload.decoded);
+        // A new FIFO cuts off a writer that still holds the old one.
+        ops.remove(&upload.fifo);
+        ops.create_fifo(&upload.fifo, constants.omnect_user_id)?;
+    }
 
     // The new image may move partitions. Everything after this point mounts
     // them, so the kernel must drop the table from before the flash first.
@@ -318,6 +318,62 @@ fn scp_with(
     Ok(())
 }
 
+/// One upload and flash. The disk is written only after the bmap passed its
+/// checks.
+fn flash_once(
+    ops: &mut dyn ScpOps,
+    upload: &Upload,
+    disk: &Path,
+    head: &ByteRange,
+    ip: Ipv4Addr,
+) -> Result<(), FlashError> {
+    ops.tell_operator(&bmap_instruction(ip));
+    // Unbounded: this waits for a person to start the `scp`.
+    ops.wait_for_bmap(&upload.bmap);
+    let map = ops.read_bmap(&upload.bmap, disk)?;
+    ops.tell_operator(&image_instruction(ip));
+
+    // The verify pass reads the whole stream first, so a broken transfer
+    // fails before the disk is written.
+    #[cfg(not(feature = "flash-mode-2-direct"))]
+    let source = {
+        log::info!("verifying {}", upload.fifo.display());
+        ops.bmap_copy(
+            &map,
+            &Source::Xz(&upload.fifo),
+            &Destination::File(&upload.decoded),
+        )?;
+        Source::Raw(&upload.decoded)
+    };
+    #[cfg(feature = "flash-mode-2-direct")]
+    let source = Source::Xz(&upload.fifo);
+
+    let partly_written = |source| FlashError::DiskPartlyWritten {
+        disk: disk.to_path_buf(),
+        source: Box::new(source),
+    };
+    log::info!(
+        "flashing {} onto {}",
+        source.path().display(),
+        disk.display()
+    );
+    ops.bmap_copy(&map, &source, &Destination::Device(disk))
+        .map_err(partly_written)?;
+
+    // Only mapped blocks are written, so bytes of the old image in the rest
+    // of the head would survive the flash.
+    for range in map.unmapped(head) {
+        log::info!(
+            "zeroing {} bytes at {} of {}",
+            range.len,
+            range.offset,
+            disk.display()
+        );
+        ops.zero_range(disk, &range).map_err(partly_written)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,26 +384,26 @@ mod tests {
     const IP: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 7);
 
     #[test]
-    fn the_zeroed_head_reaches_the_end_of_the_boot_partition() {
-        assert_eq!(zero_head_kib(Some(4096), Some(40960)).unwrap(), 45056);
+    fn the_head_reaches_the_end_of_the_boot_partition() {
+        assert_eq!(head_kib(Some(4096), Some(40960)).unwrap(), 45056);
     }
 
     #[test]
-    fn the_zeroed_head_needs_boot_start_and_boot_size() {
+    fn the_head_needs_boot_start_and_boot_size() {
         assert!(matches!(
-            zero_head_kib(None, Some(40960)),
+            head_kib(None, Some(40960)),
             Err(FlashError::MissingBuildConstant(BuildConstant::BootStart))
         ));
         assert!(matches!(
-            zero_head_kib(Some(4096), None),
+            head_kib(Some(4096), None),
             Err(FlashError::MissingBuildConstant(BuildConstant::BootSize))
         ));
     }
 
     #[test]
-    fn a_zeroed_head_that_overflows_is_refused() {
+    fn a_head_that_overflows_is_refused() {
         assert!(matches!(
-            zero_head_kib(Some(u64::MAX), Some(1)),
+            head_kib(Some(u64::MAX), Some(1)),
             Err(FlashError::InvalidBuildConstant {
                 name: BuildConstant::BootSize,
                 ..
@@ -379,7 +435,7 @@ mod tests {
         assert_eq!(
             required_constants(&raw_constants()).unwrap(),
             Constants {
-                zero_head_bytes: 46_137_344,
+                head_bytes: 46_137_344,
                 omnect_user_id: 1000,
             }
         );
@@ -502,20 +558,37 @@ mod tests {
         );
     }
 
+    const MIB: u64 = 1024 * 1024;
+
+    /// Maps the first MiB and the third MiB of the disk.
+    fn recorded_bmap() -> Bmap {
+        let mapped = |offset| bmap::MappedRange {
+            bytes: ByteRange { offset, len: MIB },
+            sha256: [0; bmap::SHA256_LEN],
+        };
+        Bmap {
+            image_size: 64 * MIB,
+            ranges: vec![mapped(0), mapped(2 * MIB)],
+        }
+    }
+
     /// Records every mode 2 side effect as one line, in call order, and fails
-    /// the first call whose line starts or ends with `fail_on`.
+    /// the first `failures` calls whose line starts or ends with `fail_on`.
     struct RecordingScpOps {
         calls: Vec<String>,
         fail_on: Option<&'static str>,
+        failures: usize,
     }
 
     impl RecordingScpOps {
         fn record(&mut self, call: String) -> Result<(), FlashError> {
-            let fail = self
-                .fail_on
-                .is_some_and(|step| call.starts_with(step) || call.ends_with(step));
+            let fail = self.failures > 0
+                && self
+                    .fail_on
+                    .is_some_and(|step| call.starts_with(step) || call.ends_with(step));
             self.calls.push(call);
             if fail {
+                self.failures -= 1;
                 return Err(FlashError::EfiFailed("injected".to_string()));
             }
             Ok(())
@@ -576,12 +649,26 @@ mod tests {
             self.calls.push(format!("wait for {}", path.display()));
         }
 
-        fn bmap_copy(&mut self, args: &BmapArgs<'_>) -> Result<(), FlashError> {
+        fn read_bmap(&mut self, path: &Path, disk: &Path) -> Result<Bmap, FlashError> {
             self.record(format!(
-                "bmap {} {} to {}",
-                args.bmap.display(),
-                args.source.display(),
-                args.destination.display()
+                "read bmap {} for {}",
+                path.display(),
+                disk.display()
+            ))?;
+            Ok(recorded_bmap())
+        }
+
+        fn bmap_copy(
+            &mut self,
+            bmap: &Bmap,
+            source: &Source<'_>,
+            destination: &Destination<'_>,
+        ) -> Result<(), FlashError> {
+            assert_eq!(*bmap, recorded_bmap());
+            self.record(format!(
+                "bmap {} to {}",
+                source.path().display(),
+                destination.path().display()
             ))
         }
 
@@ -594,9 +681,8 @@ mod tests {
             ))
         }
 
-        #[cfg(not(feature = "flash-mode-2-direct"))]
-        fn discard(&mut self, path: &Path) {
-            self.calls.push(format!("discard {}", path.display()));
+        fn remove(&mut self, path: &Path) {
+            self.calls.push(format!("remove {}", path.display()));
         }
 
         fn reread_table(&mut self, disk: &Path) -> Result<(), FlashError> {
@@ -616,6 +702,7 @@ mod tests {
     fn run_recorded(
         raw: &BuildConstants,
         fail_on: Option<&'static str>,
+        failures: usize,
     ) -> (Result<(), FlashError>, Vec<String>) {
         let layout = PartitionLayout::new(RootDevice {
             base: PathBuf::from("/dev/sda"),
@@ -630,50 +717,70 @@ mod tests {
         let mut ops = RecordingScpOps {
             calls: Vec::new(),
             fail_on,
+            failures,
         };
         let result = scp_with(&ctx, raw, &mut ops);
         (result, ops.calls)
     }
 
-    /// The operator is asked for the image only after the bmap arrived, and the
-    /// disk head is zeroed right before the flash.
-    #[test]
-    fn mode_2_runs_its_steps_in_order() {
-        let (result, calls) = run_recorded(&raw_constants(), None);
-        result.unwrap();
+    const FLASH_PASS: &str = "to /dev/sda";
 
-        let mut expected = vec![
+    fn setup_calls() -> Vec<String> {
+        vec![
             "unmount /rootfs and /dev/sda".to_string(),
             "network".to_string(),
             "fifo /home/omnect/wic.xz owned by 1000".to_string(),
             "dropbear".to_string(),
+        ]
+    }
+
+    /// One upload and flash, up to and including the zeroed head.
+    fn attempt_calls() -> Vec<String> {
+        let mut calls = vec![
             "tell please run: scp -O <bmap-file> omnect@192.168.0.7:wic.bmap".to_string(),
             "wait for /home/omnect/wic.bmap".to_string(),
+            "read bmap /home/omnect/wic.bmap for /dev/sda".to_string(),
             "tell please run: scp -O <wic-image> omnect@192.168.0.7:wic.xz".to_string(),
         ];
         #[cfg(not(feature = "flash-mode-2-direct"))]
-        expected.extend([
-            "bmap /home/omnect/wic.bmap /home/omnect/wic.xz to /home/omnect/wic".to_string(),
-            "zero /dev/sda@0 len 46137344".to_string(),
-            "bmap /home/omnect/wic.bmap /home/omnect/wic to /dev/sda".to_string(),
+        calls.extend([
+            "bmap /home/omnect/wic.xz to /home/omnect/wic".to_string(),
+            "bmap /home/omnect/wic to /dev/sda".to_string(),
         ]);
         #[cfg(feature = "flash-mode-2-direct")]
-        expected.extend([
-            "zero /dev/sda@0 len 46137344".to_string(),
-            "bmap /home/omnect/wic.bmap /home/omnect/wic.xz to /dev/sda".to_string(),
+        calls.push("bmap /home/omnect/wic.xz to /dev/sda".to_string());
+        // The head minus the two mapped MiBs of `recorded_bmap`.
+        calls.extend([
+            "zero /dev/sda@1048576 len 1048576".to_string(),
+            "zero /dev/sda@3145728 len 42991616".to_string(),
         ]);
-        expected.push("reread /dev/sda".to_string());
+        calls
+    }
+
+    fn finish_calls() -> Vec<String> {
+        let mut calls = vec!["reread /dev/sda".to_string()];
         #[cfg(feature = "grub")]
-        expected.extend([
+        calls.extend([
             "mount efivarfs".to_string(),
             "efibootmgr".to_string(),
             r"efibootmgr -c -d /dev/sda -p 1 -L omnect_os -l \EFI\BOOT\bootx64.efi".to_string(),
             "efibootmgr -v".to_string(),
             "write entry dump to /dev/sda1".to_string(),
         ]);
-        expected.push("sync".to_string());
+        calls.push("sync".to_string());
+        calls
+    }
 
-        assert_eq!(calls, expected);
+    /// The operator is asked for the image only after the bmap passed its
+    /// checks, and the head is zeroed only after the flash.
+    #[test]
+    fn mode_2_runs_its_steps_in_order() {
+        let (result, calls) = run_recorded(&raw_constants(), None, 0);
+        result.unwrap();
+        assert_eq!(
+            calls,
+            [setup_calls(), attempt_calls(), finish_calls()].concat()
+        );
     }
 
     #[test]
@@ -692,27 +799,21 @@ mod tests {
                 ..raw_constants()
             },
         ] {
-            let (result, calls) = run_recorded(&raw, None);
+            let (result, calls) = run_recorded(&raw, None, 0);
             assert!(matches!(result, Err(FlashError::MissingBuildConstant(_))));
             assert!(calls.is_empty(), "touched: {calls:?}");
         }
     }
 
     #[test]
-    fn a_failed_step_stops_mode_2_there() {
+    fn a_failed_setup_or_finish_step_stops_mode_2_there() {
         use crate::mode::flash::keeps_log;
 
-        const FLASH_PASS: &str = "to /dev/sda";
-        // Without the verify pass, the first `bmap` call is the flash pass.
-        let direct = cfg!(feature = "flash-mode-2-direct");
         let steps = [
             ("unmount", true),
             ("network", true),
             ("fifo", true),
             ("dropbear", true),
-            ("bmap", !direct),
-            ("zero", false),
-            (FLASH_PASS, false),
             ("reread", false),
             #[cfg(feature = "grub")]
             ("mount efivarfs", true),
@@ -722,11 +823,8 @@ mod tests {
             ("write entry dump", true),
         ];
         for (step, log_is_kept) in steps {
-            let (result, calls) = run_recorded(&raw_constants(), Some(step));
-            let last = calls
-                .iter()
-                .rfind(|call| !call.starts_with("discard"))
-                .unwrap();
+            let (result, calls) = run_recorded(&raw_constants(), Some(step), usize::MAX);
+            let last = calls.last().unwrap();
             assert!(
                 last.starts_with(step) || last.ends_with(step),
                 "{step} must be the last step, got {calls:?}"
@@ -736,36 +834,69 @@ mod tests {
         }
     }
 
+    fn retry_calls() -> Vec<String> {
+        let mut calls = vec![
+            "tell flash failed, asking for the bmap and the image again".to_string(),
+            "remove /home/omnect/wic.bmap".to_string(),
+        ];
+        #[cfg(not(feature = "flash-mode-2-direct"))]
+        calls.push("remove /home/omnect/wic".to_string());
+        calls.extend([
+            "remove /home/omnect/wic.xz".to_string(),
+            "fifo /home/omnect/wic.xz owned by 1000".to_string(),
+        ]);
+        calls
+    }
+
     #[test]
-    fn a_failed_flash_pass_is_a_partly_written_disk() {
-        let (result, _) = run_recorded(&raw_constants(), Some("to /dev/sda"));
-        assert!(
-            matches!(result, Err(FlashError::DiskPartlyWritten { .. })),
-            "{result:?}"
-        );
+    fn a_failed_attempt_asks_for_bmap_and_image_again() {
+        // Without the verify pass, the copy from the FIFO is the flash pass.
+        let mut steps = vec!["read bmap", "bmap /home/omnect/wic.xz", "zero"];
+        if !cfg!(feature = "flash-mode-2-direct") {
+            steps.push(FLASH_PASS);
+        }
+        for step in steps {
+            let (result, calls) = run_recorded(&raw_constants(), Some(step), 1);
+            result.unwrap_or_else(|e| panic!("{step}: {e}"));
+
+            let attempt = attempt_calls();
+            let failed_at = attempt
+                .iter()
+                .position(|call| call.starts_with(step) || call.ends_with(step))
+                .unwrap();
+            assert_eq!(
+                calls,
+                [
+                    setup_calls(),
+                    attempt[..=failed_at].to_vec(),
+                    retry_calls(),
+                    attempt,
+                    finish_calls()
+                ]
+                .concat(),
+                "{step}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bad_bmap_leaves_the_disk_untouched() {
+        let (_, calls) = run_recorded(&raw_constants(), Some("read bmap"), 1);
+        let retry = calls
+            .iter()
+            .position(|call| call.starts_with("tell flash failed"));
+        let first_write = calls
+            .iter()
+            .position(|call| call.starts_with("zero") || call.ends_with(FLASH_PASS));
+        assert!(retry < first_write, "got {calls:?}");
     }
 
     #[cfg(feature = "grub")]
     #[test]
     fn the_efi_step_uses_the_re_read_table() {
-        let (_, calls) = run_recorded(&raw_constants(), Some("mount efivarfs"));
+        let (_, calls) = run_recorded(&raw_constants(), Some("mount efivarfs"), usize::MAX);
         let reread = calls.iter().position(|call| call == "reread /dev/sda");
         let efi = calls.iter().position(|call| call == "mount efivarfs");
         assert!(reread.is_some() && reread < efi, "got {calls:?}");
-    }
-
-    #[cfg(not(feature = "flash-mode-2-direct"))]
-    #[test]
-    fn a_failed_verify_pass_stops_mode_2_before_the_disk_is_written() {
-        let (result, calls) = run_recorded(&raw_constants(), Some("bmap"));
-        assert!(result.is_err());
-        assert!(
-            calls.ends_with(&[
-                "bmap /home/omnect/wic.bmap /home/omnect/wic.xz to /home/omnect/wic".to_string(),
-                "discard /home/omnect/wic".to_string(),
-            ]),
-            "got {calls:?}"
-        );
-        assert!(!calls.iter().any(|call| call.starts_with("zero")));
     }
 }

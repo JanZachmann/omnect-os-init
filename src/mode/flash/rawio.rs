@@ -133,7 +133,7 @@ pub fn copy_range(
 
 /// The destination must already exist: a mistyped device path has to fail
 /// instead of creating a regular file that makes the write look done.
-fn open_existing_for_write(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_existing_for_write(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).open(path)
 }
 
