@@ -818,4 +818,89 @@ pub(crate) mod tests {
         std::fs::write(&path, "not a bmap").unwrap();
         assert!(matches!(read(&path), Err(FlashError::InvalidBmap { .. })));
     }
+
+    const FIXTURE_BMAP: &str = include_str!("testdata/wic.bmap");
+    const FIXTURE_XZ: &[u8] = include_bytes!("testdata/wic.xz");
+    const FIXTURE_SHA256: &str = "f41a80f9f783ec8915b3420421664c25511937a60fbf9d9001b9b6ebbb53a2b7";
+
+    #[test]
+    fn a_bmap_from_bmaptool_is_accepted() {
+        let bmap = Bmap::parse(FIXTURE_BMAP).unwrap();
+        assert_eq!(bmap.image_size, 20 * BLOCK_SIZE + 100);
+        let bytes: Vec<_> = bmap
+            .ranges
+            .iter()
+            .map(|r| (r.bytes.offset / BLOCK_SIZE, r.bytes.len))
+            .collect();
+        assert_eq!(
+            bytes,
+            [
+                (0, 2 * BLOCK_SIZE),
+                (5, BLOCK_SIZE),
+                (9, 3 * BLOCK_SIZE),
+                (20, 100)
+            ]
+        );
+    }
+
+    /// The same steps as mode 2: decode, flash onto a disk that holds old
+    /// data, then zero what the image does not map.
+    #[test]
+    fn flashing_the_bmaptool_fixture_and_zeroing_the_rest_gives_the_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let bmap = Bmap::parse(FIXTURE_BMAP).unwrap();
+        let source = dir.path().join("wic.xz");
+        std::fs::write(&source, FIXTURE_XZ).unwrap();
+        let decoded = dir.path().join("wic");
+        let disk = dir.path().join("sdz");
+        let disk_len = usize::try_from(bmap.image_size).unwrap() + 4096;
+        std::fs::write(&disk, vec![0xa5; disk_len]).unwrap();
+
+        copy(&bmap, &Source::Xz(&source), &Destination::File(&decoded)).unwrap();
+        assert_eq!(
+            hex(&Sha256::digest(std::fs::read(&decoded).unwrap())),
+            FIXTURE_SHA256
+        );
+
+        copy(&bmap, &Source::Raw(&decoded), &Destination::Device(&disk)).unwrap();
+        let written = std::fs::read(&disk).unwrap();
+        let block = usize::try_from(BLOCK_SIZE).unwrap();
+        assert!(
+            written[2 * block..5 * block].iter().all(|&b| b == 0xa5),
+            "unmapped blocks keep the old data"
+        );
+
+        let all = ByteRange {
+            offset: 0,
+            len: bmap.image_size,
+        };
+        for gap in bmap.unmapped(&all) {
+            crate::mode::flash::rawio::zero_range(&disk, &gap).unwrap();
+        }
+        let flashed = std::fs::read(&disk).unwrap();
+        let image_len = usize::try_from(bmap.image_size).unwrap();
+        assert_eq!(hex(&Sha256::digest(&flashed[..image_len])), FIXTURE_SHA256);
+        assert!(
+            flashed[image_len..].iter().all(|&b| b == 0xa5),
+            "behind the image"
+        );
+    }
+
+    #[test]
+    fn data_after_the_xz_stream_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let bmap = Bmap::parse(FIXTURE_BMAP).unwrap();
+        let source = dir.path().join("wic.xz");
+        std::fs::write(&source, [FIXTURE_XZ, b"trailing garbage"].concat()).unwrap();
+
+        let result = copy(
+            &bmap,
+            &Source::Xz(&source),
+            &Destination::File(&dir.path().join("wic")),
+        );
+        assert!(
+            matches!(result, Err(FlashError::CopyFailed { .. })),
+            "{result:?}"
+        );
+    }
 }

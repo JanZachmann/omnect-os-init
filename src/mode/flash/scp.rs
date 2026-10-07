@@ -572,23 +572,52 @@ mod tests {
         }
     }
 
-    /// Records every mode 2 side effect as one line, in call order, and fails
-    /// the first `failures` calls whose line starts or ends with `fail_on`.
+    /// Lets `passes` calls of `step` succeed, then fails the next `failures`.
+    struct Fault {
+        step: &'static str,
+        passes: usize,
+        failures: usize,
+    }
+
+    fn fails_always(step: &'static str) -> Vec<Fault> {
+        vec![Fault {
+            step,
+            passes: 0,
+            failures: usize::MAX,
+        }]
+    }
+
+    fn fails_once(step: &'static str) -> Vec<Fault> {
+        vec![Fault {
+            step,
+            passes: 0,
+            failures: 1,
+        }]
+    }
+
+    /// Records every mode 2 side effect as one line, in call order. A call
+    /// matches a fault when its line starts or ends with the fault's step.
     struct RecordingScpOps {
         calls: Vec<String>,
-        fail_on: Option<&'static str>,
-        failures: usize,
+        faults: Vec<Fault>,
     }
 
     impl RecordingScpOps {
         fn record(&mut self, call: String) -> Result<(), FlashError> {
-            let fail = self.failures > 0
-                && self
-                    .fail_on
-                    .is_some_and(|step| call.starts_with(step) || call.ends_with(step));
+            let mut fail = false;
+            for fault in &mut self.faults {
+                if !(call.starts_with(fault.step) || call.ends_with(fault.step)) {
+                    continue;
+                }
+                if fault.passes > 0 {
+                    fault.passes -= 1;
+                } else if fault.failures > 0 {
+                    fault.failures -= 1;
+                    fail = true;
+                }
+            }
             self.calls.push(call);
             if fail {
-                self.failures -= 1;
                 return Err(FlashError::EfiFailed("injected".to_string()));
             }
             Ok(())
@@ -701,8 +730,7 @@ mod tests {
 
     fn run_recorded(
         raw: &BuildConstants,
-        fail_on: Option<&'static str>,
-        failures: usize,
+        faults: Vec<Fault>,
     ) -> (Result<(), FlashError>, Vec<String>) {
         let layout = PartitionLayout::new(RootDevice {
             base: PathBuf::from("/dev/sda"),
@@ -716,8 +744,7 @@ mod tests {
         };
         let mut ops = RecordingScpOps {
             calls: Vec::new(),
-            fail_on,
-            failures,
+            faults,
         };
         let result = scp_with(&ctx, raw, &mut ops);
         (result, ops.calls)
@@ -775,7 +802,7 @@ mod tests {
     /// checks, and the head is zeroed only after the flash.
     #[test]
     fn mode_2_runs_its_steps_in_order() {
-        let (result, calls) = run_recorded(&raw_constants(), None, 0);
+        let (result, calls) = run_recorded(&raw_constants(), Vec::new());
         result.unwrap();
         assert_eq!(
             calls,
@@ -799,7 +826,7 @@ mod tests {
                 ..raw_constants()
             },
         ] {
-            let (result, calls) = run_recorded(&raw, None, 0);
+            let (result, calls) = run_recorded(&raw, Vec::new());
             assert!(matches!(result, Err(FlashError::MissingBuildConstant(_))));
             assert!(calls.is_empty(), "touched: {calls:?}");
         }
@@ -823,7 +850,7 @@ mod tests {
             ("write entry dump", true),
         ];
         for (step, log_is_kept) in steps {
-            let (result, calls) = run_recorded(&raw_constants(), Some(step), usize::MAX);
+            let (result, calls) = run_recorded(&raw_constants(), fails_always(step));
             let last = calls.last().unwrap();
             assert!(
                 last.starts_with(step) || last.ends_with(step),
@@ -856,7 +883,7 @@ mod tests {
             steps.push(FLASH_PASS);
         }
         for step in steps {
-            let (result, calls) = run_recorded(&raw_constants(), Some(step), 1);
+            let (result, calls) = run_recorded(&raw_constants(), fails_once(step));
             result.unwrap_or_else(|e| panic!("{step}: {e}"));
 
             let attempt = attempt_calls();
@@ -881,7 +908,7 @@ mod tests {
 
     #[test]
     fn a_bad_bmap_leaves_the_disk_untouched() {
-        let (_, calls) = run_recorded(&raw_constants(), Some("read bmap"), 1);
+        let (_, calls) = run_recorded(&raw_constants(), fails_once("read bmap"));
         let retry = calls
             .iter()
             .position(|call| call.starts_with("tell flash failed"));
@@ -891,10 +918,85 @@ mod tests {
         assert!(retry < first_write, "got {calls:?}");
     }
 
+    #[test]
+    fn a_failed_fifo_after_a_failed_attempt_stops_mode_2() {
+        let faults = vec![
+            Fault {
+                step: "read bmap",
+                passes: 0,
+                failures: 1,
+            },
+            Fault {
+                step: "fifo",
+                passes: 1,
+                failures: 1,
+            },
+        ];
+        let (result, calls) = run_recorded(&raw_constants(), faults);
+        assert!(result.is_err());
+        assert_eq!(
+            calls.last().unwrap(),
+            "fifo /home/omnect/wic.xz owned by 1000"
+        );
+        assert!(!calls.iter().any(|call| call.starts_with("zero")));
+    }
+
+    #[test]
+    fn mode_2_asks_again_as_often_as_attempts_fail() {
+        let faults = vec![Fault {
+            step: FLASH_PASS,
+            passes: 0,
+            failures: 3,
+        }];
+        let (result, calls) = run_recorded(&raw_constants(), faults);
+        result.unwrap();
+        let retries = calls
+            .iter()
+            .filter(|call| call.starts_with("tell flash failed"))
+            .count();
+        assert_eq!(retries, 3);
+        assert!(calls.ends_with(&finish_calls()), "got {calls:?}");
+    }
+
+    #[test]
+    fn the_real_bmap_read_checks_the_bmap_and_the_disk_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WIC_BMAP_NAME);
+        std::fs::write(&path, include_str!("testdata/wic.bmap")).unwrap();
+        let disk = dir.path().join("sdz");
+        let mut ops = RealScpOps::default();
+
+        std::fs::write(&disk, vec![0u8; 1024]).unwrap();
+        assert!(matches!(
+            ops.read_bmap(&path, &disk),
+            Err(FlashError::InvalidDestination { .. })
+        ));
+
+        std::fs::write(&disk, vec![0u8; 1024 * 1024]).unwrap();
+        assert!(ops.read_bmap(&path, &disk).is_ok());
+
+        std::fs::write(&path, "<bmap").unwrap();
+        assert!(matches!(
+            ops.read_bmap(&path, &disk),
+            Err(FlashError::InvalidBmap { .. })
+        ));
+    }
+
+    #[test]
+    fn remove_ignores_a_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WIC_FIFO_NAME);
+        let mut ops = RealScpOps::default();
+        ops.remove(&path);
+        create_owned_fifo(&path, Uid::current(), Gid::current()).unwrap();
+        ops.remove(&path);
+        assert!(!path.exists());
+    }
+
     #[cfg(feature = "grub")]
     #[test]
     fn the_efi_step_uses_the_re_read_table() {
-        let (_, calls) = run_recorded(&raw_constants(), Some("mount efivarfs"), usize::MAX);
+        let (_, calls) = run_recorded(&raw_constants(), fails_always("mount efivarfs"));
         let reread = calls.iter().position(|call| call == "reread /dev/sda");
         let efi = calls.iter().position(|call| call == "mount efivarfs");
         assert!(reread.is_some() && reread < efi, "got {calls:?}");

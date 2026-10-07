@@ -975,6 +975,7 @@ only smoke-tested. Real end-to-end coverage stays in Concourse CI on hardware.
 | Mode 2 asks again after a failed bmap check, verify pass, flash pass or zeroing | unit | `src/mode/flash/scp.rs` |
 | bmap checks: bad input is an error, never a panic | unit | `src/mode/flash/bmap.rs` |
 | bmap copy: only mapped ranges written, range checksum, early and late stream end, `xz` round trip | unit | `src/mode/flash/bmap.rs` |
+| `bmaptool create` output: parsed, and flash plus zeroing the unmapped parts gives the image | unit | `src/mode/flash/bmap.rs` |
 | Mode 2 log skipped only on a partly written disk | unit | `src/mode/flash/mod.rs`, `src/mode/flash/scp.rs` |
 | Clear-first ordering: a failing mode still leaves its triggers cleared | unit | `src/mode/flash/mod.rs` |
 | Destination refusal by device number, parent disk from a fake sysfs tree | unit | `src/mode/flash/clone.rs` |
