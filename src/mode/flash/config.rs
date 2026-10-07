@@ -59,7 +59,7 @@ mod tests {
             assert_eq!(
                 parse_mode(unknown),
                 None,
-                "{unknown} must not select a mode"
+                "{unknown:?} must not select a mode"
             );
         }
     }
