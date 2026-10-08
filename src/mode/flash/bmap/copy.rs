@@ -15,7 +15,8 @@ use crate::mode::flash::rawio::{ByteRange, COPY_BUFFER_SIZE, chunk_len, open_exi
 /// The largest dictionary of the xz presets (`-9`). The decoder allocates the
 /// dictionary that the stream header asks for, so a larger one is rejected
 /// before it can push the device out of memory.
-const MAX_XZ_DICT_SIZE: u32 = 64 * 1024 * 1024;
+const MAX_XZ_DICT_SIZE: u32 = 64 * MIB;
+const MIB: u32 = 1024 * 1024;
 
 /// Copy the mapped ranges of `source` to `destination` and check each range's
 /// checksum.
@@ -66,9 +67,13 @@ fn pass_through(
     let mut left = len;
     while left > 0 {
         let chunk = chunk_len(left, buf.len());
-        let read = input
-            .read(&mut buf[..chunk])
-            .map_err(|e| format!("reading source: {e}"))?;
+        let read = input.read(&mut buf[..chunk]).map_err(|e| match e.kind() {
+            ErrorKind::OutOfMemory => format!(
+                "decoding needs too much memory, the xz dictionary limit is {} MiB: {e}",
+                MAX_XZ_DICT_SIZE / MIB
+            ),
+            _ => format!("reading source: {e}"),
+        })?;
         if read == 0 {
             return Err(format!(
                 "source ended at byte {}, the image has more",
@@ -378,7 +383,7 @@ mod tests {
         };
         decode(DICT_64_MIB).unwrap();
         let err = decode(DICT_96_MIB).unwrap_err();
-        assert!(err.contains("mem_limit"), "{err}");
+        assert!(err.contains("limit is 64 MiB"), "{err}");
     }
 
     #[test]
