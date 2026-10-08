@@ -5,12 +5,17 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 
-use lzma_rust2::XzReader;
+use lzma_rust2::{XzReader, lzma2_get_memory_usage};
 use sha2::{Digest, Sha256};
 
 use crate::error::FlashError;
 use crate::mode::flash::bmap::{Bmap, Destination, Source};
 use crate::mode::flash::rawio::{ByteRange, COPY_BUFFER_SIZE, chunk_len, open_existing_for_write};
+
+/// The largest dictionary of the xz presets (`-9`). The decoder allocates the
+/// dictionary that the stream header asks for, so a larger one is rejected
+/// before it can push the device out of memory.
+const MAX_XZ_DICT_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Copy the mapped ranges of `source` to `destination` and check each range's
 /// checksum.
@@ -82,7 +87,11 @@ trait Input: Read {
 }
 
 fn xz_stream<R: Read>(compressed: R) -> Stream<XzReader<FullReads<R>>> {
-    Stream(XzReader::new(FullReads(compressed), true))
+    Stream(XzReader::new_mem_limit(
+        FullReads(compressed),
+        true,
+        lzma2_get_memory_usage(MAX_XZ_DICT_SIZE),
+    ))
 }
 
 /// A pipe returns only the bytes that have arrived so far. The xz decoder
@@ -323,6 +332,53 @@ mod tests {
                 .unwrap_or_else(|e| panic!("tail {tail}: {e}"));
             assert_eq!(out.into_inner(), image, "tail {tail}");
         }
+    }
+
+    fn crc32(data: &[u8]) -> u32 {
+        const POLYNOMIAL: u32 = 0xEDB8_8320;
+        !data.iter().fold(!0, |crc, &byte| {
+            (0..8).fold(crc ^ u32::from(byte), |crc, _| {
+                if crc & 1 == 1 {
+                    (crc >> 1) ^ POLYNOMIAL
+                } else {
+                    crc >> 1
+                }
+            })
+        })
+    }
+
+    /// Sets the dictionary size byte of the first block and fixes the block
+    /// header CRC.
+    fn with_dict_byte(mut compressed: Vec<u8>, dict_byte: u8) -> Vec<u8> {
+        const STREAM_HEADER_LEN: usize = 12;
+        const CRC_LEN: usize = 4;
+        const LZMA2_FILTER: [u8; 2] = [0x21, 0x01];
+        let header_len = (usize::from(compressed[STREAM_HEADER_LEN]) + 1) * 4;
+        let crc_at = STREAM_HEADER_LEN + header_len - CRC_LEN;
+        let filter = compressed[STREAM_HEADER_LEN..crc_at]
+            .windows(LZMA2_FILTER.len())
+            .position(|bytes| bytes == LZMA2_FILTER)
+            .unwrap();
+        compressed[STREAM_HEADER_LEN + filter + LZMA2_FILTER.len()] = dict_byte;
+        let crc = crc32(&compressed[STREAM_HEADER_LEN..crc_at]);
+        compressed[crc_at..crc_at + CRC_LEN].copy_from_slice(&crc.to_le_bytes());
+        compressed
+    }
+
+    #[test]
+    fn an_xz_dictionary_above_the_limit_is_an_error() {
+        const DICT_64_MIB: u8 = 28;
+        const DICT_96_MIB: u8 = 29;
+        let image = image(2, 0);
+        let bmap = Bmap::parse(&bmap_xml(&image, &[(0, 1)])).unwrap();
+        let decode = |dict_byte| {
+            let compressed = with_dict_byte(xz(&image), dict_byte);
+            let mut out = Cursor::new(Vec::new());
+            copy_stream(&bmap, &mut xz_stream(Cursor::new(compressed)), &mut out)
+        };
+        decode(DICT_64_MIB).unwrap();
+        let err = decode(DICT_96_MIB).unwrap_err();
+        assert!(err.contains("mem_limit"), "{err}");
     }
 
     #[test]
