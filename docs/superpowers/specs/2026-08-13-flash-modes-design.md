@@ -141,7 +141,7 @@ src/mode/flash/
   rawio.rs      in-process replacement for every `dd` call               flash-mode, per item
   unmount.rs    rootfs unmount, /proc/mounts sweep                       flash-mode
   net.rs        interface up, dhcpcd, dropbear                           flash-mode-2/3
-  bmap.rs       bmap parser and in-process flasher                       flash-mode-2/3
+  bmap/         bmap parser and in-process flasher                       flash-mode-2/3
   scp.rs        mode 2 orchestration                                     flash-mode-2
   url.rs        mode 3 orchestration                                     flash-mode-3
 ```
@@ -265,7 +265,7 @@ feature, the others are enabled already. `uuidgen` needs the new `uuid` crate;
 | `ip addr show` | `nix::ifaddrs::getifaddrs` |
 | `sync` | `nix::unistd::sync` |
 | `reboot -f` / `poweroff -f` | `nix::sys::reboot::reboot` with `RB_AUTOBOOT` / `RB_POWER_OFF` |
-| `bmaptool copy` (mode 2) | `bmap.rs`: bmap parsed with `quick-xml`, ranges checked with `sha2`, `xz` decoded with `lzma-rust2` (§5.4) |
+| `bmaptool copy` (mode 2) | `bmap/`: bmap parsed with `quick-xml` and `hex`, ranges checked with `sha2`, `xz` decoded with `lzma-rust2` (§5.4) |
 
 Every `dd` call in the three modes is a plain read and write at a byte offset —
 the bootloader area copy, the `boot`, `factory` and `cert` partition copies, the
@@ -411,7 +411,7 @@ flash-mode-3 = ["flash-mode"]            # URL download
 `flash-mode` gates the shared layer — the selector env key, `BootMode::Flash`,
 `config.rs`, `efi.rs`, and the dispatch branch. It is never enabled directly;
 each mode feature pulls it in. `flash-mode-2` and `flash-mode-3` additionally
-gate `net.rs` and `bmap.rs`.
+gate `net.rs` and `bmap/`.
 
 One new dependency, pulled in by `flash-mode-1` only:
 `uuid = { version = "1.11", default-features = false }`. The bytes come from
@@ -570,16 +570,17 @@ flag file shipped by `omnect-os-initramfs-test`. Both are kept.
 5. Wait for `/home/omnect/wic.bmap` to be complete, unbounded — this waits for
    a person (§7). Complete means a regular file whose content ends with the
    closing `</bmap>` tag, so a half-copied bmap does not end the wait.
-6. Check the bmap before anything is written, with the checks `bmaptool` makes
-   before its first write: XML syntax, major version 2, checksum type
-   `sha256`, the `BmapFileChecksum` (the sha256 of the file with that value
-   replaced by zeros), block counts, ranges sorted, not overlapping and inside
-   `ImageSize`, and `ImageSize` not larger than the disk. Then log the second
-   command, `scp <wic-image> omnect@<ip>:wic.xz`, in the same order as legacy.
+6. Check the bmap before anything is written: XML syntax, major version 2,
+   checksum type `sha256`, the `BmapFileChecksum` (the sha256 of the file with
+   that value replaced by zeros), block counts, ranges sorted, not overlapping
+   and inside `ImageSize`, and `ImageSize` not larger than the disk. Then log
+   the second command, `scp <wic-image> omnect@<ip>:wic.xz`, in the same order
+   as legacy.
 7. Flash. The image is `xz`-decoded in-process (`lzma-rust2`), only the
    ranges the bmap maps are written, and each range is checked against its
    sha256. The stream is read to its end, so a cut-off or extended stream
-   fails.
+   fails. A dictionary larger than 64 MiB, the size of `xz -9`, is rejected
+   before the decoder allocates it.
    - **default** — verify pass first: decode the FIFO into
      `/home/omnect/wic`, a sparse file in the initramfs root, then copy its
      mapped ranges to `/dev/omnect/rootblk`. The RAM cost of the verify pass
@@ -708,7 +709,8 @@ See §10.4.
 "Fatal" means the mode aborts into §8.1's failure path. For mode 1 the source
 disk is untouched, so a power cycle boots normally. For mode 3 the disk is
 left half-written, which is unavoidable for a whole-disk flash. Mode 2 fails
-this way only after a successful flash, when the re-read or the EFI step fails.
+this way after a successful flash, when the re-read or the EFI step fails, or
+when the new FIFO for the next attempt cannot be created.
 
 ### 8.3 Logging
 
@@ -736,8 +738,9 @@ runs. Persistence depends on whether a safe target exists:
   a later change to break the property while the doc still reads as true.
 - **Modes 2 and 3** — the whole disk is overwritten. A failure while the disk
   is written leaves it in an unknown partly written state, and mounting anything
-  on it is unsafe. That failure is `FlashError::DiskPartlyWritten`. Mode 2 does
-  not end on it but asks for the image again (§5.4); a mode that ends on it leaves
+  on it is unsafe. That failure is `FlashError::DiskPartlyWritten`. Mode 2 asks
+  for the image again instead (§5.4), and ends on it only when the new FIFO
+  cannot be created after such an attempt; a mode that ends on it leaves
   nothing on disk; diagnosis stays on kmsg and the console. The new image may
   place partitions elsewhere, so right after the flash pass the kernel re-reads
   the partition table (`BLKRRPART`), before the EFI dump mount (§6 step 5) and
@@ -973,9 +976,9 @@ only smoke-tested. Real end-to-end coverage stays in Concourse CI on hardware.
 | `/proc/mounts` sweep: device numbers, deepest first | unit | `src/mode/flash/unmount.rs` |
 | Mode 2 step order, default and `flash-mode-2-direct` | unit | `src/mode/flash/scp.rs` |
 | Mode 2 asks again after a failed bmap check, verify pass, flash pass or zeroing | unit | `src/mode/flash/scp.rs` |
-| bmap checks: bad input is an error, never a panic | unit | `src/mode/flash/bmap.rs` |
-| bmap copy: only mapped ranges written, range checksum, early and late stream end, `xz` round trip | unit | `src/mode/flash/bmap.rs` |
-| `bmaptool create` output: parsed, and flash plus zeroing the unmapped parts gives the image | unit | `src/mode/flash/bmap.rs` |
+| bmap checks: bad input is an error, never a panic | unit | `src/mode/flash/bmap/parse.rs` |
+| bmap copy: only mapped ranges written, range checksum, early and late stream end, `xz` round trip, `xz` input in small reads | unit | `src/mode/flash/bmap/copy.rs` |
+| `bmaptool create` output: parsed, and flash plus zeroing the unmapped parts gives the image | unit | `src/mode/flash/bmap/mod.rs` |
 | Mode 2 log skipped only on a partly written disk | unit | `src/mode/flash/mod.rs`, `src/mode/flash/scp.rs` |
 | Clear-first ordering: a failing mode still leaves its triggers cleared | unit | `src/mode/flash/mod.rs` |
 | Destination refusal by device number, parent disk from a fake sysfs tree | unit | `src/mode/flash/clone.rs` |

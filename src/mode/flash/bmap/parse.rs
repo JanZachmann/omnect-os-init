@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 use crate::mode::flash::bmap::{Bmap, MappedRange, SHA256_LEN};
 use crate::mode::flash::rawio::ByteRange;
 
-/// Major version 2 introduced `ChecksumType` and the tag names parsed here.
 const SUPPORTED_MAJOR_VERSION: u64 = 2;
 const CHECKSUM_TYPE: &str = "sha256";
 

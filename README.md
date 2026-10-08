@@ -264,7 +264,7 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 | `flash-mode` | Shared flash layer: trigger detection, dispatch, log capture. Pulled in by a mode feature, never selected on its own | Implemented |
 | `flash-mode-1` | Disk cloning (part of the default feature set) | Implemented |
 | `flash-mode-2` | Flash a `wic.xz` pushed in over `scp` | Implemented |
-| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream. A broken image is seen only after writing started; the init then asks for the image again, and the disk does not boot until a good one was flashed | Implemented |
+| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream. A broken image is seen only after writing started; the init then asks for bmap and image again, and the disk does not boot until a good one was flashed | Implemented |
 | `flash-mode-3` | HTTP/HTTPS flashing | Planned |
 
 > **Note:** `grub` and `uboot` are mutually exclusive, and so are `gpt` and `dos`.
