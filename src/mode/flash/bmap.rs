@@ -189,9 +189,9 @@ impl Bmap {
                 .ok_or_else(overflow)?
                 // The last block of the image may be partial.
                 .min(image_size);
-            if offset >= image_size {
+            if last >= blocks_count {
                 return Err(format!(
-                    "range '{}' starts behind the image end",
+                    "range '{}' ends behind the image end",
                     range.blocks.trim()
                 ));
             }
@@ -603,6 +603,7 @@ pub(crate) mod tests {
             ("> 0-1 <", "> 18446744073709551615 <", "byte offset"),
             ("\"> 3 <", "\"> 1 <", "overlaps"),
             ("\"> 3 <", "\"> 9 <", "behind the image end"),
+            ("\"> 3 <", "\"> 3-4 <", "behind the image end"),
             ("<BlockSize> 4096", "<BlockSize> 0", "BlockSize is 0"),
             ("<BlocksCount> 4", "<BlocksCount> 5", "BlocksCount"),
             (
