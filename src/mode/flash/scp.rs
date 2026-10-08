@@ -291,15 +291,24 @@ fn scp_with(
     // The system runs from RAM, so a failed attempt, even one that left the
     // disk unbootable, can be repaired by a new upload as long as the device
     // stays powered.
+    let mut disk_written = false;
     while let Err(e) = flash_once(ops, &upload, disk, &head, ip) {
         log::error!("{e}");
+        disk_written |= matches!(e, FlashError::DiskPartlyWritten { .. });
         ops.tell_operator("flash failed, asking for the bmap and the image again");
         ops.remove(&upload.bmap);
         #[cfg(not(feature = "flash-mode-2-direct"))]
         ops.remove(&upload.decoded);
         // A new FIFO cuts off a writer that still holds the old one.
         ops.remove(&upload.fifo);
-        ops.create_fifo(&upload.fifo, constants.omnect_user_id)?;
+        if let Err(e) = ops.create_fifo(&upload.fifo, constants.omnect_user_id) {
+            // Keeps the run log off a disk that an earlier attempt wrote.
+            return Err(if disk_written {
+                partly_written(disk, e)
+            } else {
+                e
+            });
+        }
     }
 
     // The new image may move partitions. Everything after this point mounts
@@ -316,6 +325,13 @@ fn scp_with(
     log::info!("flash mode 2 finished");
     ops.sync();
     Ok(())
+}
+
+fn partly_written(disk: &Path, source: FlashError) -> FlashError {
+    FlashError::DiskPartlyWritten {
+        disk: disk.to_path_buf(),
+        source: Box::new(source),
+    }
 }
 
 /// One upload and flash. The disk is written only after the bmap passed its
@@ -348,17 +364,13 @@ fn flash_once(
     #[cfg(feature = "flash-mode-2-direct")]
     let source = Source::Xz(&upload.fifo);
 
-    let partly_written = |source| FlashError::DiskPartlyWritten {
-        disk: disk.to_path_buf(),
-        source: Box::new(source),
-    };
     log::info!(
         "flashing {} onto {}",
         source.path().display(),
         disk.display()
     );
     ops.bmap_copy(&map, &source, &Destination::Device(disk))
-        .map_err(partly_written)?;
+        .map_err(|e| partly_written(disk, e))?;
 
     // Only mapped blocks are written, so bytes of the old image in the rest
     // of the head would survive the flash.
@@ -369,7 +381,8 @@ fn flash_once(
             range.offset,
             disk.display()
         );
-        ops.zero_range(disk, &range).map_err(partly_written)?;
+        ops.zero_range(disk, &range)
+            .map_err(|e| partly_written(disk, e))?;
     }
     Ok(())
 }
@@ -377,6 +390,7 @@ fn flash_once(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mode::flash::keeps_log;
     use crate::partition::RootDevice;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     use std::path::PathBuf;
@@ -834,8 +848,6 @@ mod tests {
 
     #[test]
     fn a_failed_setup_or_finish_step_stops_mode_2_there() {
-        use crate::mode::flash::keeps_log;
-
         let steps = [
             ("unmount", true),
             ("network", true),
@@ -939,6 +951,29 @@ mod tests {
             "fifo /home/omnect/wic.xz owned by 1000"
         );
         assert!(!calls.iter().any(|call| call.starts_with("zero")));
+        assert!(keeps_log(&result), "the disk was not written: {result:?}");
+    }
+
+    #[test]
+    fn a_failed_fifo_after_a_partly_written_attempt_keeps_the_log_off_the_disk() {
+        let faults = vec![
+            Fault {
+                step: FLASH_PASS,
+                passes: 0,
+                failures: 1,
+            },
+            Fault {
+                step: "fifo",
+                passes: 1,
+                failures: 1,
+            },
+        ];
+        let (result, _) = run_recorded(&raw_constants(), faults);
+        assert!(
+            matches!(result, Err(FlashError::DiskPartlyWritten { .. })),
+            "{result:?}"
+        );
+        assert!(!keeps_log(&result));
     }
 
     #[test]
