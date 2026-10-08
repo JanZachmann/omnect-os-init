@@ -21,7 +21,7 @@ Implemented functionality:
 - **switch\_root**: MS_MOVE + chroot + exec systemd
 - **Factory reset (modes 1-3)**: Selective-preserve backup → wipe `data`/`etc` (modes 2 and 3 only) → reformat → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
 - **Flash mode 1**: Clones the running disk onto another block device given by the `flash-mode-devpath` bootloader env key, triggered by `flash-mode`; powers off on success so the clone can be moved to its own device (feature `flash-mode-1`, part of the default feature set)
-- **Flash mode 2**: Brings up `eth0` with DHCP and starts `dropbear`; the operator pushes a `wic.xz` with `scp`, and `bmaptool` flashes it onto the running disk. Triggered by `flash-mode=2` in the bootloader env or by the flag file `/etc/enforce_flash_mode` (feature `flash-mode-2`)
+- **Flash mode 2**: Brings up `eth0` with DHCP and starts `dropbear`; the operator pushes a `wic.xz` with `scp`, and `bmaptool` flashes it onto the running disk. Triggered by `flash-mode=2` in the bootloader env or by the flag file `/etc/enforce_flash_mode` (feature `flash-mode-2`). Mode 2 wins over a `factory-reset` set at the same time: the reset does not run and an error is logged, with no further handling
 
 Not yet implemented (planned):
 
@@ -69,7 +69,7 @@ flowchart TD
     BMODE -->|"Flash(config)\nfeature = flash-mode"| FLASH
     BMODE -->|"Normal / FactoryReset"| ISETUP["init_setup::run()\nextra_bootargs sync — always\nresize-data preflight if feature = resize-data"]
 
-    FLASH["flash::run()\nclear flash triggers (mode 2: also factory-reset)\n→ clone (mode 1) or scp flash (mode 2)\nrun log → data partition"]
+    FLASH["flash::run()\nclear flash triggers → clone (mode 1) or scp flash (mode 2)\nrun log → data partition"]
     FLASH -->|OK| POWEROFF(["⏻ poweroff (mode 1) / reboot (mode 2)"])
     FLASH -->|Fatal| FEB
 

@@ -86,17 +86,12 @@ pub(crate) fn clear_flash_triggers(bl: &mut dyn BootEnv) {
     }
 }
 
-#[cfg(all(feature = "flash-mode", feature = "factory-reset"))]
-pub(crate) fn clear_factory_reset_trigger(bl: &mut dyn BootEnv) {
-    if let Err(e) = bl.set_env(BootEnvKey::FactoryReset, None) {
-        log::warn!("factory-reset: failed to clear the factory-reset trigger: {e}");
-    }
-}
-
 #[cfg(all(feature = "flash-mode-1", feature = "factory-reset"))]
 fn clear_flash_and_reset_triggers(bl: &mut dyn BootEnv) {
     clear_flash_triggers(bl);
-    clear_factory_reset_trigger(bl);
+    if let Err(e) = bl.set_env(BootEnvKey::FactoryReset, None) {
+        log::warn!("factory-reset: failed to clear the factory-reset trigger: {e}");
+    }
 }
 
 /// Whether the running initramfs carries the enforce flag file.
@@ -167,8 +162,9 @@ impl BootMode {
     /// Mode 1 together with a factory reset is refused — they act on different
     /// disks and single-mode dispatch cannot perform both, so dropping one
     /// silently would be the worse failure. The refusal is the only error, and
-    /// it is fatal. Mode 2 wins over a factory reset: it overwrites the whole
-    /// disk, so it includes the reset.
+    /// it is fatal. Mode 2 wins over a factory reset; the reset is logged as an
+    /// error and does not run. Asking for both is an operator mistake, so it gets
+    /// no further handling.
     ///
     /// A `flash-mode` value that selects nothing is logged and the device boots
     /// normally: an operator typo must not stop a device from booting.
@@ -223,6 +219,15 @@ impl BootMode {
 
             match (parsed, value) {
                 (Some(mode), _) => {
+                    #[cfg(all(feature = "flash-mode-2", feature = "factory-reset"))]
+                    if mode == flash::config::FlashMode::Mode2
+                        && matches!(bl.get_env(BootEnvKey::FactoryReset), Ok(Some(json)) if !json.trim().is_empty())
+                    {
+                        log::error!(
+                            "factory-reset: set together with flash mode 2, flash mode 2 wins and the factory reset does not run"
+                        );
+                    }
+
                     #[cfg(all(feature = "flash-mode-1", feature = "factory-reset"))]
                     if mode == flash::config::FlashMode::Mode1 {
                         match bl.get_env(BootEnvKey::FactoryReset) {
@@ -460,6 +465,29 @@ mod tests {
             assert!(mock.set_env_calls.contains(&BootEnvKey::FactoryReset));
             assert_eq!(mock.get_env(BootEnvKey::FlashMode).unwrap(), None);
             assert_eq!(mock.get_env(BootEnvKey::FactoryReset).unwrap(), None);
+        }
+
+        #[cfg(all(feature = "flash-mode-2", feature = "factory-reset"))]
+        #[test]
+        fn detect_logs_a_factory_reset_that_mode_2_overrides() {
+            let _guard = crate::logging::capture::SERIALIZE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            crate::logging::capture::install_test_logger();
+            crate::logging::start_capture();
+
+            let mut mock = create_mock_bootloader()
+                .with_env(BootEnvKey::FlashMode, "2")
+                .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
+            let lines = crate::logging::take_capture();
+
+            assert!(matches!(mode, BootMode::Flash(_)));
+            assert!(
+                lines.iter().any(|line| line
+                    .starts_with("[ERROR] factory-reset: set together with flash mode 2")),
+                "got {lines:?}"
+            );
         }
 
         #[cfg(all(feature = "flash-mode-1", feature = "factory-reset"))]

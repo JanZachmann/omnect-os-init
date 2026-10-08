@@ -97,7 +97,7 @@ mod mode_2_detection {
 
     #[cfg(feature = "factory-reset")]
     #[test]
-    fn the_flag_or_key_2_wins_over_a_queued_factory_reset() {
+    fn the_flag_or_key_2_wins_over_a_factory_reset() {
         for (key, flag) in [
             (Some("2"), EnforceFlag::Absent),
             (None, EnforceFlag::Present),
@@ -113,7 +113,6 @@ mod mode_2_detection {
                 Some(FlashMode::Mode2),
                 "key {key:?}, flag {flag:?}"
             );
-            // Clearing both keys is the mode's own first step.
             assert!(env.set_env_calls.is_empty(), "key {key:?}, flag {flag:?}");
         }
     }

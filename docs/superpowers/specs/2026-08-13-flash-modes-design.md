@@ -71,9 +71,8 @@ U-Boot writeable-variable whitelist: `flash-mode:dw` and
 
 ### 2.2 Clear-trigger-first invariant
 
-Every mode clears `flash-mode` before doing any work. Mode 2 also clears
-`factory-reset` (§3.3). Mode 3 additionally clears each URL key immediately
-after reading it. A crash or power loss mid-flash then
+Every mode clears `flash-mode` before doing any work. Mode 3 additionally clears
+each URL key immediately after reading it. A crash or power loss mid-flash then
 leads to a normal boot attempt, never to an endless re-entry into flash mode.
 This matches the factory-reset precedent.
 
@@ -349,10 +348,10 @@ leaving the triggers set would mean every power cycle hits the same refusal and
 the device never boots again. With both cleared, a power cycle boots normally
 and the operator re-queues whichever action they meant.
 
-Mode 2 and a factory reset set at once runs mode 2. Mode 2 overwrites the
-whole disk, so it includes the reset. Detection does not read `factory-reset`
-for mode 2; the mode clears it together with `flash-mode` (§2.2), so a reset
-left queued does not run after a mode 2 run that failed before writing the disk.
+Mode 2 and a factory reset set at once runs mode 2 and logs an error that a
+factory reset was also set; the reset does not run. Asking for both is an
+operator mistake, so there is no further handling: the `factory-reset` key is
+not cleared, and a `factory-reset` that cannot be read does not stop mode 2.
 
 Detection follows the legacy order `86-factory-reset`, `87-flash_mode_1`,
 `87-flash_mode_2` (flag file first, then the key), `87-flash_mode_3`:
@@ -364,7 +363,7 @@ Detection follows the legacy order `86-factory-reset`, `87-flash_mode_1`,
 | `flash-mode` `2`, no flag | Mode 2 |
 | `flash-mode` `1`, plus a set `factory-reset` | both cleared, then refused |
 | `flash-mode` `1`, `factory-reset` unreadable | Normal |
-| flag or `flash-mode` `2`, plus a set or unreadable `factory-reset` | Mode 2 |
+| flag or `flash-mode` `2`, plus a set or unreadable `factory-reset` | Mode 2; a set `factory-reset` is logged as an error |
 | flag, boot env unavailable or `flash-mode` unreadable | Mode 2 |
 
 The flag rows with an unreadable environment follow legacy, which checks the
@@ -786,8 +785,8 @@ Behaviour changes, as opposed to bug fixes:
 - a queued factory reset combined with mode 1 is now an error. Legacy ran
   both (86 then 87); single-mode dispatch cannot, and refuses the pair rather
   than dropping one silently. Both triggers are cleared before the error, so a
-  power cycle boots normally (§3.3, §10.6). Combined with mode 2, only mode 2
-  runs; the disk ends up the same, because mode 2 overwrote the reset disk;
+  power cycle boots normally (§3.3, §10.6). Combined with mode 2, mode 2 wins,
+  the factory reset does not run, and an error is logged (§3.3);
 - modes 2 and 3 may persist a log where legacy did not (§8.3, §10.5);
 - a failed unmount in the §5.1 sweep fails the run; legacy ignored it
   (`umount ... 2>/dev/null`);
@@ -898,8 +897,8 @@ gives one handler and cannot express that.
 **Decided: reject the combination with an error.** A factory reset acts on the
 booted device and a mode-1 clone on another one; requesting both was never
 intended, and silently performing only one of two destructive requests is the
-worse failure. Mode 2 is not refused: it overwrites the whole disk, so it
-includes the reset (§3.3).
+worse failure. Mode 2 is not refused: it wins, and the factory reset is
+logged as an error (§3.3).
 
 The error clears both triggers first (§3.3) — without that, a release image
 halts forever and every power cycle repeats the refusal. If even a one-time
