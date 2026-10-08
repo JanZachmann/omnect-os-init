@@ -25,6 +25,12 @@ pub enum BuildConstant {
     UbootEnv2Start,
     #[cfg(feature = "uboot")]
     UbootEnvSize,
+    #[cfg(feature = "flash-mode-2")]
+    BootStart,
+    #[cfg(feature = "flash-mode-2")]
+    BootSize,
+    #[cfg(feature = "flash-mode-2")]
+    OmnectUserId,
 }
 
 #[cfg(feature = "flash-mode")]
@@ -38,6 +44,12 @@ impl std::fmt::Display for BuildConstant {
             Self::UbootEnv2Start => "UBOOT_ENV2_START",
             #[cfg(feature = "uboot")]
             Self::UbootEnvSize => "UBOOT_ENV_SIZE",
+            #[cfg(feature = "flash-mode-2")]
+            Self::BootStart => "BOOT_START",
+            #[cfg(feature = "flash-mode-2")]
+            Self::BootSize => "BOOT_SIZE",
+            #[cfg(feature = "flash-mode-2")]
+            Self::OmnectUserId => "OMNECT_USER_ID",
         })
     }
 }
@@ -107,6 +119,14 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "flash-mode-2")]
+    #[test]
+    fn test_build_constant_names_mode_2() {
+        assert_eq!(BuildConstant::BootStart.to_string(), "BOOT_START");
+        assert_eq!(BuildConstant::BootSize.to_string(), "BOOT_SIZE");
+        assert_eq!(BuildConstant::OmnectUserId.to_string(), "OMNECT_USER_ID");
+    }
 
     #[test]
     fn test_cmdline_parse_key_value() {

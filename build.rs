@@ -16,6 +16,9 @@
 //! | OMNECT_PART_SIZE_UBOOT_ENV     | UBOOT_ENV_SIZE    | flash-mode-1   |
 //! | OMNECT_PART_SIZE_DATA          | DATA_SIZE         | flash-mode-1   |
 //! | BOOTLOADER_SEEK                | BOOTLOADER_START  | flash-mode-1   |
+//! | OMNECT_PART_OFFSET_BOOT        | BOOT_START        | flash-mode-2   |
+//! | OMNECT_PART_SIZE_BOOT          | BOOT_SIZE         | flash-mode-2   |
+//! | OMNECT_USER_ID                 | OMNECT_USER_ID    | flash-mode-2   |
 
 use std::env;
 use std::fs;
@@ -30,12 +33,18 @@ fn main() {
     println!("cargo:rerun-if-env-changed=OMNECT_PART_SIZE_UBOOT_ENV");
     println!("cargo:rerun-if-env-changed=OMNECT_PART_SIZE_DATA");
     println!("cargo:rerun-if-env-changed=BOOTLOADER_SEEK");
+    println!("cargo:rerun-if-env-changed=OMNECT_PART_OFFSET_BOOT");
+    println!("cargo:rerun-if-env-changed=OMNECT_PART_SIZE_BOOT");
+    println!("cargo:rerun-if-env-changed=OMNECT_USER_ID");
 
     let uboot_env1_start = read_u64_env("OMNECT_PART_OFFSET_UBOOT_ENV1");
     let uboot_env2_start = read_u64_env("OMNECT_PART_OFFSET_UBOOT_ENV2");
     let uboot_env_size = read_u64_env("OMNECT_PART_SIZE_UBOOT_ENV");
     let data_size = read_u64_env("OMNECT_PART_SIZE_DATA");
     let bootloader_start = read_u64_env("BOOTLOADER_SEEK");
+    let boot_start = read_u64_env("OMNECT_PART_OFFSET_BOOT");
+    let boot_size = read_u64_env("OMNECT_PART_SIZE_BOOT");
+    let omnect_user_id = read_u64_env("OMNECT_USER_ID");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
     let dest = out_dir.join("build_config.rs");
@@ -52,12 +61,21 @@ fn main() {
          /// Initial size of the data partition (in KB).\n\
          pub const DATA_SIZE: Option<u64> = {data_size};\n\
          /// Start of the bootloader area (in KB), where a machine keeps one.\n\
-         pub const BOOTLOADER_START: Option<u64> = {bootloader_start};\n",
+         pub const BOOTLOADER_START: Option<u64> = {bootloader_start};\n\
+         /// Start of the boot partition (in KB).\n\
+         pub const BOOT_START: Option<u64> = {boot_start};\n\
+         /// Size of the boot partition (in KB).\n\
+         pub const BOOT_SIZE: Option<u64> = {boot_size};\n\
+         /// Numeric id of the omnect user and its group.\n\
+         pub const OMNECT_USER_ID: Option<u64> = {omnect_user_id};\n",
         uboot_env1_start = fmt_option(uboot_env1_start),
         uboot_env2_start = fmt_option(uboot_env2_start),
         uboot_env_size = fmt_option(uboot_env_size),
         data_size = fmt_option(data_size),
         bootloader_start = fmt_option(bootloader_start),
+        boot_start = fmt_option(boot_start),
+        boot_size = fmt_option(boot_size),
+        omnect_user_id = fmt_option(omnect_user_id),
     );
 
     fs::write(&dest, content).unwrap_or_else(|e| {

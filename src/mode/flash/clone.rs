@@ -7,26 +7,28 @@
 
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use nix::sys::stat::{major, makedev, minor};
-
 use crate::bootloader::sync_filesystems;
 use crate::config::{BuildConstant, build};
-use crate::error::{FlashError, PartitionTableOperation};
+use crate::error::FlashError;
 #[cfg(feature = "grub")]
 use crate::filesystem::MountOptions;
 use crate::filesystem::reformat_ext4;
 #[cfg(feature = "grub")]
 use crate::mode::flash::efi;
-use crate::mode::flash::{rawio, sfdisk, unmount};
+use crate::mode::flash::rawio::{self, ByteRange, kb_to_bytes};
+use crate::mode::flash::{layout_partition, sfdisk, unmount};
 #[cfg(feature = "grub")]
 use crate::mode::flash::{scratch_mounts, with_mount};
-use crate::partition::device::{partition_path, partition_sep_for};
+use crate::partition::device::{
+    REASON_NOT_A_BLOCK_DEVICE, SYS_DEV_BLOCK, block_devnum, partition_path, partition_sep_for,
+    whole_disk_devnum,
+};
 use crate::partition::layout::{
     PARTITION_NUM_BOOT, PARTITION_NUM_CERT, PARTITION_NUM_DATA, PARTITION_NUM_ETC,
     PARTITION_NUM_FACTORY, PARTITION_NUM_ROOT_A, PARTITION_NUM_ROOT_B,
@@ -63,13 +65,8 @@ const UUID_BYTES: usize = 16;
 const REASON_IDENTICAL_DISK: &str = "identical to the booted disk";
 const REASON_SOURCE_PARTITION: &str = "a partition of the booted disk";
 const REASON_NOT_A_WHOLE_DISK: &str = "a partition, not a whole disk";
-const REASON_NOT_A_BLOCK_DEVICE: &str = "not a block device";
 const REASON_UNKNOWN_DISK: &str = "the disk it belongs to is unknown to sysfs";
 const REASON_NO_PARTITION_NODE: &str = "the applied partition table produced no block device here";
-
-/// Block devices by device number, each a link to the device's sysfs
-/// directory.
-const SYS_DEV_BLOCK: &str = "/sys/dev/block";
 
 /// A DOS extended container holds none of these roles, so its node is not
 /// required.
@@ -114,12 +111,6 @@ impl BuildConstants {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct ByteRange {
-    offset: u64,
-    len: u64,
-}
-
 #[cfg(feature = "uboot")]
 #[derive(Debug, PartialEq, Eq)]
 struct UbootEnv {
@@ -135,14 +126,6 @@ struct Constants {
     bootloader_area: Option<ByteRange>,
     #[cfg(feature = "uboot")]
     uboot_env: UbootEnv,
-}
-
-fn kb_to_bytes(kb: u64, name: BuildConstant) -> Result<u64, FlashError> {
-    kb.checked_mul(rawio::KIB)
-        .ok_or_else(|| FlashError::InvalidBuildConstant {
-            name,
-            reason: format!("{kb} KB does not fit a byte offset"),
-        })
 }
 
 /// Validate the build-time constants before anything is written.
@@ -210,34 +193,6 @@ fn required_constants(raw: &BuildConstants) -> Result<Constants, FlashError> {
 /// the same index on both disks.
 fn destination_partition(destination: &Path, num: u32) -> PathBuf {
     partition_path(destination, partition_sep_for(destination), num)
-}
-
-fn block_devnum(path: &Path) -> Result<u64, String> {
-    let metadata = fs::metadata(path).map_err(|e| format!("cannot stat: {e}"))?;
-    if !metadata.file_type().is_block_device() {
-        return Err(REASON_NOT_A_BLOCK_DEVICE.to_string());
-    }
-    Ok(metadata.rdev())
-}
-
-/// The device number of the whole disk `devnum` sits on: `devnum` itself for
-/// a disk, the parent disk for a partition. `None` when sysfs does not list it.
-fn whole_disk_devnum(sys_dev_block: &Path, devnum: u64) -> Option<u64> {
-    let node = sys_dev_block.join(format!("{}:{}", major(devnum), minor(devnum)));
-    if !node.exists() {
-        return None;
-    }
-    if !node.join("partition").exists() {
-        return Some(devnum);
-    }
-    // The kernel resolves `..` after following the link, so this reads the
-    // `dev` file of the parent disk's directory.
-    let parent = fs::read_to_string(node.join("../dev")).ok()?;
-    let (parent_major, parent_minor) = parent.trim().split_once(':')?;
-    Some(makedev(
-        parent_major.parse().ok()?,
-        parent_minor.parse().ok()?,
-    ))
 }
 
 /// Why a destination on `destination_disk` is refused for `source`, if it is.
@@ -327,17 +282,6 @@ fn verify_destination_partitions(destination: &Path) -> Result<(), FlashError> {
         });
     }
     Ok(())
-}
-
-fn source_partition(layout: &PartitionLayout, name: PartitionName) -> Result<&Path, FlashError> {
-    layout
-        .get(name)
-        .map(PathBuf::as_path)
-        .ok_or_else(|| FlashError::PartitionTable {
-            device: layout.device.base.clone(),
-            operation: PartitionTableOperation::Lookup,
-            reason: format!("the source layout has no {name} partition"),
-        })
 }
 
 fn output_tail(output: &[u8]) -> String {
@@ -448,21 +392,10 @@ trait CloneOps {
     fn sync(&mut self);
 }
 
-struct RealCloneOps;
-
-#[cfg(feature = "grub")]
-impl efi::EfiOps for RealCloneOps {
-    fn mount_efivarfs(&mut self) -> Result<(), FlashError> {
-        efi::RealEfiOps.mount_efivarfs()
-    }
-
-    fn efibootmgr(&mut self, args: &[String]) -> Result<String, FlashError> {
-        efi::RealEfiOps.efibootmgr(args)
-    }
-
-    fn write_entry_dump(&mut self, boot_partition: &Path, dump: &str) -> Result<(), FlashError> {
-        efi::RealEfiOps.write_entry_dump(boot_partition, dump)
-    }
+#[derive(Default)]
+struct RealCloneOps {
+    #[cfg(feature = "grub")]
+    efi: efi::RealEfiOps,
 }
 
 impl CloneOps for RealCloneOps {
@@ -556,7 +489,7 @@ impl CloneOps for RealCloneOps {
 
     #[cfg(feature = "grub")]
     fn efi(&mut self) -> &mut dyn efi::EfiOps {
-        self
+        &mut self.efi
     }
 
     fn sync(&mut self) {
@@ -567,7 +500,7 @@ impl CloneOps for RealCloneOps {
 /// Clone the running disk onto `ctx.destination`.
 pub(crate) fn run_clone(ctx: &CloneCtx<'_>) -> Result<(), FlashError> {
     let constants = required_constants(&BuildConstants::from_build())?;
-    clone_with(ctx, &constants, &mut RealCloneOps)
+    clone_with(ctx, &constants, &mut RealCloneOps::default())
 }
 
 fn clone_with(
@@ -640,7 +573,7 @@ fn clone_with(
         (PartitionName::Factory, PARTITION_NUM_FACTORY),
         (PartitionName::Cert, PARTITION_NUM_CERT),
     ] {
-        let src = source_partition(ctx.layout, name)?;
+        let src = layout_partition(ctx.layout, name)?;
         let dst = destination_partition(destination, num);
         log::info!("copying {} onto {}", src.display(), dst.display());
         ops.copy_range(src, 0, &dst, 0, None)?;
@@ -691,6 +624,7 @@ fn clone_with(
 mod tests {
     use super::*;
     use crate::partition::RootDevice;
+    use nix::sys::stat::makedev;
 
     #[test]
     fn destination_partitions_use_the_same_indices_as_the_source() {
@@ -753,51 +687,6 @@ mod tests {
     #[test]
     fn a_destination_sysfs_does_not_list_is_refused() {
         assert_eq!(refusal(SDB, None, SDA), Some(REASON_UNKNOWN_DISK));
-    }
-
-    /// A sysfs tree with `mmcblk1` (179:0) and its partition `mmcblk1p2`
-    /// (179:2) linked from `dev/block`, the way the kernel lays it out.
-    fn fake_sys_dev_block() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
-        let disk = root.path().join("devices/block/mmcblk1");
-        let partition = disk.join("mmcblk1p2");
-        fs::create_dir_all(&partition).unwrap();
-        fs::write(disk.join("dev"), "179:0\n").unwrap();
-        fs::write(partition.join("dev"), "179:2\n").unwrap();
-        fs::write(partition.join("partition"), "2\n").unwrap();
-
-        let by_number = root.path().join("dev/block");
-        fs::create_dir_all(&by_number).unwrap();
-        std::os::unix::fs::symlink(&disk, by_number.join("179:0")).unwrap();
-        std::os::unix::fs::symlink(&partition, by_number.join("179:2")).unwrap();
-        root
-    }
-
-    #[test]
-    fn a_partition_maps_onto_its_parent_disk() {
-        let sys = fake_sys_dev_block();
-        let by_number = sys.path().join("dev/block");
-        assert_eq!(
-            whole_disk_devnum(&by_number, makedev(179, 2)),
-            Some(makedev(179, 0))
-        );
-    }
-
-    #[test]
-    fn a_disk_maps_onto_itself() {
-        let sys = fake_sys_dev_block();
-        let by_number = sys.path().join("dev/block");
-        assert_eq!(
-            whole_disk_devnum(&by_number, makedev(179, 0)),
-            Some(makedev(179, 0))
-        );
-    }
-
-    #[test]
-    fn a_device_sysfs_does_not_list_has_no_disk() {
-        let sys = fake_sys_dev_block();
-        let by_number = sys.path().join("dev/block");
-        assert_eq!(whole_disk_devnum(&by_number, makedev(179, 8)), None);
     }
 
     #[test]

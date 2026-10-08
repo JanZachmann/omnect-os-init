@@ -15,6 +15,13 @@ pub mod factory_reset;
 #[cfg(feature = "flash-mode")]
 pub mod flash;
 
+/// An image recipe adds the flag to the initramfs, so it is checked at run time.
+#[cfg(feature = "flash-mode-2")]
+const ENFORCE_FLASH_MODE_FLAG: &str = "etc/enforce_flash_mode";
+
+#[cfg(feature = "flash-mode-2")]
+const INITRAMFS_ROOT: &str = "/";
+
 /// Runtime context passed to the active boot-mode handler.
 pub struct BootContext<'a> {
     pub(crate) config: &'a Config,
@@ -79,11 +86,36 @@ pub(crate) fn clear_flash_triggers(bl: &mut dyn BootEnv) {
     }
 }
 
-#[cfg(all(feature = "flash-mode", feature = "factory-reset"))]
+#[cfg(all(feature = "flash-mode-1", feature = "factory-reset"))]
 fn clear_flash_and_reset_triggers(bl: &mut dyn BootEnv) {
     clear_flash_triggers(bl);
     if let Err(e) = bl.set_env(BootEnvKey::FactoryReset, None) {
         log::warn!("factory-reset: failed to clear the factory-reset trigger: {e}");
+    }
+}
+
+/// Whether the running initramfs carries the enforce flag file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnforceFlag {
+    Absent,
+    Present,
+}
+
+#[cfg(feature = "flash-mode-2")]
+fn enforce_flag(root: &Path) -> EnforceFlag {
+    if root.join(ENFORCE_FLASH_MODE_FLAG).is_file() {
+        EnforceFlag::Present
+    } else {
+        EnforceFlag::Absent
+    }
+}
+
+#[cfg(feature = "flash-mode-2")]
+pub(crate) fn mode_2_config() -> flash::config::FlashConfig {
+    flash::config::FlashConfig {
+        mode: flash::config::FlashMode::Mode2,
+        #[cfg(feature = "flash-mode-1")]
+        devpath: flash::config::Devpath::NotSet,
     }
 }
 
@@ -93,52 +125,111 @@ fn clear_flash_and_reset_triggers(bl: &mut dyn BootEnv) {
 /// runs before the mode starts its log capture, and the mode is where the
 /// reason has to reach the persisted log.
 #[cfg(feature = "flash-mode")]
-#[cfg_attr(not(feature = "flash-mode-1"), allow(unused_variables))]
 fn build_flash_config(
-    bl: &mut dyn BootEnv,
+    #[cfg_attr(not(feature = "flash-mode-1"), allow(unused_variables))] bl: &mut dyn BootEnv,
     mode: flash::config::FlashMode,
 ) -> flash::config::FlashConfig {
-    #[cfg(feature = "flash-mode-1")]
-    let devpath = match bl.get_env(BootEnvKey::FlashModeDevPath) {
-        Ok(value) => flash::config::parse_devpath(value.as_deref()),
-        Err(e) => flash::config::Devpath::Unreadable(e.to_string()),
-    };
-
-    flash::config::FlashConfig {
-        mode,
+    match mode {
         #[cfg(feature = "flash-mode-1")]
-        devpath,
+        flash::config::FlashMode::Mode1 => {
+            let devpath = match bl.get_env(BootEnvKey::FlashModeDevPath) {
+                Ok(value) => flash::config::parse_devpath(value.as_deref()),
+                Err(e) => flash::config::Devpath::Unreadable(e.to_string()),
+            };
+            flash::config::FlashConfig { mode, devpath }
+        }
+        #[cfg(feature = "flash-mode-2")]
+        flash::config::FlashMode::Mode2 => mode_2_config(),
     }
 }
 
 impl BootMode {
-    /// Detect the boot mode from the boot environment.
+    /// Detect the boot mode from the boot environment and, with flash mode 2
+    /// built in, the enforce flag file in the running initramfs.
+    pub fn detect(bl: Option<&mut dyn BootEnv>) -> Result<Self> {
+        #[cfg(feature = "flash-mode-2")]
+        let flag = enforce_flag(Path::new(INITRAMFS_ROOT));
+        #[cfg(not(feature = "flash-mode-2"))]
+        let flag = EnforceFlag::Absent;
+        Self::detect_with(bl, flag)
+    }
+
+    /// Detect the boot mode, with the enforce flag state given.
     ///
     /// A set `flash-mode` selects `Flash`; a `factory-reset` with a non-blank
     /// value selects `FactoryReset`. A blank value of either key is no trigger.
-    /// Both triggers at once is refused — they act on different disks and
-    /// single-mode dispatch cannot perform both, so dropping one silently would
-    /// be the worse failure. The refusal is the only error, and it is fatal.
+    /// The enforce flag selects mode 2 unless `flash-mode` selects mode 1.
+    /// Mode 1 together with a factory reset is refused — they act on different
+    /// disks and single-mode dispatch cannot perform both, so dropping one
+    /// silently would be the worse failure. The refusal is the only error, and
+    /// it is fatal. Mode 2 wins over a factory reset; the reset is logged as an
+    /// error and does not run. Asking for both is an operator mistake, so it gets
+    /// no further handling.
     ///
     /// A `flash-mode` value that selects nothing is logged and the device boots
     /// normally: an operator typo must not stop a device from booting.
-    /// Falls back to `Normal` when either trigger key cannot be read while a
-    /// flash mode may be set, since a conflict cannot be ruled out and both
-    /// modes are destructive.
+    /// Falls back to `Normal` when a trigger key cannot be read while a
+    /// destructive mode may be set. The enforce flag is the exception: it
+    /// selects mode 2 even when the environment cannot be read.
     #[cfg_attr(
         not(any(feature = "factory-reset", feature = "flash-mode")),
         allow(unused_variables)
     )]
-    pub fn detect(bl: Option<&mut dyn BootEnv>) -> Result<Self> {
-        if let Some(bl) = bl {
-            #[cfg(feature = "flash-mode")]
-            match bl.get_env(BootEnvKey::FlashMode) {
+    pub fn detect_with(
+        bl: Option<&mut dyn BootEnv>,
+        #[cfg_attr(not(feature = "flash-mode-2"), allow(unused_variables))] flag: EnforceFlag,
+    ) -> Result<Self> {
+        #[cfg(feature = "flash-mode-2")]
+        let flag_present = flag == EnforceFlag::Present;
+        let Some(bl) = bl else {
+            #[cfg(feature = "flash-mode-2")]
+            if flag_present {
+                return Ok(Self::Flash(mode_2_config()));
+            }
+            return Ok(Self::Normal);
+        };
+
+        #[cfg(feature = "flash-mode")]
+        {
+            let value = match bl.get_env(BootEnvKey::FlashMode) {
                 // Blank is no trigger, for the same backend reason as the
                 // factory-reset key below.
-                Ok(Some(value)) if value.trim().is_empty() => {}
-                Ok(Some(value)) => match flash::config::parse_mode(&value) {
-                    Some(mode) => {
-                        #[cfg(feature = "factory-reset")]
+                Ok(value) => value.filter(|value| !value.trim().is_empty()),
+                Err(e) => {
+                    #[cfg(feature = "flash-mode-2")]
+                    if flag_present {
+                        log::warn!(
+                            "flash-mode: failed to read env, the enforce flag selects mode 2: {e}"
+                        );
+                        return Ok(Self::Flash(mode_2_config()));
+                    }
+                    log::warn!("flash-mode: failed to read env, booting normally: {e}");
+                    return Ok(Self::Normal);
+                }
+            };
+
+            let parsed = value.as_deref().and_then(flash::config::parse_mode);
+            #[cfg(feature = "flash-mode-2")]
+            let parsed = match parsed {
+                #[cfg(feature = "flash-mode-1")]
+                Some(flash::config::FlashMode::Mode1) => parsed,
+                _ if flag_present => Some(flash::config::FlashMode::Mode2),
+                _ => parsed,
+            };
+
+            match (parsed, value) {
+                (Some(mode), _) => {
+                    #[cfg(all(feature = "flash-mode-2", feature = "factory-reset"))]
+                    if mode == flash::config::FlashMode::Mode2
+                        && matches!(bl.get_env(BootEnvKey::FactoryReset), Ok(Some(json)) if !json.trim().is_empty())
+                    {
+                        log::error!(
+                            "factory-reset: set together with flash mode 2, flash mode 2 wins and the factory reset does not run"
+                        );
+                    }
+
+                    #[cfg(all(feature = "flash-mode-1", feature = "factory-reset"))]
+                    if mode == flash::config::FlashMode::Mode1 {
                         match bl.get_env(BootEnvKey::FactoryReset) {
                             Ok(Some(json)) if !json.trim().is_empty() => {
                                 clear_flash_and_reset_triggers(bl);
@@ -152,41 +243,37 @@ impl BootMode {
                                 return Ok(Self::Normal);
                             }
                         }
+                    }
 
-                        return Ok(Self::Flash(build_flash_config(bl, mode)));
-                    }
-                    None => {
-                        log::warn!("flash-mode: unrecognised value '{value}', booting normally");
-                    }
-                },
-                Ok(None) => {}
-                Err(e) => {
-                    log::warn!("flash-mode: failed to read env, booting normally: {e}");
-                    return Ok(Self::Normal);
+                    return Ok(Self::Flash(build_flash_config(bl, mode)));
                 }
+                (None, Some(value)) => {
+                    log::warn!("flash-mode: unrecognised value '{value}', booting normally");
+                }
+                (None, None) => {}
             }
+        }
 
-            #[cfg(feature = "factory-reset")]
-            match bl.get_env(BootEnvKey::FactoryReset) {
-                // A trigger can be cleared by unsetting the key or by writing
-                // an empty value. The backends disagree about the second:
-                // fw_printenv reports an empty variable as unset, grub-editenv
-                // still lists the key. Treat blank as no trigger so both behave
-                // the same.
-                Ok(Some(json)) if json.trim().is_empty() => {}
-                Ok(Some(json)) => match factory_reset::config::FactoryResetConfig::parse(&json) {
-                    Ok(config) => {
-                        return Ok(Self::FactoryReset(FactoryResetTrigger::Accepted(config)));
-                    }
-                    Err(e) => {
-                        log::warn!("factory-reset: unusable trigger, reporting it: {e}");
-                        return Ok(Self::FactoryReset(FactoryResetTrigger::Rejected(e)));
-                    }
-                },
-                Ok(None) => {}
-                Err(e) => {
-                    log::warn!("factory-reset: failed to read env, booting normally: {e}");
+        #[cfg(feature = "factory-reset")]
+        match bl.get_env(BootEnvKey::FactoryReset) {
+            // A trigger can be cleared by unsetting the key or by writing
+            // an empty value. The backends disagree about the second:
+            // fw_printenv reports an empty variable as unset, grub-editenv
+            // still lists the key. Treat blank as no trigger so both behave
+            // the same.
+            Ok(Some(json)) if json.trim().is_empty() => {}
+            Ok(Some(json)) => match factory_reset::config::FactoryResetConfig::parse(&json) {
+                Ok(config) => {
+                    return Ok(Self::FactoryReset(FactoryResetTrigger::Accepted(config)));
                 }
+                Err(e) => {
+                    log::warn!("factory-reset: unusable trigger, reporting it: {e}");
+                    return Ok(Self::FactoryReset(FactoryResetTrigger::Rejected(e)));
+                }
+            },
+            Ok(None) => {}
+            Err(e) => {
+                log::warn!("factory-reset: failed to read env, booting normally: {e}");
             }
         }
 
@@ -202,13 +289,13 @@ mod tests {
     #[test]
     fn detect_normal_with_live_bootloader() {
         let mut mock = create_mock_bootloader();
-        let mode = BootMode::detect(Some(&mut mock)).unwrap();
+        let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
         assert!(matches!(mode, BootMode::Normal));
     }
 
     #[test]
     fn detect_normal_degraded_boot_no_bootloader() {
-        let mode = BootMode::detect(None).unwrap();
+        let mode = BootMode::detect_with(None, EnforceFlag::Absent).unwrap();
         assert!(matches!(mode, BootMode::Normal));
     }
 
@@ -220,7 +307,7 @@ mod tests {
         #[test]
         fn detect_normal_when_factory_reset_key_absent() {
             let mut mock = create_mock_bootloader();
-            let mode = BootMode::detect(Some(&mut mock)).unwrap();
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
             assert!(matches!(mode, BootMode::Normal));
         }
 
@@ -228,7 +315,7 @@ mod tests {
         fn detect_factory_reset_when_key_present_valid_json() {
             let mut mock = create_mock_bootloader()
                 .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
-            let mode = BootMode::detect(Some(&mut mock)).unwrap();
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
             let BootMode::FactoryReset(FactoryResetTrigger::Accepted(config)) = mode else {
                 panic!("a usable trigger must be accepted");
             };
@@ -250,7 +337,7 @@ mod tests {
                 r#"{"mode":1,"preserve":""}"#,
             ] {
                 let mut mock = create_mock_bootloader().with_env(BootEnvKey::FactoryReset, trigger);
-                let mode = BootMode::detect(Some(&mut mock)).unwrap();
+                let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
                 assert!(
                     matches!(
                         mode,
@@ -265,7 +352,7 @@ mod tests {
         fn detect_normal_when_the_trigger_is_blank() {
             for trigger in ["", " ", "\n"] {
                 let mut mock = create_mock_bootloader().with_env(BootEnvKey::FactoryReset, trigger);
-                let mode = BootMode::detect(Some(&mut mock)).unwrap();
+                let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
                 assert!(
                     matches!(mode, BootMode::Normal),
                     "a blank trigger must not start a reset: {trigger:?}"
@@ -275,19 +362,46 @@ mod tests {
 
         #[test]
         fn detect_normal_when_bootloader_unavailable() {
-            let mode = BootMode::detect(None).unwrap();
+            let mode = BootMode::detect_with(None, EnforceFlag::Absent).unwrap();
             assert!(matches!(mode, BootMode::Normal));
         }
 
         #[test]
         fn detect_normal_when_get_env_fails() {
             let mut mock = create_mock_bootloader().with_get_env_error();
-            let mode = BootMode::detect(Some(&mut mock)).unwrap();
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
             assert!(matches!(mode, BootMode::Normal));
         }
     }
 
-    #[cfg(feature = "flash-mode")]
+    #[cfg(feature = "flash-mode-2")]
+    mod enforce_flag_tests {
+        use super::*;
+
+        #[test]
+        fn the_enforce_flag_is_a_file_under_etc() {
+            let root = tempfile::tempdir().unwrap();
+            assert_eq!(enforce_flag(root.path()), EnforceFlag::Absent);
+
+            let flag = root.path().join(ENFORCE_FLASH_MODE_FLAG);
+            std::fs::create_dir_all(flag.parent().unwrap()).unwrap();
+            std::fs::create_dir(&flag).unwrap();
+            assert_eq!(
+                enforce_flag(root.path()),
+                EnforceFlag::Absent,
+                "a directory is not the flag"
+            );
+
+            std::fs::remove_dir(&flag).unwrap();
+            std::fs::write(&flag, "").unwrap();
+            assert_eq!(enforce_flag(root.path()), EnforceFlag::Present);
+        }
+    }
+
+    #[cfg(all(
+        feature = "flash-mode",
+        any(feature = "flash-mode-1", feature = "factory-reset")
+    ))]
     mod flash_detect_tests {
         use super::*;
         use crate::bootloader::BootEnvKey;
@@ -298,7 +412,7 @@ mod tests {
             let mut mock = create_mock_bootloader()
                 .with_env(BootEnvKey::FlashMode, "1")
                 .with_env(BootEnvKey::FlashModeDevPath, "/dev/mmcblk2");
-            let mode = BootMode::detect(Some(&mut mock)).unwrap();
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
             let BootMode::Flash(config) = mode else {
                 panic!("a set flash-mode must select the flash mode");
             };
@@ -318,7 +432,7 @@ mod tests {
                 let mut mock = create_mock_bootloader()
                     .with_env(BootEnvKey::FlashMode, unknown)
                     .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
-                let mode = BootMode::detect(Some(&mut mock)).unwrap();
+                let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
                 assert!(
                     matches!(
                         mode,
@@ -336,7 +450,7 @@ mod tests {
                 .with_env(BootEnvKey::FlashMode, "1")
                 .with_env(BootEnvKey::FlashModeDevPath, "/dev/mmcblk2")
                 .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
-            let err = BootMode::detect(Some(&mut mock)).unwrap_err();
+            let err = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap_err();
             assert!(
                 matches!(
                     err,
@@ -353,6 +467,29 @@ mod tests {
             assert_eq!(mock.get_env(BootEnvKey::FactoryReset).unwrap(), None);
         }
 
+        #[cfg(all(feature = "flash-mode-2", feature = "factory-reset"))]
+        #[test]
+        fn detect_logs_a_factory_reset_that_mode_2_overrides() {
+            let _guard = crate::logging::capture::SERIALIZE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            crate::logging::capture::install_test_logger();
+            crate::logging::start_capture();
+
+            let mut mock = create_mock_bootloader()
+                .with_env(BootEnvKey::FlashMode, "2")
+                .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
+            let lines = crate::logging::take_capture();
+
+            assert!(matches!(mode, BootMode::Flash(_)));
+            assert!(
+                lines.iter().any(|line| line
+                    .starts_with("[ERROR] factory-reset: set together with flash mode 2")),
+                "got {lines:?}"
+            );
+        }
+
         #[cfg(all(feature = "flash-mode-1", feature = "factory-reset"))]
         #[test]
         fn detect_flashes_when_the_queued_factory_reset_is_blank() {
@@ -361,7 +498,7 @@ mod tests {
                     .with_env(BootEnvKey::FlashMode, "1")
                     .with_env(BootEnvKey::FlashModeDevPath, "/dev/mmcblk2")
                     .with_env(BootEnvKey::FactoryReset, blank);
-                let mode = BootMode::detect(Some(&mut mock)).unwrap();
+                let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
                 assert!(
                     matches!(mode, BootMode::Flash(_)),
                     "a blank reset key is no trigger, so there is nothing to conflict with: {blank:?}"
@@ -378,7 +515,7 @@ mod tests {
                 .with_env(BootEnvKey::FlashMode, "1")
                 .with_env(BootEnvKey::FlashModeDevPath, "/dev/mmcblk2")
                 .with_get_env_error_after(1);
-            let mode = BootMode::detect(Some(&mut mock)).unwrap();
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
             assert!(matches!(mode, BootMode::Normal));
             assert!(mock.set_env_calls.is_empty());
         }
@@ -391,7 +528,7 @@ mod tests {
             let mut mock = create_mock_bootloader()
                 .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#)
                 .with_get_env_error_for(BootEnvKey::FlashMode);
-            let mode = BootMode::detect(Some(&mut mock)).unwrap();
+            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
             assert!(matches!(mode, BootMode::Normal));
             assert!(mock.set_env_calls.is_empty());
         }
@@ -402,7 +539,9 @@ mod tests {
             use crate::mode::flash::config::Devpath;
 
             let mut unset = create_mock_bootloader().with_env(BootEnvKey::FlashMode, "1");
-            let Ok(BootMode::Flash(config)) = BootMode::detect(Some(&mut unset)) else {
+            let Ok(BootMode::Flash(config)) =
+                BootMode::detect_with(Some(&mut unset), EnforceFlag::Absent)
+            else {
                 panic!("an unset destination must still select the flash mode");
             };
             assert_eq!(config.devpath, Devpath::NotSet);
@@ -410,7 +549,9 @@ mod tests {
             let mut unreadable = create_mock_bootloader()
                 .with_env(BootEnvKey::FlashMode, "1")
                 .with_get_env_error_for(BootEnvKey::FlashModeDevPath);
-            let Ok(BootMode::Flash(config)) = BootMode::detect(Some(&mut unreadable)) else {
+            let Ok(BootMode::Flash(config)) =
+                BootMode::detect_with(Some(&mut unreadable), EnforceFlag::Absent)
+            else {
                 panic!("an unreadable destination must still select the flash mode");
             };
             assert!(matches!(config.devpath, Devpath::Unreadable(_)));

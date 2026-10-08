@@ -10,9 +10,16 @@
 //! - **U-Boot** (`root=/dev/<device>`): full device path set by U-Boot bootargs
 //!   (e.g. `root=/dev/mmcblk1p2`). Base device and separator are derived from the path.
 
+#[cfg(feature = "flash-mode")]
+use std::fs;
+#[cfg(feature = "flash-mode")]
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(feature = "flash-mode")]
+use nix::sys::stat::{major, makedev, minor};
 
 use crate::config::CmdlineConfig;
 use crate::partition::{PartitionError, Result};
@@ -22,6 +29,14 @@ const DEVICE_POLL_INTERVAL_MS: u64 = 100;
 
 #[cfg(feature = "grub")]
 const BLKID_CMD: &str = "/sbin/blkid";
+
+/// Block devices by device number, each a link to the device's sysfs
+/// directory.
+#[cfg(feature = "flash-mode")]
+pub(crate) const SYS_DEV_BLOCK: &str = "/sys/dev/block";
+
+#[cfg(feature = "flash-mode")]
+pub(crate) const REASON_NOT_A_BLOCK_DEVICE: &str = "not a block device";
 
 /// Represents the detected root block device and its properties.
 #[derive(Debug, Clone)]
@@ -268,6 +283,36 @@ fn wait_for_device(device: &Path) -> Result<()> {
     }
 }
 
+#[cfg(feature = "flash-mode")]
+pub(crate) fn block_devnum(path: &Path) -> std::result::Result<u64, String> {
+    let metadata = fs::metadata(path).map_err(|e| format!("cannot stat: {e}"))?;
+    if !metadata.file_type().is_block_device() {
+        return Err(REASON_NOT_A_BLOCK_DEVICE.to_string());
+    }
+    Ok(metadata.rdev())
+}
+
+/// The device number of the whole disk `devnum` sits on: `devnum` itself for
+/// a disk, the parent disk for a partition. `None` when sysfs does not list it.
+#[cfg(feature = "flash-mode")]
+pub(crate) fn whole_disk_devnum(sys_dev_block: &Path, devnum: u64) -> Option<u64> {
+    let node = sys_dev_block.join(format!("{}:{}", major(devnum), minor(devnum)));
+    if !node.exists() {
+        return None;
+    }
+    if !node.join("partition").exists() {
+        return Some(devnum);
+    }
+    // The kernel resolves `..` after following the link, so this reads the
+    // `dev` file of the parent disk's directory.
+    let parent = fs::read_to_string(node.join("../dev")).ok()?;
+    let (parent_major, parent_minor) = parent.trim().split_once(':')?;
+    Some(makedev(
+        parent_major.parse().ok()?,
+        parent_minor.parse().ok()?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -495,5 +540,64 @@ mod tests {
             msg.contains("/dev/"),
             "error should mention '/dev/', got: {msg}"
         );
+    }
+}
+
+#[cfg(all(test, feature = "flash-mode"))]
+mod devnum_tests {
+    use super::*;
+
+    /// A sysfs tree with `mmcblk1` (179:0) and its partition `mmcblk1p2`
+    /// (179:2) linked from `dev/block`, the way the kernel lays it out.
+    fn fake_sys_dev_block() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let disk = root.path().join("devices/block/mmcblk1");
+        let partition = disk.join("mmcblk1p2");
+        fs::create_dir_all(&partition).unwrap();
+        fs::write(disk.join("dev"), "179:0\n").unwrap();
+        fs::write(partition.join("dev"), "179:2\n").unwrap();
+        fs::write(partition.join("partition"), "2\n").unwrap();
+
+        let by_number = root.path().join("dev/block");
+        fs::create_dir_all(&by_number).unwrap();
+        std::os::unix::fs::symlink(&disk, by_number.join("179:0")).unwrap();
+        std::os::unix::fs::symlink(&partition, by_number.join("179:2")).unwrap();
+        root
+    }
+
+    #[test]
+    fn a_partition_maps_onto_its_parent_disk() {
+        let sys = fake_sys_dev_block();
+        let by_number = sys.path().join("dev/block");
+        assert_eq!(
+            whole_disk_devnum(&by_number, makedev(179, 2)),
+            Some(makedev(179, 0))
+        );
+    }
+
+    #[test]
+    fn a_disk_maps_onto_itself() {
+        let sys = fake_sys_dev_block();
+        let by_number = sys.path().join("dev/block");
+        assert_eq!(
+            whole_disk_devnum(&by_number, makedev(179, 0)),
+            Some(makedev(179, 0))
+        );
+    }
+
+    #[test]
+    fn a_regular_file_has_no_block_device_number() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert_eq!(
+            block_devnum(file.path()),
+            Err(REASON_NOT_A_BLOCK_DEVICE.to_string())
+        );
+    }
+
+    #[test]
+    fn a_device_sysfs_does_not_list_has_no_disk() {
+        let sys = fake_sys_dev_block();
+        let by_number = sys.path().join("dev/block");
+        assert_eq!(whole_disk_devnum(&by_number, makedev(179, 8)), None);
     }
 }

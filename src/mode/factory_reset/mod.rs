@@ -1466,11 +1466,12 @@ mod tests {
 
         fn status_of(trigger: &str) -> FactoryResetStatus {
             use crate::bootloader::{BootEnvKey, MockBootEnv};
-            use crate::mode::BootMode;
+            use crate::mode::{BootMode, EnforceFlag};
 
             let mut bl = MockBootEnv::new().with_env(BootEnvKey::FactoryReset, trigger);
             let BootMode::FactoryReset(FactoryResetTrigger::Rejected(e)) =
-                BootMode::detect(Some(&mut bl)).expect("detect never fails")
+                BootMode::detect_with(Some(&mut bl), EnforceFlag::Absent)
+                    .expect("detect never fails")
             else {
                 panic!("trigger must be rejected: {trigger}");
             };
