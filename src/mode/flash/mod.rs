@@ -36,6 +36,8 @@ use crate::bootloader::sync_filesystems;
 use crate::error::FlashError;
 use crate::filesystem::{MountOptions, MountPoint, mount, umount};
 use crate::logging::{start_capture, take_capture};
+#[cfg(all(feature = "flash-mode-2", feature = "factory-reset"))]
+use crate::mode::clear_factory_reset_trigger;
 use crate::mode::{BootContext, clear_flash_triggers};
 use crate::partition::{PartitionLayout, PartitionName};
 
@@ -244,6 +246,13 @@ fn run_and_persist(
 
     if let Some(bl) = ctx.boot_env.available_mut() {
         clear_flash_triggers(bl);
+        // Mode 2 overwrites the whole disk, so it includes a queued factory
+        // reset. A reset left queued would run after a mode 2 run that failed
+        // before writing the disk.
+        #[cfg(all(feature = "flash-mode-2", feature = "factory-reset"))]
+        if flash_config.mode == config::FlashMode::Mode2 {
+            clear_factory_reset_trigger(bl);
+        }
     }
 
     let outcome = run_mode(flash_config, ctx);
@@ -473,6 +482,8 @@ mod tests {
             BootEnvKey::FlashMode,
             #[cfg(feature = "flash-mode-1")]
             BootEnvKey::FlashModeDevPath,
+            #[cfg(feature = "factory-reset")]
+            BootEnvKey::FactoryReset,
         ]
         .to_vec()
     }

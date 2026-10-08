@@ -97,9 +97,7 @@ mod mode_2_detection {
 
     #[cfg(feature = "factory-reset")]
     #[test]
-    fn the_flag_or_key_2_with_a_factory_reset_clears_both_and_is_refused() {
-        use omnect_os_init::error::{FlashError, InitramfsError};
-
+    fn the_flag_or_key_2_wins_over_a_queued_factory_reset() {
         for (key, flag) in [
             (Some("2"), EnforceFlag::Absent),
             (None, EnforceFlag::Present),
@@ -110,14 +108,13 @@ mod mode_2_detection {
             if let Some(key) = key {
                 env = env.with_env(BootEnvKey::FlashMode, key);
             }
-            let err = BootMode::detect_with(Some(&mut env), flag).unwrap_err();
-            assert!(
-                matches!(err, InitramfsError::Flash(FlashError::ConflictingTriggers)),
-                "key {key:?}, flag {flag:?}: {err}"
+            assert_eq!(
+                detected_mode(Some(&mut env), flag),
+                Some(FlashMode::Mode2),
+                "key {key:?}, flag {flag:?}"
             );
-            assert!(env.set_env_calls.contains(&BootEnvKey::FlashMode));
-            assert!(env.set_env_calls.contains(&BootEnvKey::FactoryReset));
-            assert_eq!(env.get_env(BootEnvKey::FactoryReset).unwrap(), None);
+            // Clearing both keys is the mode's own first step.
+            assert!(env.set_env_calls.is_empty(), "key {key:?}, flag {flag:?}");
         }
     }
 
@@ -146,18 +143,21 @@ mod mode_2_detection {
 
     #[cfg(feature = "factory-reset")]
     #[test]
-    fn the_flag_selects_mode_2_when_the_factory_reset_key_cannot_be_read() {
-        let mut env = MockBootEnv::new().with_get_env_error_for(BootEnvKey::FactoryReset);
-        assert_eq!(
-            detected_mode(Some(&mut env), EnforceFlag::Present),
-            Some(FlashMode::Mode2)
-        );
-        assert!(env.set_env_calls.is_empty());
-
-        // Without the flag a conflict cannot be ruled out, so mode 2 does not run.
-        let mut env = MockBootEnv::new()
-            .with_env(BootEnvKey::FlashMode, "2")
-            .with_get_env_error_for(BootEnvKey::FactoryReset);
-        assert_eq!(detected_mode(Some(&mut env), EnforceFlag::Absent), None);
+    fn mode_2_does_not_depend_on_the_factory_reset_key() {
+        for (key, flag) in [
+            (None, EnforceFlag::Present),
+            (Some("2"), EnforceFlag::Absent),
+        ] {
+            let mut env = MockBootEnv::new().with_get_env_error_for(BootEnvKey::FactoryReset);
+            if let Some(key) = key {
+                env = env.with_env(BootEnvKey::FlashMode, key);
+            }
+            assert_eq!(
+                detected_mode(Some(&mut env), flag),
+                Some(FlashMode::Mode2),
+                "key {key:?}, flag {flag:?}"
+            );
+            assert!(env.set_env_calls.is_empty());
+        }
     }
 }

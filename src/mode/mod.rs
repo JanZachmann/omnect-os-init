@@ -87,11 +87,16 @@ pub(crate) fn clear_flash_triggers(bl: &mut dyn BootEnv) {
 }
 
 #[cfg(all(feature = "flash-mode", feature = "factory-reset"))]
-fn clear_flash_and_reset_triggers(bl: &mut dyn BootEnv) {
-    clear_flash_triggers(bl);
+pub(crate) fn clear_factory_reset_trigger(bl: &mut dyn BootEnv) {
     if let Err(e) = bl.set_env(BootEnvKey::FactoryReset, None) {
         log::warn!("factory-reset: failed to clear the factory-reset trigger: {e}");
     }
+}
+
+#[cfg(all(feature = "flash-mode-1", feature = "factory-reset"))]
+fn clear_flash_and_reset_triggers(bl: &mut dyn BootEnv) {
+    clear_flash_triggers(bl);
+    clear_factory_reset_trigger(bl);
 }
 
 /// Whether the running initramfs carries the enforce flag file.
@@ -159,16 +164,17 @@ impl BootMode {
     /// A set `flash-mode` selects `Flash`; a `factory-reset` with a non-blank
     /// value selects `FactoryReset`. A blank value of either key is no trigger.
     /// The enforce flag selects mode 2 unless `flash-mode` selects mode 1.
-    /// Both triggers at once is refused — they act on different disks and
-    /// single-mode dispatch cannot perform both, so dropping one silently would
-    /// be the worse failure. The refusal is the only error, and it is fatal.
+    /// Mode 1 together with a factory reset is refused — they act on different
+    /// disks and single-mode dispatch cannot perform both, so dropping one
+    /// silently would be the worse failure. The refusal is the only error, and
+    /// it is fatal. Mode 2 wins over a factory reset: it overwrites the whole
+    /// disk, so it includes the reset.
     ///
     /// A `flash-mode` value that selects nothing is logged and the device boots
     /// normally: an operator typo must not stop a device from booting.
-    /// Falls back to `Normal` when either trigger key cannot be read while a
-    /// flash mode may be set, since a conflict cannot be ruled out and both
-    /// modes are destructive. The enforce flag is the exception: it selects
-    /// mode 2 even when the environment cannot be read.
+    /// Falls back to `Normal` when a trigger key cannot be read while a
+    /// destructive mode may be set. The enforce flag is the exception: it
+    /// selects mode 2 even when the environment cannot be read.
     #[cfg_attr(
         not(any(feature = "factory-reset", feature = "flash-mode")),
         allow(unused_variables)
@@ -217,25 +223,20 @@ impl BootMode {
 
             match (parsed, value) {
                 (Some(mode), _) => {
-                    #[cfg(feature = "factory-reset")]
-                    match bl.get_env(BootEnvKey::FactoryReset) {
-                        Ok(Some(json)) if !json.trim().is_empty() => {
-                            clear_flash_and_reset_triggers(bl);
-                            return Err(crate::error::FlashError::ConflictingTriggers.into());
-                        }
-                        Ok(Some(_)) | Ok(None) => {}
-                        Err(e) => {
-                            #[cfg(feature = "flash-mode-2")]
-                            if flag_present && mode == flash::config::FlashMode::Mode2 {
-                                log::warn!(
-                                    "factory-reset: failed to read env while checking for a flash conflict, the enforce flag selects mode 2: {e}"
-                                );
-                                return Ok(Self::Flash(mode_2_config()));
+                    #[cfg(all(feature = "flash-mode-1", feature = "factory-reset"))]
+                    if mode == flash::config::FlashMode::Mode1 {
+                        match bl.get_env(BootEnvKey::FactoryReset) {
+                            Ok(Some(json)) if !json.trim().is_empty() => {
+                                clear_flash_and_reset_triggers(bl);
+                                return Err(crate::error::FlashError::ConflictingTriggers.into());
                             }
-                            log::warn!(
-                                "factory-reset: failed to read env while checking for a flash conflict, booting normally: {e}"
-                            );
-                            return Ok(Self::Normal);
+                            Ok(Some(_)) | Ok(None) => {}
+                            Err(e) => {
+                                log::warn!(
+                                    "factory-reset: failed to read env while checking for a flash conflict, booting normally: {e}"
+                                );
+                                return Ok(Self::Normal);
+                            }
                         }
                     }
 

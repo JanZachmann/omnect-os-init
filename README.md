@@ -65,11 +65,11 @@ flowchart TD
     APPLY -->|"OK\nDegraded: ods.degraded_boot=true"| FBDETECT["compute_first_boot()\nset_update_pending()"]
 
     FBDETECT --> BMODE{"BootMode::detect()"}
-    BMODE -->|"Fatal: flash and factory reset\nboth queued (both cleared)"| FEB
+    BMODE -->|"Fatal: flash mode 1 and factory reset\nboth queued (both cleared)"| FEB
     BMODE -->|"Flash(config)\nfeature = flash-mode"| FLASH
     BMODE -->|"Normal / FactoryReset"| ISETUP["init_setup::run()\nextra_bootargs sync — always\nresize-data preflight if feature = resize-data"]
 
-    FLASH["flash::run()\nclear flash triggers → clone (mode 1) or scp flash (mode 2)\nrun log → data partition"]
+    FLASH["flash::run()\nclear flash triggers (mode 2: also factory-reset)\n→ clone (mode 1) or scp flash (mode 2)\nrun log → data partition"]
     FLASH -->|OK| POWEROFF(["⏻ poweroff (mode 1) / reboot (mode 2)"])
     FLASH -->|Fatal| FEB
 
@@ -353,7 +353,7 @@ cargo test --features uboot,gpt,resize-data,release-image,test-utils
 
 # flash-mode-1 is in the default feature set, so every combination above
 # already builds and tests it; the factory-reset ones also cover the refusal
-# of a flash mode queued together with a factory reset.
+# of flash mode 1 queued together with a factory reset.
 
 # Without any flash feature: flash-mode-1 is in the default set, so
 # --no-default-features is required to exclude it; --features alone is
