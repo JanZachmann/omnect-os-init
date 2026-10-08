@@ -4,7 +4,7 @@
 //! first write, and a bad one is an error, never a panic.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use lzma_rust2::XzReader;
@@ -297,7 +297,7 @@ pub(crate) fn copy(
 
     let input = File::open(source.path()).map_err(|e| failed(format!("opening source: {e}")))?;
     let mut input: Box<dyn Input> = match source {
-        Source::Xz(_) => Box::new(Stream(XzReader::new(input, true))),
+        Source::Xz(_) => Box::new(xz_stream(input)),
         #[cfg(any(test, not(feature = "flash-mode-2-direct")))]
         Source::Raw(_) => Box::new(Seekable(input)),
     };
@@ -351,11 +351,36 @@ trait Input: Read {
     fn skip(&mut self, position: u64, target: u64, buf: &mut [u8]) -> Result<(), String>;
 }
 
+fn xz_stream<R: Read>(compressed: R) -> Stream<XzReader<FullReads<R>>> {
+    Stream(XzReader::new(FullReads(compressed), true))
+}
+
+/// A pipe returns only the bytes that have arrived so far. The xz decoder
+/// reads the padding after a block with a single `read` and takes a short
+/// count as a broken stream, so each read here waits for the whole buffer or
+/// the end of the input.
+struct FullReads<R>(R);
+
+impl<R: Read> Read for FullReads<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.0.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(filled)
+    }
+}
+
 /// A stream moves forward only by reading.
 struct Stream<R>(R);
 
 impl<R: Read> Read for Stream<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
     }
 }
@@ -726,6 +751,34 @@ pub(crate) mod tests {
         let mut longer = image.clone();
         longer.push(0);
         assert!(copied(&bmap, &longer).unwrap_err().contains("longer"));
+    }
+
+    /// Returns one byte per read, as a pipe does when the writer is slow.
+    struct Trickle<'a>(&'a [u8]);
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let (Some(slot), Some((&byte, rest))) = (buf.first_mut(), self.0.split_first()) else {
+                return Ok(0);
+            };
+            *slot = byte;
+            self.0 = rest;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn an_xz_stream_that_arrives_in_small_reads_is_decoded() {
+        // Different sizes give different block padding lengths.
+        for tail in 1..=8 {
+            let image = image(2, tail);
+            let bmap = Bmap::parse(&bmap_xml(&image, &[(0, 2)])).unwrap();
+            let compressed = xz(&image);
+            let mut out = Cursor::new(Vec::new());
+            copy_stream(&bmap, &mut xz_stream(Trickle(&compressed)), &mut out)
+                .unwrap_or_else(|e| panic!("tail {tail}: {e}"));
+            assert_eq!(out.into_inner(), image, "tail {tail}");
+        }
     }
 
     #[test]
