@@ -393,7 +393,6 @@ mod tests {
     use crate::mode::flash::keeps_log;
     use crate::partition::RootDevice;
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-    use std::path::PathBuf;
 
     const IP: Ipv4Addr = Ipv4Addr::new(192, 168, 0, 7);
 

@@ -3,7 +3,9 @@
 //! The bmap comes from the operator, so every value in it is checked before the
 //! first write, and a bad one is an error, never a panic.
 
-use std::fs::File;
+#[cfg(any(test, not(feature = "flash-mode-2-direct")))]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
@@ -12,7 +14,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::error::FlashError;
-use crate::mode::flash::rawio::{ByteRange, COPY_BUFFER_SIZE, open_existing_for_write};
+use crate::mode::flash::rawio::{ByteRange, COPY_BUFFER_SIZE, chunk_len, open_existing_for_write};
 
 /// Major version 2 introduced `ChecksumType` and the tag names parsed here.
 const SUPPORTED_MAJOR_VERSION: u64 = 2;
@@ -254,17 +256,15 @@ impl Bmap {
     }
 }
 
-/// Read and check the bmap at `path`.
 pub(crate) fn read(path: &Path) -> Result<Bmap, FlashError> {
     let invalid = |reason: String| FlashError::InvalidBmap {
         path: path.to_path_buf(),
         reason,
     };
-    let text = std::fs::read_to_string(path).map_err(|e| invalid(e.to_string()))?;
+    let text = fs::read_to_string(path).map_err(|e| invalid(e.to_string()))?;
     Bmap::parse(&text).map_err(invalid)
 }
 
-/// Fail when the image is larger than `device`.
 pub(crate) fn check_fits(bmap: &Bmap, device: &Path) -> Result<(), FlashError> {
     let unusable = |reason: String| FlashError::InvalidDestination {
         device: device.to_path_buf(),
@@ -305,7 +305,7 @@ pub(crate) fn copy(
     let mut output = match destination {
         Destination::Device(path) => open_existing_for_write(path),
         #[cfg(any(test, not(feature = "flash-mode-2-direct")))]
-        Destination::File(path) => std::fs::OpenOptions::new()
+        Destination::File(path) => OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
@@ -330,7 +330,7 @@ fn pass_through(
 ) -> Result<(), String> {
     let mut left = len;
     while left > 0 {
-        let chunk = usize::try_from(left).unwrap_or(buf.len()).min(buf.len());
+        let chunk = chunk_len(left, buf.len());
         let read = input
             .read(&mut buf[..chunk])
             .map_err(|e| format!("reading source: {e}"))?;
@@ -404,7 +404,7 @@ struct Seekable<R>(R);
 
 #[cfg(any(test, not(feature = "flash-mode-2-direct")))]
 impl<R: Read> Read for Seekable<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.0.read(buf)
     }
 }
@@ -472,14 +472,16 @@ fn copy_stream<W: Write + Seek>(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
+    use crate::mode::flash::rawio::zero_range;
+    use lzma_rust2::{XzOptions, XzWriter};
     use std::io::Cursor;
 
     const BLOCK_SIZE: u64 = 4096;
 
     /// A bmap in bmaptool's layout, with a correct file checksum.
-    pub(crate) fn bmap_xml(image: &[u8], blocks: &[(u64, u64)]) -> String {
+    fn bmap_xml(image: &[u8], blocks: &[(u64, u64)]) -> String {
         let image_size = image.len() as u64;
         let mut mapped = 0;
         let mut ranges = String::new();
@@ -540,8 +542,7 @@ pub(crate) mod tests {
     }
 
     fn xz(data: &[u8]) -> Vec<u8> {
-        let mut writer =
-            lzma_rust2::XzWriter::new(Vec::new(), lzma_rust2::XzOptions::with_preset(1)).unwrap();
+        let mut writer = XzWriter::new(Vec::new(), XzOptions::with_preset(1)).unwrap();
         writer.write_all(data).unwrap();
         writer.finish().unwrap()
     }
@@ -624,8 +625,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_bad_range_checksum_is_an_error() {
+        const CHKSUM_ATTR: &str = "chksum=\"";
         let xml = bmap_xml(&image(4, 0), &[(0, 1)]);
-        let sha_start = xml.find("chksum=\"").unwrap() + 8;
+        let sha_start = xml.find(CHKSUM_ATTR).unwrap() + CHKSUM_ATTR.len();
         let sha = &xml[sha_start..sha_start + 2 * SHA256_LEN];
         let err = Bmap::parse(&edited(&xml, sha, "zz")).unwrap_err();
         assert!(err.contains("not a sha256"), "{err}");
@@ -679,7 +681,7 @@ pub(crate) mod tests {
     }
 
     impl Read for Counting<'_> {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             let n = self.inner.read(buf)?;
             self.read += n as u64;
             Ok(n)
@@ -687,7 +689,7 @@ pub(crate) mod tests {
     }
 
     impl Seek for Counting<'_> {
-        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
             self.inner.seek(pos)
         }
     }
@@ -929,7 +931,7 @@ pub(crate) mod tests {
             len: bmap.image_size,
         };
         for gap in bmap.unmapped(&all) {
-            crate::mode::flash::rawio::zero_range(&disk, &gap).unwrap();
+            zero_range(&disk, &gap).unwrap();
         }
         let flashed = std::fs::read(&disk).unwrap();
         let image_len = usize::try_from(bmap.image_size).unwrap();
