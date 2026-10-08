@@ -50,17 +50,11 @@ fn number(name: &str, text: &str) -> Result<u64, String> {
         .map_err(|e| format!("{name} '{}': {e}", text.trim()))
 }
 
-fn sha256_from_hex(hex: &str) -> Result<[u8; SHA256_LEN], String> {
-    let hex = hex.trim();
-    let invalid = || format!("checksum '{hex}' is not a sha256");
-    if hex.len() != 2 * SHA256_LEN {
-        return Err(invalid());
-    }
+fn sha256_from_hex(text: &str) -> Result<[u8; SHA256_LEN], String> {
+    let text = text.trim();
     let mut digest = [0u8; SHA256_LEN];
-    for (byte, pair) in digest.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
-        let pair = std::str::from_utf8(pair).map_err(|_| invalid())?;
-        *byte = u8::from_str_radix(pair, 16).map_err(|_| invalid())?;
-    }
+    hex::decode_to_slice(text, &mut digest)
+        .map_err(|_| format!("checksum '{text}' is not a sha256"))?;
     Ok(digest)
 }
 
@@ -259,8 +253,11 @@ mod tests {
         let xml = bmap_xml(&image(4, 0), &[(0, 1)]);
         let sha_start = xml.find(CHKSUM_ATTR).unwrap() + CHKSUM_ATTR.len();
         let sha = &xml[sha_start..sha_start + 2 * SHA256_LEN];
-        let err = Bmap::parse(&edited(&xml, sha, "zz")).unwrap_err();
-        assert!(err.contains("not a sha256"), "{err}");
+        let plus_sign = format!("+{}", &sha[1..]);
+        for bad in ["zz", plus_sign.as_str()] {
+            let err = Bmap::parse(&edited(&xml, sha, bad)).unwrap_err();
+            assert!(err.contains("not a sha256"), "{bad}: {err}");
+        }
     }
 
     #[test]

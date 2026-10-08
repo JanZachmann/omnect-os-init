@@ -142,7 +142,7 @@ mod test_support {
             let end = usize::try_from((last + 1) * BLOCK_SIZE)
                 .unwrap()
                 .min(image.len());
-            let sha = hex(&Sha256::digest(&image[start..end]));
+            let sha = hex::encode(Sha256::digest(&image[start..end]));
             let span = if first == last {
                 format!("{first}")
             } else {
@@ -169,12 +169,8 @@ mod test_support {
         ))
     }
 
-    pub(super) fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
     pub(super) fn with_checksum(zeroed: &str) -> String {
-        let sum = hex(&Sha256::digest(zeroed.as_bytes()));
+        let sum = hex::encode(Sha256::digest(zeroed.as_bytes()));
         zeroed.replacen(&"0".repeat(2 * SHA256_LEN), &sum, 1)
     }
 
@@ -208,7 +204,7 @@ mod test_support {
 mod tests {
     use super::*;
     use crate::mode::flash::bmap::test_support::{
-        BLOCK_SIZE, FIXTURE_BMAP, FIXTURE_SHA256, FIXTURE_XZ, hex,
+        BLOCK_SIZE, FIXTURE_BMAP, FIXTURE_SHA256, FIXTURE_XZ,
     };
     use crate::mode::flash::rawio::zero_range;
     use sha2::{Digest, Sha256};
@@ -300,7 +296,7 @@ mod tests {
 
         copy(&bmap, &Source::Xz(&source), &Destination::File(&decoded)).unwrap();
         assert_eq!(
-            hex(&Sha256::digest(fs::read(&decoded).unwrap())),
+            hex::encode(Sha256::digest(fs::read(&decoded).unwrap())),
             FIXTURE_SHA256
         );
 
@@ -321,7 +317,10 @@ mod tests {
         }
         let flashed = fs::read(&disk).unwrap();
         let image_len = usize::try_from(bmap.image_size).unwrap();
-        assert_eq!(hex(&Sha256::digest(&flashed[..image_len])), FIXTURE_SHA256);
+        assert_eq!(
+            hex::encode(Sha256::digest(&flashed[..image_len])),
+            FIXTURE_SHA256
+        );
         assert!(
             flashed[image_len..].iter().all(|&b| b == 0xa5),
             "behind the image"
