@@ -251,10 +251,11 @@ The remaining tools stay external because no pure-Rust equivalent exists at a
 dependency weight an initramfs can carry: `sfdisk` (partition tables),
 `e2image`, `mkfs.ext4` and `tune2fs` (ext4), `efibootmgr` (EFI variables), `curl`, `dhcpcd` and `dropbear`.
 
-Seven operations the legacy scripts shell out for are done in-process instead.
+Eight operations the legacy scripts shell out for are done in-process instead.
 Five use `nix`, which is already a dependency; `getifaddrs` needs its `net`
 feature, the others are enabled already. `uuidgen` needs the new `uuid` crate;
-`dd` needs nothing:
+`dd` needs nothing; `bmaptool copy` needs `hex`, `lzma-rust2`, `quick-xml` and
+`sha2`:
 
 | Legacy | In-process |
 |---|---|
@@ -272,6 +273,15 @@ the bootloader area copy, the `boot`, `factory` and `cert` partition copies, the
 `uboot-env.bin` writes and the zeroing in mode 2 — so `File::seek` plus a
 buffered copy covers all of them, followed by the explicit `sync` the legacy
 scripts get from `dd` returning.
+
+The in-process `bmaptool copy` makes the release binary about 166 KiB larger
+(x86-64, `core,uboot,gpt,flash-mode-1,flash-mode-2,factory-reset`: 656 400 to
+826 152 bytes). In exchange, mode 2 drops `bmaptool`, its Python runtime and
+`xz` from the initramfs. The decoder and the parser run in PID 1 with
+`panic = "abort"`, so a panic on a malformed stream is a kernel panic, where a
+crashed `bmaptool` was a failed attempt. `lzma-rust2` and `quick-xml` have no
+`unsafe` code in the features used, and `lzma-rust2` is pinned to an exact
+version until it reaches 1.0, because each 0.x update can change the decoder.
 
 The reboot call follows the existing pattern in `handle_fatal_error`: it returns
 `Result<Infallible>`, so the `Ok` arm is uninhabited and only the error path is
@@ -413,9 +423,10 @@ flash-mode-3 = ["flash-mode"]            # URL download
 each mode feature pulls it in. `flash-mode-2` and `flash-mode-3` additionally
 gate `net.rs` and `bmap/`.
 
-One new dependency, pulled in by `flash-mode-1` only:
+`flash-mode-1` pulls in one new dependency,
 `uuid = { version = "1.11", default-features = false }`. The bytes come from
 `/dev/urandom`, so a failing random source is an error and not a panic in PID 1.
+`flash-mode-2` pulls in `hex`, `lzma-rust2`, `quick-xml` and `sha2` (§2.8).
 
 `default = ["core", "flash-mode-1"]`, mirroring the legacy recipe, which installs
 `flash-mode-1` unconditionally and gates 2 and 3 on `DISTRO_FEATURES`. This also
@@ -569,10 +580,14 @@ flag file shipped by `omnect-os-initramfs-test`. Both are kept.
    `scp <bmap-file> omnect@<ip>:wic.bmap`.
 5. Wait for `/home/omnect/wic.bmap` to be complete, unbounded — this waits for
    a person (§7). Complete means a regular file whose content ends with the
-   closing `</bmap>` tag, so a half-copied bmap does not end the wait.
-6. Check the bmap before anything is written: XML syntax, major version 2,
-   checksum type `sha256`, the `BmapFileChecksum` (the sha256 of the file with
-   that value replaced by zeros), block counts, ranges sorted, not overlapping
+   closing `</bmap>` tag, so a half-copied bmap does not end the wait. A file
+   that stops changing without that tag, such as the image pushed under the
+   wrong name, is reported once in the log.
+6. Check the bmap before anything is written: at most 1 MiB, XML syntax,
+   version `2.<minor>` (1.x, including the 1.4 that `bmaptool` reads as 2.0,
+   is rejected; `bmaptool create` writes 2.0), checksum type `sha256`, the
+   `BmapFileChecksum` (the sha256 of the file with that value replaced by
+   zeros), block counts, at least one range, ranges sorted, not overlapping
    and inside `ImageSize`, and `ImageSize` not larger than the disk. Then log
    the second command, `scp <wic-image> omnect@<ip>:wic.xz`, in the same order
    as legacy.
@@ -613,8 +628,8 @@ in progress and leave the disk half-written (§10.8).
 The zeroing step is the legacy `non_bmap_dd_handling`. Its comment records
 post-flash boot failures observed on both GRUB (mismatched `bootx64.efi`
 checksums) and U-Boot (boot-partition errors after `bmaptool`). It is ported —
-see §10.1 — but runs after the flash, so a bad bmap or image leaves the old
-disk bootable.
+see §10.1 — but runs after the flash, so a bad bmap, and with the verify pass
+a bad image, leaves the old disk bootable.
 
 ## 6. EFI handling
 
@@ -711,9 +726,10 @@ See §10.4.
 
 "Fatal" means the mode aborts into §8.1's failure path. For mode 1 the source
 disk is untouched, so a power cycle boots normally. For mode 3 the disk is
-left half-written, which is unavoidable for a whole-disk flash. Mode 2 fails
-this way after a successful flash, when the re-read or the EFI step fails, or
-when the new FIFO for the next attempt cannot be created.
+left half-written, which is unavoidable for a whole-disk flash. Mode 2 ends
+fatally only after the flash, when the re-read or the EFI step fails, or when
+the new FIFO for the next attempt cannot be created; the disk is half-written
+in the last case only if an earlier attempt wrote it.
 
 ### 8.3 Logging
 
@@ -872,7 +888,12 @@ partition-alignment problem rather than fixing one.
 
 **Decided: keep.** Only the parts the bmap does not map are zeroed, after the
 flash: the final disk is the same, and the old disk stays bootable until the
-bmap passed its checks (§5.4).
+flash pass starts (§5.4).
+
+> **Correction (2026-10-09).** This decision first zeroed the whole head
+> before `bmaptool` ran. With `bmaptool` replaced by the in-process flash, the
+> zeroing moved behind the flash and covers only the unmapped parts, so a bmap
+> that fails its checks no longer leaves the device unbootable.
 
 ### 10.2 Keep the duplicate EFI boot entry?
 

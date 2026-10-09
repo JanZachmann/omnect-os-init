@@ -47,8 +47,11 @@ src/
 │       ├── config.rs        # Environment read, validation -> FlashConfig
 │       ├── efi.rs           # efibootmgr handling (feature = grub)
 │       ├── net.rs           # eth0 up, dhcpcd, dropbear (feature = flash-mode-2)
-│       ├── scp.rs           # Mode 2 orchestration: fifo for the scp upload (feature = flash-mode-2)
-│       ├── bmap.rs          # bmaptool copy invocation (feature = flash-mode-2)
+│       ├── scp.rs           # Mode 2 orchestration: scp upload, flash, retry (feature = flash-mode-2)
+│       ├── bmap/            # In-process bmap flash (feature = flash-mode-2)
+│       │   ├── mod.rs       # Bmap type, read, unmapped gaps
+│       │   ├── parse.rs     # bmap XML parsing and checks
+│       │   └── copy.rs      # xz decode and copy of the mapped ranges
 │       ├── clone.rs         # Mode 1 orchestration (feature = flash-mode-1)
 │       ├── sfdisk.rs        # Partition-table dump parsing and rewriting (feature = flash-mode-1)
 │       ├── rawio.rs         # In-process replacement for every `dd` call (feature = flash-mode)

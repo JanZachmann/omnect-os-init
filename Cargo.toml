@@ -18,7 +18,9 @@ path = "src/main.rs"
 [dependencies]
 hex = { version = "0.4", default-features = false, optional = true }
 log = { version = "0.4", default-features = false, features = ["std"] }
-lzma-rust2 = { version = "0.21", default-features = false, features = ["std", "xz"], optional = true }
+# TODO: remove me, as soon as lzma-rust2 1.0 is released: until then a 0.x
+# update can change the decoder that runs in PID 1, so it needs a review.
+lzma-rust2 = { version = "=0.21.0", default-features = false, features = ["std", "xz"], optional = true }
 nix = { version = "0.29", default-features = false, features = ["fs", "ioctl", "mount", "net", "process", "reboot", "user"] }
 quick-xml = { version = "0.42", default-features = false, features = ["serialize"], optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
@@ -65,5 +67,5 @@ required-features = ["test-utils", "flash-mode"]
 
 [dev-dependencies]
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
-lzma-rust2 = { version = "0.21", default-features = false, features = ["encoder", "std", "xz"] }
+lzma-rust2 = { version = "=0.21.0", default-features = false, features = ["encoder", "std", "xz"] }
 tempfile = { version = "3.20", default-features = false }
