@@ -237,6 +237,7 @@ mod tests {
     use crate::mode::flash::bmap::test_support::{
         BLOCK_SIZE, FIXTURE_BMAP, FIXTURE_XZ, bmap_xml, image, xz,
     };
+    use lzma_rust2::{XzOptions, XzWriter};
     use std::io::Cursor;
 
     fn copied(bmap: &Bmap, source: &[u8]) -> Result<Vec<u8>, String> {
@@ -369,6 +370,66 @@ mod tests {
                 .unwrap_or_else(|e| panic!("tail {tail}: {e}"));
             assert_eq!(out.into_inner(), image, "tail {tail}");
         }
+    }
+
+    #[test]
+    fn a_multi_block_xz_stream_that_arrives_in_small_reads_is_decoded() {
+        const XZ_BLOCK_SIZE: u64 = 3 * BLOCK_SIZE;
+        for tail in 1..=8 {
+            let image = image(8, tail);
+            let bmap = Bmap::parse(&bmap_xml(&image, &[(0, 8)])).unwrap();
+            let mut options = XzOptions::with_preset(1);
+            options.set_block_size(std::num::NonZeroU64::new(XZ_BLOCK_SIZE));
+            let mut writer = XzWriter::new(Vec::new(), options).unwrap();
+            writer.write_all(&image).unwrap();
+            let compressed = writer.finish().unwrap();
+
+            let mut out = Cursor::new(Vec::new());
+            copy_stream(&bmap, &mut xz_stream(Trickle(&compressed)), &mut out)
+                .unwrap_or_else(|e| panic!("tail {tail}: {e}"));
+            assert_eq!(out.into_inner(), image, "tail {tail}");
+        }
+    }
+
+    #[test]
+    fn a_raw_stream_that_arrives_in_small_reads_is_copied() {
+        let image = image(5, 100);
+        let bmap = Bmap::parse(&bmap_xml(&image, &[(1, 1), (3, 5)])).unwrap();
+        let mut out = Cursor::new(Vec::new());
+        copy_stream(&bmap, &mut Stream::new(Trickle(&image)), &mut out).unwrap();
+        let block = usize::try_from(BLOCK_SIZE).unwrap();
+        assert_eq!(out.get_ref()[3 * block..], image[3 * block..]);
+    }
+
+    /// Fails every other read with `Interrupted`.
+    struct Interrupting<R> {
+        inner: R,
+        interrupt: bool,
+    }
+
+    impl<R: Read> Read for Interrupting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.interrupt = !self.interrupt;
+            if self.interrupt {
+                return Err(ErrorKind::Interrupted.into());
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    #[test]
+    fn full_reads_fill_the_buffer_until_the_input_ends() {
+        let data: Vec<u8> = (0..10).collect();
+        let mut reader = FullReads(Interrupting {
+            inner: Trickle(&data),
+            interrupt: false,
+        });
+        let mut buf = [0u8; 6];
+        assert_eq!(reader.read(&mut buf).unwrap(), 6);
+        assert_eq!(buf, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(reader.read(&mut buf).unwrap(), 4, "the input ends");
+        assert_eq!(buf[..4], [6, 7, 8, 9]);
+        assert_eq!(reader.read(&mut buf).unwrap(), 0);
     }
 
     fn crc32(data: &[u8]) -> u32 {

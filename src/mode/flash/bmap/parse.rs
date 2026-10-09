@@ -69,11 +69,15 @@ fn check_file_checksum(text: &str, checksum: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// `"major.minor"`, both numbers.
 fn check_version(version: &str) -> Result<(), String> {
-    let major = version.split('.').next().unwrap_or_default();
-    match major.parse::<u64>() {
-        Ok(SUPPORTED_MAJOR_VERSION) => Ok(()),
-        _ => Err(format!("bmap version '{version}' is not supported")),
+    let supported = version.split_once('.').is_some_and(|(major, minor)| {
+        major.parse() == Ok(SUPPORTED_MAJOR_VERSION) && minor.parse::<u64>().is_ok()
+    });
+    if supported {
+        Ok(())
+    } else {
+        Err(format!("bmap version '{version}' is not supported"))
     }
 }
 
@@ -212,6 +216,14 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_ranges_and_any_minor_version_are_accepted() {
+        let xml = bmap_xml(&image(4, 0), &[(0, 1), (2, 2)]);
+        assert_eq!(Bmap::parse(&xml).unwrap().ranges.len(), 2);
+        let xml = edited(&xml, "version=\"2.0\"", "version=\"2.1\"");
+        assert!(Bmap::parse(&xml).is_ok());
+    }
+
+    #[test]
     fn a_changed_bmap_fails_the_file_checksum() {
         let xml = bmap_xml(&image(4, 0), &[(0, 1)]).replacen("0-1", "0-2", 1);
         let err = Bmap::parse(&xml).unwrap_err();
@@ -224,6 +236,17 @@ mod tests {
         let cases = [
             ("version=\"2.0\"", "version=\"3.0\"", "version"),
             ("version=\"2.0\"", "version=\"1.4\"", "version"),
+            ("version=\"2.0\"", "version=\"2\"", "version"),
+            ("version=\"2.0\"", "version=\"2.x\"", "version"),
+            ("version=\"2.0\"", "version=\" 2.0\"", "version"),
+            ("> 0-1 <", "> 0-1-2 <", "range end"),
+            ("> 0-1 <", "> 0-18446744073709551615 <", "byte offset"),
+            ("<Range chksum=", "<Range sum=", "missing field"),
+            (
+                "<BlockSize>",
+                "<ImageSize> 1 </ImageSize><BlockSize>",
+                "duplicate field",
+            ),
             ("sha256 </Checksum", "md5 </Checksum", "checksum type"),
             ("> 0-1 <", "> 1-0 <", "ends before it starts"),
             ("> 0-1 <", "> a-1 <", "range start"),
