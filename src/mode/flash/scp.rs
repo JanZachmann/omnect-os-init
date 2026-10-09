@@ -37,6 +37,8 @@ const BMAP_CLOSING_TAG: &str = "</bmap>";
 /// Enough for the closing tag and the whitespace an editor or generator
 /// leaves after it.
 const BMAP_TAIL_LEN: u64 = 64;
+/// Polls without a size change before a file that is not a bmap is reported.
+const BMAP_STALE_POLLS: u32 = 5;
 
 pub(crate) struct ScpCtx<'a> {
     pub(crate) layout: &'a PartitionLayout,
@@ -160,7 +162,27 @@ fn read_tail(path: &Path) -> std::io::Result<Vec<u8>> {
 
 fn wait_for_bmap(path: &Path, interval: Duration, sleep: &mut dyn FnMut(Duration)) {
     log::info!("waiting for {}", path.display());
+    let mut last_len = None;
+    let mut unchanged_polls = 0;
     while !bmap_is_complete(path) {
+        let len = std::fs::metadata(path)
+            .ok()
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len());
+        unchanged_polls = if len.is_some() && len == last_len {
+            unchanged_polls + 1
+        } else {
+            0
+        };
+        last_len = len;
+        if unchanged_polls == BMAP_STALE_POLLS {
+            log::warn!(
+                "{} has not changed for {} s and does not end with {BMAP_CLOSING_TAG}, \
+                 it is not a bmap file",
+                path.display(),
+                (interval * BMAP_STALE_POLLS).as_secs()
+            );
+        }
         sleep(interval);
     }
 }
@@ -549,7 +571,7 @@ mod tests {
         assert_eq!(meta.gid(), Gid::current().as_raw());
     }
 
-    const MAX_TEST_POLLS: usize = 10;
+    const MAX_TEST_POLLS: usize = 20;
     const PARTIAL_BMAP: &str = "<?xml version=\"1.0\" ?>\n<bmap version=\"2.0\">\n";
 
     #[test]
@@ -611,6 +633,41 @@ mod tests {
         let lines = crate::logging::capture::take_capture();
         assert_eq!(
             lines.iter().filter(|line| line.contains(&waiting)).count(),
+            1,
+            "got {lines:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_that_stays_incomplete_is_reported_once() {
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::logging::capture::install_test_logger();
+        crate::logging::capture::start_capture();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WIC_BMAP_NAME);
+        std::fs::write(&path, "an xz stream").unwrap();
+        let complete_at = 2 * usize::try_from(BMAP_STALE_POLLS).unwrap() + 2;
+        let mut polls = 0;
+        wait_for_bmap(&path, BMAP_POLL_INTERVAL, &mut |_| {
+            polls += 1;
+            match polls {
+                n if n == complete_at => {
+                    std::fs::write(&path, format!("{PARTIAL_BMAP}{BMAP_CLOSING_TAG}")).unwrap()
+                }
+                n if n > MAX_TEST_POLLS => panic!("the wait did not end"),
+                _ => {}
+            }
+        });
+
+        let lines = crate::logging::capture::take_capture();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("it is not a bmap file"))
+                .count(),
             1,
             "got {lines:?}"
         );
