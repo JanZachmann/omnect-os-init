@@ -17,10 +17,8 @@ done
 printf "$(printf '\\%03o' $(seq 0 99))" |
     dd of=wic bs=4096 seek=20 conv=notrunc status=none
 bmaptool create wic -o wic.bmap
-xz -k wic
+xz -T0 -k wic
 ```
 
 The sha256 of the decoded image is
 `f41a80f9f783ec8915b3420421664c25511937a60fbf9d9001b9b6ebbb53a2b7`.
-`bmaptool` and `xz` versions may produce a different `wic.bmap` comment or
-`wic.xz`, but the same image.
