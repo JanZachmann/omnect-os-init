@@ -1,8 +1,4 @@
-//! Decode the image and write the ranges the bmap maps.
-
-use std::fs::File;
-#[cfg(any(test, not(feature = "flash-mode-2-direct")))]
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
 
 use lzma_rust2::{XzReader, lzma2_get_memory_usage};
@@ -13,7 +9,7 @@ use crate::mode::flash::bmap::{Bmap, Destination, Source};
 use crate::mode::flash::rawio::{ByteRange, COPY_BUFFER_SIZE, chunk_len, open_existing_for_write};
 
 /// The largest dictionary of the xz presets (`-9`). The decoder allocates the
-/// dictionary that the stream header asks for, so a larger one is rejected
+/// dictionary that each block header asks for, so a larger one is rejected
 /// before it can push the device out of memory.
 const MAX_XZ_DICT_SIZE: u32 = 64 * MIB;
 const MIB: u32 = 1024 * 1024;
@@ -34,13 +30,11 @@ pub(crate) fn copy(
     let input = File::open(source.path()).map_err(|e| failed(format!("opening source: {e}")))?;
     let mut input: Box<dyn Input> = match source {
         Source::Xz(_) => Box::new(xz_stream(input)),
-        #[cfg(any(test, not(feature = "flash-mode-2-direct")))]
-        Source::Raw(_) => Box::new(Seekable(input)),
+        Source::Raw(_) => Box::new(Seekable::new(input)),
     };
 
     let mut output = match destination {
         Destination::Device(path) => open_existing_for_write(path),
-        #[cfg(any(test, not(feature = "flash-mode-2-direct")))]
         Destination::File(path) => OpenOptions::new()
             .write(true)
             .create(true)
@@ -58,11 +52,10 @@ pub(crate) fn copy(
 
 /// Read exactly `len` bytes, handing each chunk to `sink`.
 fn pass_through(
-    input: &mut dyn Read,
+    input: &mut dyn Input,
     len: u64,
     buf: &mut [u8],
     sink: &mut dyn FnMut(&[u8]) -> Result<(), String>,
-    position: u64,
 ) -> Result<(), String> {
     let mut left = len;
     while left > 0 {
@@ -77,7 +70,7 @@ fn pass_through(
         if read == 0 {
             return Err(format!(
                 "source ended at byte {}, the image has more",
-                position + (len - left)
+                input.position()
             ));
         }
         sink(&buf[..read])?;
@@ -87,22 +80,29 @@ fn pass_through(
 }
 
 trait Input: Read {
-    /// Move forward from `position` to `target` without using the bytes.
-    fn skip(&mut self, position: u64, target: u64, buf: &mut [u8]) -> Result<(), String>;
+    /// The number of image bytes read or skipped so far.
+    fn position(&self) -> u64;
+    /// Move forward to `target` without using the bytes in between.
+    fn skip_to(&mut self, target: u64, buf: &mut [u8]) -> Result<(), String>;
+}
+
+fn distance(position: u64, target: u64) -> Result<u64, String> {
+    target
+        .checked_sub(position)
+        .ok_or_else(|| format!("cannot move back from byte {position} to {target}"))
 }
 
 fn xz_stream<R: Read>(compressed: R) -> Stream<XzReader<FullReads<R>>> {
-    Stream(XzReader::new_mem_limit(
+    Stream::new(XzReader::new_mem_limit(
         FullReads(compressed),
         true,
         lzma2_get_memory_usage(MAX_XZ_DICT_SIZE),
     ))
 }
 
-/// A pipe returns only the bytes that have arrived so far. The xz decoder
-/// reads the padding after a block with a single `read` and takes a short
-/// count as a broken stream, so each read here waits for the whole buffer or
-/// the end of the input.
+/// The xz decoder treats a short read as a broken stream; a pipe returns only
+/// what has arrived, so each read here fills the buffer or reaches the end of
+/// input.
 struct FullReads<R>(R);
 
 impl<R: Read> Read for FullReads<R> {
@@ -120,89 +120,105 @@ impl<R: Read> Read for FullReads<R> {
     }
 }
 
-/// A stream moves forward only by reading.
-struct Stream<R>(R);
+struct Stream<R> {
+    inner: R,
+    position: u64,
+}
+
+impl<R> Stream<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, position: 0 }
+    }
+}
 
 impl<R: Read> Read for Stream<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        let read = self.inner.read(buf)?;
+        self.position += read as u64;
+        Ok(read)
     }
 }
 
 impl<R: Read> Input for Stream<R> {
-    fn skip(&mut self, position: u64, target: u64, buf: &mut [u8]) -> Result<(), String> {
-        pass_through(
-            &mut self.0,
-            target - position,
-            buf,
-            &mut |_| Ok(()),
-            position,
-        )
+    fn position(&self) -> u64 {
+        self.position
+    }
+
+    fn skip_to(&mut self, target: u64, buf: &mut [u8]) -> Result<(), String> {
+        let len = distance(self.position, target)?;
+        pass_through(self, len, buf, &mut |_| Ok(()))
     }
 }
 
-/// On ramfs, reading a hole of a sparse file puts a zero page into a page
-/// cache that cannot be evicted, so the gaps are seeked over.
-#[cfg(any(test, not(feature = "flash-mode-2-direct")))]
-struct Seekable<R>(R);
+/// Gaps are seeked over: on ramfs, reading a hole allocates a zero page that
+/// stays in RAM.
+#[cfg_attr(feature = "flash-mode-2-direct", allow(dead_code))]
+struct Seekable<R> {
+    inner: R,
+    position: u64,
+}
 
-#[cfg(any(test, not(feature = "flash-mode-2-direct")))]
+impl<R> Seekable<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, position: 0 }
+    }
+}
+
 impl<R: Read> Read for Seekable<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
+        let read = self.inner.read(buf)?;
+        self.position += read as u64;
+        Ok(read)
     }
 }
 
-#[cfg(any(test, not(feature = "flash-mode-2-direct")))]
 impl<R: Read + Seek> Input for Seekable<R> {
-    fn skip(&mut self, _position: u64, target: u64, _buf: &mut [u8]) -> Result<(), String> {
-        self.0
+    fn position(&self) -> u64 {
+        self.position
+    }
+
+    fn skip_to(&mut self, target: u64, _buf: &mut [u8]) -> Result<(), String> {
+        distance(self.position, target)?;
+        self.inner
             .seek(SeekFrom::Start(target))
-            .map(|_| ())
-            .map_err(|e| format!("seeking source: {e}"))
+            .map_err(|e| format!("seeking source: {e}"))?;
+        self.position = target;
+        Ok(())
     }
 }
 
-/// The source must end at the image end, so a stream with a bad end (an xz
-/// footer, extra data) fails instead of being taken as complete.
+/// The source is read to its end, so a cut xz stream or data after the image
+/// is an error instead of a complete image.
 fn copy_stream<W: Write + Seek>(
     bmap: &Bmap,
     input: &mut dyn Input,
     output: &mut W,
 ) -> Result<(), String> {
     let mut buf = vec![0u8; COPY_BUFFER_SIZE];
-    let mut position: u64 = 0;
 
     for range in &bmap.ranges {
         let ByteRange { offset, len } = range.bytes;
-        input.skip(position, offset, &mut buf)?;
+        input.skip_to(offset, &mut buf)?;
         output
             .seek(SeekFrom::Start(offset))
             .map_err(|e| format!("seeking destination: {e}"))?;
 
         let mut hasher = Sha256::new();
-        pass_through(
-            input,
-            len,
-            &mut buf,
-            &mut |chunk| {
-                hasher.update(chunk);
-                output
-                    .write_all(chunk)
-                    .map_err(|e| format!("writing destination: {e}"))
-            },
-            offset,
-        )?;
+        pass_through(input, len, &mut buf, &mut |chunk| {
+            hasher.update(chunk);
+            output
+                .write_all(chunk)
+                .map_err(|e| format!("writing destination: {e}"))
+        })?;
         if hasher.finalize()[..] != range.sha256 {
             return Err(format!(
                 "checksum mismatch in bytes {offset}..{}",
                 offset + len
             ));
         }
-        position = offset + len;
     }
 
-    input.skip(position, bmap.image_size, &mut buf)?;
+    input.skip_to(bmap.image_size, &mut buf)?;
     let extra = input
         .read(&mut buf[..1])
         .map_err(|e| format!("reading source: {e}"))?;
@@ -225,11 +241,10 @@ mod tests {
 
     fn copied(bmap: &Bmap, source: &[u8]) -> Result<Vec<u8>, String> {
         let mut out = Cursor::new(Vec::new());
-        copy_stream(bmap, &mut Stream(Cursor::new(source)), &mut out)?;
+        copy_stream(bmap, &mut Stream::new(Cursor::new(source)), &mut out)?;
         Ok(out.into_inner())
     }
 
-    /// Counts the bytes read through it.
     struct Counting<'a> {
         inner: Cursor<&'a [u8]>,
         read: u64,
@@ -250,17 +265,34 @@ mod tests {
     }
 
     #[test]
+    fn an_input_does_not_move_back() {
+        let data = [0u8; 10];
+        let mut buf = [0u8; 4];
+        let inputs: [Box<dyn Input>; 2] = [
+            Box::new(Stream::new(Cursor::new(&data))),
+            Box::new(Seekable::new(Cursor::new(&data))),
+        ];
+        for mut input in inputs {
+            input.skip_to(6, &mut buf).unwrap();
+            assert_eq!(input.position(), 6);
+            input.skip_to(6, &mut buf).unwrap();
+            let err = input.skip_to(5, &mut buf).unwrap_err();
+            assert!(err.contains("cannot move back"), "{err}");
+        }
+    }
+
+    #[test]
     fn a_seekable_source_reads_only_the_mapped_ranges() {
         let image = image(5, 100);
         let bmap = Bmap::parse(&bmap_xml(&image, &[(1, 1), (3, 3)])).unwrap();
-        let mut input = Seekable(Counting {
+        let mut input = Seekable::new(Counting {
             inner: Cursor::new(&image),
             read: 0,
         });
         let mut out = Cursor::new(Vec::new());
         copy_stream(&bmap, &mut input, &mut out).unwrap();
 
-        assert_eq!(input.0.read, 2 * BLOCK_SIZE);
+        assert_eq!(input.inner.read, 2 * BLOCK_SIZE);
         let block = usize::try_from(BLOCK_SIZE).unwrap();
         assert_eq!(out.get_ref()[block..2 * block], image[block..2 * block]);
     }

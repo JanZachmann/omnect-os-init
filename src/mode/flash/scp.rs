@@ -172,7 +172,8 @@ trait ScpOps {
     fn create_fifo(&mut self, path: &Path, owner: u32) -> Result<(), FlashError>;
     fn tell_operator(&mut self, message: &str);
     fn wait_for_bmap(&mut self, path: &Path);
-    fn read_bmap(&mut self, path: &Path, disk: &Path) -> Result<Bmap, FlashError>;
+    fn read_bmap(&mut self, path: &Path) -> Result<Bmap, FlashError>;
+    fn device_len(&mut self, disk: &Path) -> Result<u64, FlashError>;
     fn bmap_copy(
         &mut self,
         bmap: &Bmap,
@@ -219,10 +220,17 @@ impl ScpOps for RealScpOps {
         wait_for_bmap(path, BMAP_POLL_INTERVAL, &mut thread::sleep);
     }
 
-    fn read_bmap(&mut self, path: &Path, disk: &Path) -> Result<Bmap, FlashError> {
-        let map = bmap::read(path)?;
-        bmap::check_fits(&map, disk)?;
-        Ok(map)
+    fn read_bmap(&mut self, path: &Path) -> Result<Bmap, FlashError> {
+        bmap::read(path)
+    }
+
+    fn device_len(&mut self, disk: &Path) -> Result<u64, FlashError> {
+        File::open(disk)
+            .and_then(|mut file| file.seek(SeekFrom::End(0)))
+            .map_err(|e| FlashError::InvalidDestination {
+                device: disk.to_path_buf(),
+                reason: format!("cannot determine size: {e}"),
+            })
     }
 
     fn bmap_copy(
@@ -373,7 +381,17 @@ fn flash_once(
     ops.tell_operator(&bmap_instruction(ip));
     // Unbounded: this waits for a person to start the `scp`.
     ops.wait_for_bmap(&upload.bmap);
-    let map = ops.read_bmap(&upload.bmap, disk)?;
+    let map = ops.read_bmap(&upload.bmap)?;
+    let disk_len = ops.device_len(disk)?;
+    if map.image_size() > disk_len {
+        return Err(FlashError::InvalidDestination {
+            device: disk.to_path_buf(),
+            reason: format!(
+                "the image needs {} bytes, the device has {disk_len}",
+                map.image_size()
+            ),
+        });
+    }
     ops.tell_operator(&image_instruction(ip));
 
     // The verify pass reads the whole stream first, so a broken transfer
@@ -598,18 +616,11 @@ mod tests {
         );
     }
 
-    const MIB: u64 = 1024 * 1024;
+    const FIXTURE_BMAP: &str = include_str!("testdata/wic.bmap");
+    const DISK_LEN: u64 = 64 * 1024 * 1024;
 
-    /// Maps the first MiB and the third MiB of the disk.
     fn recorded_bmap() -> Bmap {
-        let mapped = |offset| bmap::MappedRange {
-            bytes: ByteRange { offset, len: MIB },
-            sha256: [0; bmap::SHA256_LEN],
-        };
-        Bmap {
-            image_size: 64 * MIB,
-            ranges: vec![mapped(0), mapped(2 * MIB)],
-        }
+        Bmap::parse(FIXTURE_BMAP).unwrap()
     }
 
     /// Lets `passes` calls of `step` succeed, then fails the next `failures`.
@@ -640,6 +651,7 @@ mod tests {
     struct RecordingScpOps {
         calls: Vec<String>,
         faults: Vec<Fault>,
+        disk_len: u64,
     }
 
     impl RecordingScpOps {
@@ -718,13 +730,14 @@ mod tests {
             self.calls.push(format!("wait for {}", path.display()));
         }
 
-        fn read_bmap(&mut self, path: &Path, disk: &Path) -> Result<Bmap, FlashError> {
-            self.record(format!(
-                "read bmap {} for {}",
-                path.display(),
-                disk.display()
-            ))?;
+        fn read_bmap(&mut self, path: &Path) -> Result<Bmap, FlashError> {
+            self.record(format!("read bmap {}", path.display()))?;
             Ok(recorded_bmap())
+        }
+
+        fn device_len(&mut self, disk: &Path) -> Result<u64, FlashError> {
+            self.record(format!("size of {}", disk.display()))?;
+            Ok(self.disk_len)
         }
 
         fn bmap_copy(
@@ -776,6 +789,14 @@ mod tests {
         raw: &BuildConstants,
         faults: Vec<Fault>,
     ) -> (Result<(), FlashError>, Vec<String>) {
+        run_recorded_on(raw, faults, DISK_LEN)
+    }
+
+    fn run_recorded_on(
+        raw: &BuildConstants,
+        faults: Vec<Fault>,
+        disk_len: u64,
+    ) -> (Result<(), FlashError>, Vec<String>) {
         let layout = PartitionLayout::new(RootDevice {
             base: PathBuf::from("/dev/sda"),
             partition_sep: "",
@@ -789,6 +810,7 @@ mod tests {
         let mut ops = RecordingScpOps {
             calls: Vec::new(),
             faults,
+            disk_len,
         };
         let result = scp_with(&ctx, raw, &mut ops);
         (result, ops.calls)
@@ -810,7 +832,8 @@ mod tests {
         let mut calls = vec![
             "tell please run: scp -O <bmap-file> omnect@192.168.0.7:wic.bmap".to_string(),
             "wait for /home/omnect/wic.bmap".to_string(),
-            "read bmap /home/omnect/wic.bmap for /dev/sda".to_string(),
+            "read bmap /home/omnect/wic.bmap".to_string(),
+            "size of /dev/sda".to_string(),
             "tell please run: scp -O <wic-image> omnect@192.168.0.7:wic.xz".to_string(),
         ];
         #[cfg(not(feature = "flash-mode-2-direct"))]
@@ -820,10 +843,12 @@ mod tests {
         ]);
         #[cfg(feature = "flash-mode-2-direct")]
         calls.push("bmap /home/omnect/wic.xz to /dev/sda".to_string());
-        // The head minus the two mapped MiBs of `recorded_bmap`.
+        // The head minus the blocks 0-1, 5, 9-11 and 20 that the fixture maps.
         calls.extend([
-            "zero /dev/sda@1048576 len 1048576".to_string(),
-            "zero /dev/sda@3145728 len 42991616".to_string(),
+            "zero /dev/sda@8192 len 12288".to_string(),
+            "zero /dev/sda@24576 len 12288".to_string(),
+            "zero /dev/sda@49152 len 32768".to_string(),
+            "zero /dev/sda@82020 len 46055324".to_string(),
         ]);
         calls
     }
@@ -1014,27 +1039,48 @@ mod tests {
     }
 
     #[test]
-    fn the_real_bmap_read_checks_the_bmap_and_the_disk_size() {
+    fn an_image_larger_than_the_disk_is_refused_before_any_write() {
+        let image_size = recorded_bmap().image_size();
+        let (result, calls) = run_recorded_on(
+            &raw_constants(),
+            then_fifo_fails(Vec::new(), 1),
+            image_size - 1,
+        );
+        assert!(keeps_log(&result), "{result:?}");
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("zero") || call.ends_with(FLASH_PASS)),
+            "got {calls:?}"
+        );
+        let size = calls.iter().position(|call| call == "size of /dev/sda");
+        assert_eq!(calls[size.unwrap() + 1], retry_calls()[0], "got {calls:?}");
+
+        let (result, _) = run_recorded_on(&raw_constants(), Vec::new(), image_size);
+        result.unwrap();
+    }
+
+    #[test]
+    fn the_real_ops_read_the_bmap_and_the_disk_size() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(WIC_BMAP_NAME);
-        std::fs::write(&path, include_str!("testdata/wic.bmap")).unwrap();
         let disk = dir.path().join("sdz");
         let mut ops = RealScpOps::default();
 
-        std::fs::write(&disk, vec![0u8; 1024]).unwrap();
-        assert!(matches!(
-            ops.read_bmap(&path, &disk),
-            Err(FlashError::InvalidDestination { .. })
-        ));
-
-        std::fs::write(&disk, vec![0u8; 1024 * 1024]).unwrap();
-        assert!(ops.read_bmap(&path, &disk).is_ok());
-
+        std::fs::write(&path, FIXTURE_BMAP).unwrap();
+        assert_eq!(ops.read_bmap(&path).unwrap(), recorded_bmap());
         std::fs::write(&path, "<bmap").unwrap();
         assert!(matches!(
-            ops.read_bmap(&path, &disk),
+            ops.read_bmap(&path),
             Err(FlashError::InvalidBmap { .. })
         ));
+
+        assert!(matches!(
+            ops.device_len(&disk),
+            Err(FlashError::InvalidDestination { .. })
+        ));
+        std::fs::write(&disk, [0u8; 1024]).unwrap();
+        assert_eq!(ops.device_len(&disk).unwrap(), 1024);
     }
 
     #[test]

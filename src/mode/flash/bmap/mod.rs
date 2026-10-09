@@ -6,8 +6,8 @@
 mod copy;
 mod parse;
 
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 use crate::error::FlashError;
@@ -15,43 +15,42 @@ use crate::mode::flash::rawio::ByteRange;
 
 pub(crate) use copy::copy;
 
-pub(crate) const SHA256_LEN: usize = 32;
+const SHA256_LEN: usize = 32;
 /// Far above the size of a real bmap, which is a few KiB.
 const MAX_BMAP_LEN: u64 = 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct MappedRange {
-    pub(crate) bytes: ByteRange,
-    pub(crate) sha256: [u8; SHA256_LEN],
+struct MappedRange {
+    bytes: ByteRange,
+    sha256: [u8; SHA256_LEN],
 }
 
 /// A checked bmap: ranges are sorted, do not overlap and end inside the image.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Bmap {
-    pub(crate) image_size: u64,
-    pub(crate) ranges: Vec<MappedRange>,
+    image_size: u64,
+    ranges: Vec<MappedRange>,
 }
 
 pub(crate) enum Source<'a> {
     Xz(&'a Path),
-    /// An image the verify pass already decoded.
-    #[cfg(any(test, not(feature = "flash-mode-2-direct")))]
+    /// Must be seekable: a FIFO fails at the first gap.
+    #[cfg_attr(feature = "flash-mode-2-direct", allow(dead_code))]
     Raw(&'a Path),
 }
 
 pub(crate) enum Destination<'a> {
+    /// Must already exist.
     Device(&'a Path),
     /// Created, or truncated, to the image size.
-    #[cfg(any(test, not(feature = "flash-mode-2-direct")))]
+    #[cfg_attr(feature = "flash-mode-2-direct", allow(dead_code))]
     File(&'a Path),
 }
 
 impl Source<'_> {
     pub(crate) fn path(&self) -> &Path {
         match self {
-            Self::Xz(path) => path,
-            #[cfg(any(test, not(feature = "flash-mode-2-direct")))]
-            Self::Raw(path) => path,
+            Self::Xz(path) | Self::Raw(path) => path,
         }
     }
 }
@@ -59,14 +58,16 @@ impl Source<'_> {
 impl Destination<'_> {
     pub(crate) fn path(&self) -> &Path {
         match self {
-            Self::Device(path) => path,
-            #[cfg(any(test, not(feature = "flash-mode-2-direct")))]
-            Self::File(path) => path,
+            Self::Device(path) | Self::File(path) => path,
         }
     }
 }
 
 impl Bmap {
+    pub(crate) fn image_size(&self) -> u64 {
+        self.image_size
+    }
+
     /// The parts of `area` that no range of the image writes.
     pub(crate) fn unmapped(&self, area: &ByteRange) -> Vec<ByteRange> {
         let area_end = area.offset.saturating_add(area.len);
@@ -113,23 +114,6 @@ pub(crate) fn read(path: &Path) -> Result<Bmap, FlashError> {
     }
     let text = String::from_utf8(bytes).map_err(|e| invalid(e.to_string()))?;
     Bmap::parse(&text).map_err(invalid)
-}
-
-pub(crate) fn check_fits(bmap: &Bmap, device: &Path) -> Result<(), FlashError> {
-    let unusable = |reason: String| FlashError::InvalidDestination {
-        device: device.to_path_buf(),
-        reason,
-    };
-    let size = File::open(device)
-        .and_then(|mut file| file.seek(SeekFrom::End(0)))
-        .map_err(|e| unusable(format!("cannot determine size: {e}")))?;
-    if bmap.image_size > size {
-        return Err(unusable(format!(
-            "the image needs {} bytes, the device has {size}",
-            bmap.image_size
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -220,6 +204,7 @@ mod tests {
     };
     use crate::mode::flash::rawio::zero_range;
     use sha2::{Digest, Sha256};
+    use std::fs;
 
     fn bmap_of(ranges: &[(u64, u64)]) -> Bmap {
         Bmap {
@@ -257,35 +242,6 @@ mod tests {
     }
 
     #[test]
-    fn an_image_larger_than_the_device_does_not_fit() {
-        let dir = tempfile::tempdir().unwrap();
-        let bmap = bmap_of(&[]);
-        let device = dir.path().join("sdz");
-        fs::write(&device, [0u8; 16]).unwrap();
-
-        assert!(
-            check_fits(
-                &Bmap {
-                    image_size: 16,
-                    ..bmap_of(&[])
-                },
-                &device
-            )
-            .is_ok()
-        );
-        assert!(matches!(
-            check_fits(
-                &Bmap {
-                    image_size: 17,
-                    ..bmap
-                },
-                &device
-            ),
-            Err(FlashError::InvalidDestination { .. })
-        ));
-    }
-
-    #[test]
     fn a_bmap_file_that_is_not_xml_is_invalid() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wic.bmap");
@@ -318,8 +274,6 @@ mod tests {
         ));
     }
 
-    /// The same steps as mode 2: decode, flash onto a disk that holds old
-    /// data, then zero what the image does not map.
     #[test]
     fn flashing_the_bmaptool_fixture_and_zeroing_the_rest_gives_the_image() {
         let dir = tempfile::tempdir().unwrap();
