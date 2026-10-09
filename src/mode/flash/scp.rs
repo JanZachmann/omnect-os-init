@@ -948,57 +948,47 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_bad_bmap_leaves_the_disk_untouched() {
-        let (_, calls) = run_recorded(&raw_constants(), fails_once("read bmap"));
-        let retry = calls
-            .iter()
-            .position(|call| call.starts_with("tell flash failed"));
-        let first_write = calls
-            .iter()
-            .position(|call| call.starts_with("zero") || call.ends_with(FLASH_PASS));
-        assert!(retry < first_write, "got {calls:?}");
+    fn then_fifo_fails(mut faults: Vec<Fault>, fifo_passes: usize) -> Vec<Fault> {
+        faults.push(Fault {
+            step: "fifo",
+            passes: fifo_passes,
+            failures: 1,
+        });
+        faults
     }
 
     #[test]
     fn a_failed_fifo_after_a_failed_attempt_stops_mode_2() {
-        let faults = vec![
-            Fault {
-                step: "read bmap",
-                passes: 0,
-                failures: 1,
-            },
-            Fault {
-                step: "fifo",
-                passes: 1,
-                failures: 1,
-            },
-        ];
-        let (result, calls) = run_recorded(&raw_constants(), faults);
-        assert!(result.is_err());
-        assert_eq!(
-            calls.last().unwrap(),
-            "fifo /home/omnect/wic.xz owned by 1000"
-        );
-        assert!(!calls.iter().any(|call| call.starts_with("zero")));
-        assert!(keeps_log(&result), "the disk was not written: {result:?}");
+        let mut steps = vec![("read bmap", false), ("zero", true), (FLASH_PASS, true)];
+        if !cfg!(feature = "flash-mode-2-direct") {
+            steps.push(("bmap /home/omnect/wic.xz", false));
+        }
+        for (step, disk_written) in steps {
+            let (result, calls) =
+                run_recorded(&raw_constants(), then_fifo_fails(fails_once(step), 1));
+            assert_eq!(
+                calls.last().unwrap(),
+                "fifo /home/omnect/wic.xz owned by 1000",
+                "{step}"
+            );
+            assert_eq!(
+                matches!(result, Err(FlashError::DiskPartlyWritten { .. })),
+                disk_written,
+                "{step}: {result:?}"
+            );
+            assert_eq!(keeps_log(&result), !disk_written, "{step}: {result:?}");
+        }
     }
 
     #[test]
-    fn a_failed_fifo_after_a_partly_written_attempt_keeps_the_log_off_the_disk() {
-        let faults = vec![
-            Fault {
-                step: FLASH_PASS,
-                passes: 0,
-                failures: 1,
-            },
-            Fault {
-                step: "fifo",
-                passes: 1,
-                failures: 1,
-            },
-        ];
-        let (result, _) = run_recorded(&raw_constants(), faults);
+    fn a_disk_written_by_an_earlier_attempt_keeps_the_log_off_it() {
+        let mut faults = fails_once(FLASH_PASS);
+        faults.push(Fault {
+            step: "read bmap",
+            passes: 1,
+            failures: 1,
+        });
+        let (result, _) = run_recorded(&raw_constants(), then_fifo_fails(faults, 2));
         assert!(
             matches!(result, Err(FlashError::DiskPartlyWritten { .. })),
             "{result:?}"
