@@ -177,7 +177,7 @@ fn wait_for_bmap(path: &Path, interval: Duration, sleep: &mut dyn FnMut(Duration
         if unchanged_polls == BMAP_STALE_POLLS {
             log::warn!(
                 "{} has not changed for {} s and does not end with {BMAP_CLOSING_TAG}, \
-                 it is not a bmap file",
+                 is it the bmap file?",
                 path.display(),
                 (interval * BMAP_STALE_POLLS).as_secs()
             );
@@ -662,7 +662,7 @@ mod tests {
         assert_eq!(
             lines
                 .iter()
-                .filter(|line| line.contains("it is not a bmap file"))
+                .filter(|line| line.contains("is it the bmap file?"))
                 .count(),
             1,
             "got {lines:?}"
