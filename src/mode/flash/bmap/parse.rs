@@ -57,7 +57,8 @@ fn sha256_from_hex(text: &str) -> Result<[u8; SHA256_LEN], String> {
     Ok(digest)
 }
 
-/// bmaptool hashes the file with its own checksum replaced by zeros.
+/// The file checksum is the sha256 of the file with the checksum value
+/// replaced by zeros.
 fn check_file_checksum(text: &str, checksum: &str) -> Result<(), String> {
     let checksum = checksum.trim();
     let expected = sha256_from_hex(checksum)?;

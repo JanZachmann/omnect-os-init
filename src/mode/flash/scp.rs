@@ -67,8 +67,7 @@ struct Constants {
     omnect_user_id: u32,
 }
 
-/// The disk head: everything up to the end of the boot partition. Its parts
-/// the image does not write are zeroed after the flash.
+/// The disk head: everything up to the end of the boot partition.
 fn head_kib(boot_start: Option<u64>, boot_size: Option<u64>) -> Result<u64, FlashError> {
     let start = boot_start.ok_or(FlashError::MissingBuildConstant(BuildConstant::BootStart))?;
     let size = boot_size.ok_or(FlashError::MissingBuildConstant(BuildConstant::BootSize))?;
@@ -293,8 +292,6 @@ impl ScpOps for RealScpOps {
 struct Upload {
     fifo: PathBuf,
     bmap: PathBuf,
-    /// The verify pass decodes the image here. It is held in the initramfs
-    /// root, so it must fit in RAM.
     #[cfg(not(feature = "flash-mode-2-direct"))]
     decoded: PathBuf,
 }
@@ -311,7 +308,6 @@ impl Upload {
     }
 }
 
-/// Flash the running disk with the image the operator pushes in.
 pub(crate) fn run_scp(ctx: &ScpCtx<'_>) -> Result<(), FlashError> {
     scp_with(
         ctx,
@@ -391,8 +387,7 @@ fn partly_written(disk: &Path, source: FlashError) -> FlashError {
     }
 }
 
-/// One upload and flash. The disk is written only after the bmap passed its
-/// checks.
+/// One upload and flash.
 fn flash_once(
     ops: &mut dyn ScpOps,
     upload: &Upload,
@@ -417,7 +412,8 @@ fn flash_once(
     ops.tell_operator(&image_instruction(ip));
 
     // The verify pass reads the whole stream first, so a broken transfer
-    // fails before the disk is written.
+    // fails before the disk is written. The decoded image is held in the
+    // initramfs root, so it must fit in RAM.
     #[cfg(not(feature = "flash-mode-2-direct"))]
     let source = {
         log::info!("verifying {}", upload.fifo.display());
