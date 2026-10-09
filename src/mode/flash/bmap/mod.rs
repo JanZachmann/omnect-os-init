@@ -7,7 +7,7 @@ mod copy;
 mod parse;
 
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 use crate::error::FlashError;
@@ -16,6 +16,8 @@ use crate::mode::flash::rawio::ByteRange;
 pub(crate) use copy::copy;
 
 pub(crate) const SHA256_LEN: usize = 32;
+/// Far above the size of a real bmap, which is a few KiB.
+const MAX_BMAP_LEN: u64 = 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MappedRange {
@@ -99,7 +101,17 @@ pub(crate) fn read(path: &Path) -> Result<Bmap, FlashError> {
         path: path.to_path_buf(),
         reason,
     };
-    let text = fs::read_to_string(path).map_err(|e| invalid(e.to_string()))?;
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(MAX_BMAP_LEN + 1).read_to_end(&mut bytes))
+        .map_err(|source| FlashError::PathIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_BMAP_LEN {
+        return Err(invalid(format!("larger than {MAX_BMAP_LEN} bytes")));
+    }
+    let text = String::from_utf8(bytes).map_err(|e| invalid(e.to_string()))?;
     Bmap::parse(&text).map_err(invalid)
 }
 
@@ -279,6 +291,31 @@ mod tests {
         let path = dir.path().join("wic.bmap");
         fs::write(&path, "not a bmap").unwrap();
         assert!(matches!(read(&path), Err(FlashError::InvalidBmap { .. })));
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(matches!(read(&path), Err(FlashError::InvalidBmap { .. })));
+    }
+
+    #[test]
+    fn a_bmap_file_above_the_size_limit_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wic.bmap");
+        let len = usize::try_from(MAX_BMAP_LEN).unwrap();
+        let too_large = |len: usize| {
+            let padding = " ".repeat(len - FIXTURE_BMAP.len());
+            fs::write(&path, format!("{FIXTURE_BMAP}{padding}")).unwrap();
+            read(&path).is_err_and(|e| e.to_string().contains("larger than"))
+        };
+        assert!(!too_large(len), "at the limit");
+        assert!(too_large(len + 1));
+    }
+
+    #[test]
+    fn a_bmap_file_that_cannot_be_read_is_an_io_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            read(&dir.path().join("wic.bmap")),
+            Err(FlashError::PathIo { .. })
+        ));
     }
 
     /// The same steps as mode 2: decode, flash onto a disk that holds old

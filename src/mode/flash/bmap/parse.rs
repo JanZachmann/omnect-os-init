@@ -151,6 +151,10 @@ impl Bmap {
             });
         }
 
+        // A real image always maps its partition table.
+        if ranges.is_empty() {
+            return Err("bmap maps no blocks".to_string());
+        }
         let mapped_blocks_count = number("MappedBlocksCount", &xml.mapped_blocks_count)?;
         if mapped_blocks != mapped_blocks_count {
             return Err(format!(
@@ -236,13 +240,25 @@ mod tests {
                 "MappedBlocksCount",
             ),
             ("<ImageSize> 16384", "<ImageSize> x", "ImageSize"),
-            ("</BlockMap>", "", ""),
+            ("</BlockMap>", "", "ill-formed document"),
         ];
         for (from, to, expected) in cases {
             let changed = edited(&xml, from, to);
             assert_ne!(changed, xml, "{from} not found");
             let err = Bmap::parse(&changed).unwrap_err();
             assert!(err.contains(expected), "{from} -> {to}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_bmap_that_maps_nothing_is_an_error() {
+        for image in [image(0, 0), image(4, 0)] {
+            let err = Bmap::parse(&bmap_xml(&image, &[])).unwrap_err();
+            assert!(
+                err.contains("maps no blocks"),
+                "{} bytes: {err}",
+                image.len()
+            );
         }
     }
 
