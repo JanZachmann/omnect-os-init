@@ -600,8 +600,11 @@ flag file shipped by `omnect-os-initramfs-test`. Both are kept.
 A failure in steps 6 to 8 does not end the mode. It is logged, `wic.bmap`, the
 decoded image and the FIFO are removed, a new FIFO is created and the operator
 is asked again from step 4. The init runs from RAM, so even a partly written
-disk can be repaired by a new upload as long as the device stays powered. A
-new FIFO also cuts off an `scp` that still writes into the old one.
+disk can be repaired by a new upload as long as the device stays powered. An
+`scp` that still writes into the old FIFO fails with `EPIPE` once the flash
+closes the read end. An `scp` still blocked in opening the old FIFO would wait
+forever after the FIFO is removed, so the FIFO is opened for reading once
+before the removal; that `scp` then fails the same way.
 
 Once the flash starts it blocks reading the FIFO until the operator's `scp`
 feeds it, and that wait stays unbounded too: a timeout there would kill a flash

@@ -1,14 +1,16 @@
 //! Flash mode 2: flash the running disk with a `wic.xz` the operator pushes in
 //! over `scp`.
 
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::fs::{File, OpenOptions};
+use std::io::{ErrorKind, Read, Seek, SeekFrom};
 use std::net::Ipv4Addr;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
 use nix::errno::Errno;
+use nix::fcntl::OFlag;
 use nix::sys::stat::Mode;
 use nix::unistd::{Gid, Uid, chown, mkfifo};
 
@@ -112,6 +114,32 @@ fn create_owned_fifo(path: &Path, uid: Uid, gid: Gid) -> Result<(), FlashError> 
     chown(path, Some(uid), Some(gid)).map_err(failed)
 }
 
+/// A writer blocked in `open()` waits for a reader of this inode, so it would
+/// hang forever once the path is gone. The short-lived reader lets its `open()`
+/// return, and once the reader is closed its writes fail with `EPIPE`.
+fn remove_fifo(path: &Path) {
+    let reader = OpenOptions::new()
+        .read(true)
+        .custom_flags(OFlag::O_NONBLOCK.bits())
+        .open(path);
+    if let Err(e) = &reader
+        && e.kind() != ErrorKind::NotFound
+    {
+        log::warn!("failed to open {} for reading: {e}", path.display());
+    }
+    remove_file(path);
+    drop(reader);
+}
+
+fn remove_file(path: &Path) {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            log::warn!("failed to remove {}: {e}", path.display());
+        }
+        _ => {}
+    }
+}
+
 /// A half-copied bmap must not end the wait, or the operator would be asked
 /// again for no reason. Only the tail is read, so a large file pushed under
 /// the bmap name costs no RAM.
@@ -153,6 +181,7 @@ trait ScpOps {
     ) -> Result<(), FlashError>;
     fn zero_range(&mut self, dst: &Path, range: &ByteRange) -> Result<(), FlashError>;
     fn remove(&mut self, path: &Path);
+    fn remove_fifo(&mut self, path: &Path);
     fn reread_table(&mut self, disk: &Path) -> Result<(), FlashError>;
     #[cfg(feature = "grub")]
     fn efi(&mut self) -> &mut dyn efi::EfiOps;
@@ -210,12 +239,11 @@ impl ScpOps for RealScpOps {
     }
 
     fn remove(&mut self, path: &Path) {
-        match std::fs::remove_file(path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                log::warn!("failed to remove {}: {e}", path.display());
-            }
-            _ => {}
-        }
+        remove_file(path);
+    }
+
+    fn remove_fifo(&mut self, path: &Path) {
+        remove_fifo(path);
     }
 
     fn reread_table(&mut self, disk: &Path) -> Result<(), FlashError> {
@@ -299,8 +327,7 @@ fn scp_with(
         ops.remove(&upload.bmap);
         #[cfg(not(feature = "flash-mode-2-direct"))]
         ops.remove(&upload.decoded);
-        // A new FIFO cuts off a writer that still holds the old one.
-        ops.remove(&upload.fifo);
+        ops.remove_fifo(&upload.fifo);
         if let Err(e) = ops.create_fifo(&upload.fifo, constants.omnect_user_id) {
             // Keeps the run log off a disk that an earlier attempt wrote.
             return Err(if disk_written {
@@ -727,6 +754,10 @@ mod tests {
             self.calls.push(format!("remove {}", path.display()));
         }
 
+        fn remove_fifo(&mut self, path: &Path) {
+            self.calls.push(format!("remove fifo {}", path.display()));
+        }
+
         fn reread_table(&mut self, disk: &Path) -> Result<(), FlashError> {
             self.record(format!("reread {}", disk.display()))
         }
@@ -880,7 +911,7 @@ mod tests {
         #[cfg(not(feature = "flash-mode-2-direct"))]
         calls.push("remove /home/omnect/wic".to_string());
         calls.extend([
-            "remove /home/omnect/wic.xz".to_string(),
+            "remove fifo /home/omnect/wic.xz".to_string(),
             "fifo /home/omnect/wic.xz owned by 1000".to_string(),
         ]);
         calls
@@ -1025,6 +1056,49 @@ mod tests {
         create_owned_fifo(&path, Uid::current(), Gid::current()).unwrap();
         ops.remove(&path);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn removing_the_fifo_releases_a_writer_blocked_in_open() {
+        const WRITER_TIMEOUT: Duration = Duration::from_secs(5);
+        const STATE_POLL: Duration = Duration::from_millis(1);
+        // More than a pipe holds, so the write cannot end in the pipe buffer.
+        const WRITE_LEN: usize = 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(WIC_FIFO_NAME);
+        create_owned_fifo(&path, Uid::current(), Gid::current()).unwrap();
+
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let writer_path = path.clone();
+        thread::spawn(move || {
+            tid_tx.send(nix::unistd::gettid()).unwrap();
+            let result = OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .and_then(|mut fifo| std::io::Write::write_all(&mut fifo, &[0; WRITE_LEN]));
+            result_tx.send(result.map_err(|e| e.kind())).unwrap();
+        });
+        // Field 3 of the task's stat is its state; `S` means it sleeps in `open()`.
+        let stat = format!("/proc/self/task/{}/stat", tid_rx.recv().unwrap());
+        while std::fs::read_to_string(&stat)
+            .unwrap()
+            .rsplit(") ")
+            .next()
+            .is_none_or(|rest| !rest.starts_with('S'))
+        {
+            thread::sleep(STATE_POLL);
+        }
+
+        remove_fifo(&path);
+
+        assert!(!path.exists());
+        assert_eq!(
+            result_rx
+                .recv_timeout(WRITER_TIMEOUT)
+                .expect("the writer still hangs"),
+            Err(ErrorKind::BrokenPipe)
+        );
     }
 
     #[cfg(feature = "grub")]
