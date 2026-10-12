@@ -587,8 +587,8 @@ Child processes get an explicit `PATH`: PID 1 has no login environment, and
 4. Hash the image with `sha2` in `COPY_BUFFER_SIZE` chunks and compare it with
    the first field of the sha256 file. A sha256 file larger than 4 KiB or not
    UTF-8 is refused as `InvalidImage`: it comes from a wrong URL.
-5. Read the uncompressed size from the xz index and refuse an image larger than
-   the disk. The reader accepts exactly one xz stream; it is own code until
+5. Read the uncompressed size from the xz index and refuse an empty image or
+   one larger than the disk. The reader accepts exactly one xz stream; it is own code until
    `lzma-rust2` reports the size itself.
 6. Decode the image with `lzma-rust2` onto `/dev/omnect/rootblk` and write every
    byte, also the zero blocks, as `bmaptool copy --nobmap` did. The write stops
@@ -763,7 +763,7 @@ See §10.4.
 | Network setup or wait timeout | Fatal |
 | Download failure or checksum mismatch | Fatal |
 | Mode 2: bmap check, verify pass, flash pass or head zeroing failure | Log error → ask for bmap and image again (§5.4) |
-| Mode 3: unusable URL, image larger than the disk, or a write failure | Fatal |
+| Mode 3: unusable URL, empty image, image larger than the disk, or a write failure | Fatal |
 | Partition-table re-read failure after the flash (§8.3) | Fatal, no log. The image is on the disk, but the EFI step and the log mount must not use the old table |
 | EFI handling failure | Fatal. The machine keeps its old entries if the create failed, and the new entry plus any not yet deleted if a delete failed |
 | Log persistence failure | Log warn → continue |
@@ -860,7 +860,8 @@ Behaviour changes, as opposed to bug fixes:
   and image again after a failed attempt instead of stopping (§5.4, §10.1);
 - `dd` is replaced by in-process file I/O (§2.8);
 - mode 3 decodes and writes the image in-process instead of with `bmaptool`,
-  and refuses an image larger than the disk before the first write (§5.3);
+  and refuses an empty image or one larger than the disk before the first
+  write (§5.3);
 - mode 3 runs `curl` with `--fail`, so an HTTP error page is not saved as the
   image, and with the timeouts of §7;
 - mode 3 logs the URLs without user info, query string and fragment; legacy
@@ -1046,7 +1047,7 @@ only smoke-tested. Real end-to-end coverage stays in Concourse CI on hardware.
 | Mode 3: base64 decode, newline trimmed, invalid base64, non-UTF-8 and empty URL rejected | unit | `src/mode/flash/config.rs` |
 | Destination role → partition index, GPT and DOS | unit | `src/mode/flash/clone.rs` |
 | `curl` options, `--insecure` only without the `rtc` feature | unit | `src/mode/flash/url.rs` |
-| Mode 3 step order; checksum, size, download, write and re-read failures; no query string in the log | unit | `src/mode/flash/url.rs` |
+| Mode 3 step order; checksum, empty image, size, download, write and re-read failures; no query string in the log | unit | `src/mode/flash/url.rs` |
 | xz index size: single and multi-block, concatenated streams, cut and foreign files refused | unit | `src/mode/flash/xz/index.rs` |
 | scp instruction text includes the acquired IP | unit | `src/mode/flash/scp.rs` |
 | Detection: mode 1 and factory reset set → both cleared, then refused | unit | `src/mode/mod.rs` |

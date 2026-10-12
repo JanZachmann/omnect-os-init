@@ -339,6 +339,12 @@ fn url_with(ctx: &UrlCtx<'_>, ops: &mut dyn UrlOps) -> Result<(), FlashError> {
         });
     }
     let size = ops.image_size(&downloads.image)?;
+    if size == 0 {
+        return Err(FlashError::InvalidImage {
+            path: downloads.image,
+            reason: "the image is empty".to_string(),
+        });
+    }
     let disk_len = ops.device_len(disk)?;
     if size > disk_len {
         return Err(FlashError::InvalidDestination {
@@ -745,6 +751,25 @@ mod tests {
             "{result:?}"
         );
         assert_eq!(calls.last().unwrap(), "size of /dev/sda");
+    }
+
+    #[test]
+    fn an_empty_image_is_refused_before_the_write() {
+        let mut ops = RecordingUrlOps::new();
+        ops.image = Vec::new();
+        ops.sha256_file = sha256_line(b"");
+        let (result, calls) = run_recorded(ops);
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, FlashError::InvalidImage { reason, .. } if reason.contains("empty")),
+            "{err}"
+        );
+        assert!(keeps_log(&Err(err)));
+        assert_eq!(
+            calls.last().unwrap(),
+            "size of /tmp/flash-mode-3/wic.xz",
+            "{calls:?}"
+        );
     }
 
     #[test]
