@@ -3,9 +3,12 @@
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::mode::flash::bmap::{Bmap, MappedRange};
-use crate::mode::flash::rawio::ByteRange;
-use crate::mode::flash::{SHA256_LEN, sha256_from_hex};
+use crate::mode::flash::{
+    SHA256_LEN,
+    bmap::{Bmap, MappedRange},
+    rawio::ByteRange,
+    sha256_from_hex,
+};
 
 const SUPPORTED_MAJOR_VERSION: u64 = 2;
 const CHECKSUM_TYPE: &str = "sha256";

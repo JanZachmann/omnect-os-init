@@ -8,9 +8,10 @@ mod parse;
 
 use std::path::Path;
 
-use crate::error::FlashError;
-use crate::mode::flash::rawio::ByteRange;
-use crate::mode::flash::{SHA256_LEN, read_small_text};
+use crate::{
+    error::FlashError,
+    mode::flash::{SHA256_LEN, rawio::ByteRange, read_small_text},
+};
 
 pub(crate) use copy::copy;
 

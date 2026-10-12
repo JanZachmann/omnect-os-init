@@ -1,13 +1,19 @@
-use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Read, Seek, SeekFrom, Write},
+};
 
 use lzma_rust2::XzReader;
 use sha2::{Digest, Sha256};
 
-use crate::error::FlashError;
-use crate::mode::flash::bmap::{Bmap, Destination, Source};
-use crate::mode::flash::rawio::{ByteRange, COPY_BUFFER_SIZE, chunk_len, open_existing_for_write};
-use crate::mode::flash::xz::{self, FullReads};
+use crate::{
+    error::FlashError,
+    mode::flash::{
+        bmap::{Bmap, Destination, Source},
+        rawio::{ByteRange, COPY_BUFFER_SIZE, chunk_len, open_existing_for_write},
+        xz::{self, FullReads},
+    },
+};
 
 /// Copy the mapped ranges of `source` to `destination` and check each range's
 /// checksum.

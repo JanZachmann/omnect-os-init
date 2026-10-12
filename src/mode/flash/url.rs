@@ -1,26 +1,33 @@
 //! Flash mode 3: download a `wic.xz` and its sha256 file, check the image and
 //! flash it onto the running disk.
 
-use std::ffi::OsString;
-use std::fs::{self, File};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::{
+    ffi::OsString,
+    fs::{self, File},
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use sha2::{Digest, Sha256};
 
-use crate::bootloader::sync_filesystems;
-use crate::error::FlashError;
-use crate::mode::flash::config::redacted;
-use crate::mode::flash::rawio::{self, COPY_BUFFER_SIZE, open_existing_for_write};
-use crate::mode::flash::{
-    SHA256_LEN, child, net, partly_written, read_small_text, sha256_from_hex, unmount, xz,
+use crate::{
+    bootloader::sync_filesystems,
+    error::FlashError,
+    mode::flash::{
+        SHA256_LEN, child,
+        config::redacted,
+        net, partly_written,
+        rawio::{self, COPY_BUFFER_SIZE, open_existing_for_write},
+        read_small_text, sha256_from_hex, unmount, xz,
+    },
+    partition::PartitionLayout,
 };
 #[cfg(feature = "grub")]
-use crate::mode::flash::{efi, layout_partition};
-use crate::partition::PartitionLayout;
-#[cfg(feature = "grub")]
-use crate::partition::PartitionName;
+use crate::{
+    mode::flash::{efi, layout_partition},
+    partition::PartitionName,
+};
 
 const CURL_CMD: &str = "/usr/bin/curl";
 /// `--globoff`: brackets and braces in a URL are literal characters.
@@ -352,9 +359,10 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
-    use crate::mode::flash::keeps_log;
-    use crate::mode::flash::xz::test_support::xz;
-    use crate::partition::RootDevice;
+    use crate::{
+        mode::flash::{keeps_log, xz::test_support::xz},
+        partition::RootDevice,
+    };
 
     const IMAGE_URL: &str = "https://user:pass@example.invalid/omnect.wic.xz?sv=2024&sig=secret";
     const SHA256_URL: &str = "https://example.invalid/omnect.wic.sha256?sv=2024&sig=secret";

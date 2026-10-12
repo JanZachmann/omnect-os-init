@@ -115,8 +115,7 @@ fn read_number(reader: &mut impl Read) -> Result<u64, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
-    use std::num::NonZeroU64;
+    use std::{io::Cursor, num::NonZeroU64};
 
     use super::*;
     use crate::mode::flash::xz::test_support::{xz, xz_with};
