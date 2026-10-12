@@ -24,7 +24,6 @@ pub(crate) fn decoder<R: Read>(compressed: R) -> XzReader<FullReads<R>> {
     )
 }
 
-/// The reason for a failed read from a `decoder`.
 pub(crate) fn read_error(e: &io::Error) -> String {
     match e.kind() {
         ErrorKind::OutOfMemory => format!(

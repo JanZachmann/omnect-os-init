@@ -88,8 +88,7 @@ pub(crate) fn sha256_from_hex(text: &str) -> Result<[u8; SHA256_LEN], hex::FromH
     Ok(digest)
 }
 
-/// A file larger than `max_len` comes from a wrong source, and reading it
-/// whole would fill RAM, so it is refused through `invalid`.
+/// A file larger than `max_len` comes from a wrong source and would fill RAM.
 #[cfg(feature = "flash-mode-network")]
 pub(crate) fn read_small_text(
     path: &Path,

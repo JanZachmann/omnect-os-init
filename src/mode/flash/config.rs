@@ -20,7 +20,6 @@ pub enum FlashMode {
 }
 
 impl FlashMode {
-    /// The `flash-mode` value that selects the mode.
     #[cfg(all(feature = "flash-mode-network", feature = "factory-reset"))]
     pub fn selector(self) -> &'static str {
         match self {
@@ -33,7 +32,6 @@ impl FlashMode {
         }
     }
 
-    /// Modes 2 and 3 write a new image over the disk the device runs from.
     #[cfg(feature = "flash-mode-network")]
     pub fn overwrites_running_disk(self) -> bool {
         match self {
@@ -57,16 +55,13 @@ pub enum EnvValue<T> {
     Unreadable(String),
 }
 
-/// The value of `flash-mode-devpath`.
 #[cfg(feature = "flash-mode-1")]
 pub type Devpath = EnvValue<PathBuf>;
 
-/// The value of a mode 3 URL key.
 #[cfg(feature = "flash-mode-3")]
 pub type EnvUrl = EnvValue<Url>;
 
-/// A URL that can hold credentials or an access token. `Debug` prints it
-/// redacted.
+/// `Debug` prints the URL redacted.
 #[cfg(feature = "flash-mode-3")]
 #[derive(PartialEq, Eq)]
 pub struct Url(String);
@@ -93,7 +88,7 @@ impl fmt::Debug for Url {
 }
 
 /// `url` without user info, query string and fragment, which can hold
-/// credentials or an access token, so it can go to kmsg and the run log.
+/// credentials or an access token.
 #[cfg(feature = "flash-mode-3")]
 pub(crate) fn redacted(url: &str) -> String {
     let url = url.split(['?', '#']).next().unwrap_or(url);

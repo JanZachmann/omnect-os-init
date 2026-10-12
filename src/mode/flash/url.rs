@@ -115,8 +115,8 @@ fn sha256_of(path: &Path) -> Result<[u8; SHA256_LEN], FlashError> {
     }
 }
 
-/// Decode `image` onto `disk` and write every byte, also the zero blocks, so
-/// nothing of the old image survives inside the new one.
+/// Every byte is written, also the zero blocks, so nothing of the old image
+/// survives inside the new one.
 fn write_image(image: &Path, disk: &Path, size: u64) -> Result<(), FlashError> {
     let failed = |reason: String| FlashError::CopyFailed {
         src: image.to_path_buf(),
@@ -132,8 +132,8 @@ fn write_image(image: &Path, disk: &Path, size: u64) -> Result<(), FlashError> {
         .map_err(|e| failed(format!("syncing destination: {e}")))
 }
 
-/// Stops before a byte past `size` is written, so a stream that does not
-/// match its index cannot write beyond the checked length.
+/// Stops at `size`, so a stream that does not match its index cannot write
+/// beyond the checked length.
 fn decode_into(mut input: impl Read, output: &mut impl Write, size: u64) -> Result<(), String> {
     let mut buf = vec![0u8; COPY_BUFFER_SIZE];
     let mut written: u64 = 0;
@@ -190,8 +190,6 @@ impl UrlOps for RealUrlOps {
         net::bring_up(net::Ipv4Need::Lease).map(|_| ())
     }
 
-    /// The error names the redacted URL, because the arguments and the full
-    /// URL can hold an access token.
     fn download(&mut self, url: &str, target: &Path) -> Result<(), FlashError> {
         let failed = |reason: String| FlashError::DownloadFailed {
             url: redacted(url),
@@ -285,8 +283,8 @@ fn url_with(ctx: &UrlCtx<'_>, ops: &mut dyn UrlOps) -> Result<(), FlashError> {
 
     #[cfg(not(feature = "rtc"))]
     log::warn!(
-        "TLS certificates are not checked: without a real-time clock their validity cannot be \
-         checked, so the sha256 file only detects a corrupted download, not a changed one"
+        "TLS certificates are not checked without a real-time clock; the sha256 file only \
+         detects a corrupted download"
     );
 
     ops.unmount(ctx.rootfs, disk)?;
