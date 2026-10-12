@@ -103,6 +103,12 @@ pub enum BootEnvKey {
     #[cfg(feature = "flash-mode-1")]
     /// `flash-mode-devpath` — destination block device for mode 1.
     FlashModeDevPath,
+    #[cfg(feature = "flash-mode-3")]
+    /// `flash-mode-url` — base64 of the image URL for mode 3.
+    FlashModeUrl,
+    #[cfg(feature = "flash-mode-3")]
+    /// `flash-mode-url-sha256` — base64 of the sha256-file URL for mode 3.
+    FlashModeUrlSha256,
 }
 
 impl BootEnvKey {
@@ -123,6 +129,10 @@ impl BootEnvKey {
             Self::FlashMode => Cow::Borrowed("flash-mode"),
             #[cfg(feature = "flash-mode-1")]
             Self::FlashModeDevPath => Cow::Borrowed("flash-mode-devpath"),
+            #[cfg(feature = "flash-mode-3")]
+            Self::FlashModeUrl => Cow::Borrowed("flash-mode-url"),
+            #[cfg(feature = "flash-mode-3")]
+            Self::FlashModeUrlSha256 => Cow::Borrowed("flash-mode-url-sha256"),
         }
     }
 }
@@ -699,5 +709,12 @@ mod tests {
         assert_eq!(BootEnvKey::FlashMode.as_str(), "flash-mode");
         #[cfg(feature = "flash-mode-1")]
         assert_eq!(BootEnvKey::FlashModeDevPath.as_str(), "flash-mode-devpath");
+        #[cfg(feature = "flash-mode-3")]
+        assert_eq!(BootEnvKey::FlashModeUrl.as_str(), "flash-mode-url");
+        #[cfg(feature = "flash-mode-3")]
+        assert_eq!(
+            BootEnvKey::FlashModeUrlSha256.as_str(),
+            "flash-mode-url-sha256"
+        );
     }
 }

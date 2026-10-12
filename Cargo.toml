@@ -16,7 +16,8 @@ name = "omnect-os-init"
 path = "src/main.rs"
 
 [dependencies]
-hex = { version = "0.4", default-features = false, optional = true }
+base64 = { version = "0.22", default-features = false, features = ["std"], optional = true }
+hex = { version = "0.4", default-features = false, features = ["alloc"], optional = true }
 log = { version = "0.4", default-features = false, features = ["std"] }
 # TODO: remove me, as soon as lzma-rust2 1.0 is released: until then a 0.x
 # update can change the decoder that runs in PID 1, so it needs a review.
@@ -38,12 +39,14 @@ flash-mode = ["core"]     # Shared flash layer; pulled in by a mode, never selec
 flash-mode-1 = ["flash-mode", "dep:uuid"]  # Clone the running disk onto another block device
 flash-mode-2 = ["flash-mode-network", "dep:quick-xml"] # Flash a wic.xz pushed in over scp
 flash-mode-2-direct = ["flash-mode-2"] # Flash straight from the scp stream, no verify pass
+flash-mode-3 = ["flash-mode-network", "dep:base64"] # Flash a wic.xz downloaded from a URL
 flash-mode-network = ["flash-mode", "dep:hex", "dep:lzma-rust2", "dep:sha2"] # Shared layer of modes 2 and 3; pulled in by a mode, never selected on its own
 gpt = ["core"]            # GPT partition table (primary partitions 1-7)
 grub = ["core"]           # x86-64 EFI targets (GRUB bootloader)
 persistent-var-log = ["core"]
 release-image = ["core"]  # Enables release-mode error handling (loop on fatal error)
 resize-data = ["core"]    # Expands data partition to fill disk on first boot
+rtc = ["core"]            # The machine has a reliable real-time clock, so TLS certificates are checked
 test-utils = []
 uboot = ["core"]          # ARM targets (U-Boot bootloader)
 

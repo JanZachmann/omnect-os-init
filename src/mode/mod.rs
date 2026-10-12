@@ -84,6 +84,15 @@ pub(crate) fn clear_flash_triggers(bl: &mut dyn BootEnv) {
     if let Err(e) = bl.set_env(BootEnvKey::FlashModeDevPath, None) {
         log::warn!("flash-mode: failed to clear the flash-mode-devpath trigger: {e}");
     }
+    #[cfg(feature = "flash-mode-3")]
+    for key in [BootEnvKey::FlashModeUrl, BootEnvKey::FlashModeUrlSha256] {
+        if let Err(e) = bl.set_env(key, None) {
+            log::warn!(
+                "flash-mode: failed to clear the {} trigger: {e}",
+                key.as_str()
+            );
+        }
+    }
 }
 
 #[cfg(all(feature = "flash-mode-1", feature = "factory-reset"))]
@@ -112,21 +121,21 @@ fn enforce_flag(root: &Path) -> EnforceFlag {
 
 #[cfg(feature = "flash-mode-2")]
 pub(crate) fn mode_2_config() -> flash::config::FlashConfig {
-    flash::config::FlashConfig {
-        mode: flash::config::FlashMode::Mode2,
-        #[cfg(feature = "flash-mode-1")]
-        devpath: flash::config::Devpath::NotSet,
-    }
+    flash::config::FlashConfig::new(flash::config::FlashMode::Mode2)
 }
 
 /// Build the config for a recognised flash mode.
 ///
-/// An unusable devpath is carried in the config rather than raised: detection
+/// An unusable devpath or URL is carried in the config rather than raised: detection
 /// runs before the mode starts its log capture, and the mode is where the
 /// reason has to reach the persisted log.
 #[cfg(feature = "flash-mode")]
 fn build_flash_config(
-    #[cfg_attr(not(feature = "flash-mode-1"), allow(unused_variables))] bl: &mut dyn BootEnv,
+    #[cfg_attr(
+        not(any(feature = "flash-mode-1", feature = "flash-mode-3")),
+        allow(unused_variables)
+    )]
+    bl: &mut dyn BootEnv,
     mode: flash::config::FlashMode,
 ) -> flash::config::FlashConfig {
     match mode {
@@ -136,10 +145,25 @@ fn build_flash_config(
                 Ok(value) => flash::config::parse_devpath(value.as_deref()),
                 Err(e) => flash::config::Devpath::Unreadable(e.to_string()),
             };
-            flash::config::FlashConfig { mode, devpath }
+            flash::config::FlashConfig {
+                devpath,
+                ..flash::config::FlashConfig::new(mode)
+            }
         }
         #[cfg(feature = "flash-mode-2")]
         flash::config::FlashMode::Mode2 => mode_2_config(),
+        #[cfg(feature = "flash-mode-3")]
+        flash::config::FlashMode::Mode3 => {
+            let url = |key| match bl.get_env(key) {
+                Ok(value) => flash::config::parse_url(value.as_deref()),
+                Err(e) => flash::config::EnvUrl::Unreadable(e.to_string()),
+            };
+            flash::config::FlashConfig {
+                image_url: url(BootEnvKey::FlashModeUrl),
+                sha256_url: url(BootEnvKey::FlashModeUrlSha256),
+                ..flash::config::FlashConfig::new(mode)
+            }
+        }
     }
 }
 
@@ -162,7 +186,7 @@ impl BootMode {
     /// Mode 1 together with a factory reset is refused — they act on different
     /// disks and single-mode dispatch cannot perform both, so dropping one
     /// silently would be the worse failure. The refusal is the only error, and
-    /// it is fatal. Mode 2 wins over a factory reset; the reset is logged as an
+    /// it is fatal. Modes 2 and 3 win over a factory reset; the reset is logged as an
     /// error and does not run. Asking for both is an operator mistake, so it gets
     /// no further handling.
     ///
@@ -219,12 +243,13 @@ impl BootMode {
 
             match (parsed, value) {
                 (Some(mode), _) => {
-                    #[cfg(all(feature = "flash-mode-2", feature = "factory-reset"))]
-                    if mode == flash::config::FlashMode::Mode2
+                    #[cfg(all(feature = "flash-mode-network", feature = "factory-reset"))]
+                    if mode.overwrites_running_disk()
                         && matches!(bl.get_env(BootEnvKey::FactoryReset), Ok(Some(json)) if !json.trim().is_empty())
                     {
                         log::error!(
-                            "factory-reset: set together with flash mode 2, flash mode 2 wins and the factory reset does not run"
+                            "factory-reset: set together with flash mode {}, the flash mode wins and the factory reset does not run",
+                            mode.selector()
                         );
                     }
 

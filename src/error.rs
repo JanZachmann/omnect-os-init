@@ -396,6 +396,15 @@ pub enum FlashError {
     #[error("Network setup failed: {0}")]
     NetworkFailed(String),
 
+    /// `url` carries no query string, which can hold an access token.
+    #[cfg(feature = "flash-mode-3")]
+    #[error("Download of {url} failed: {reason}")]
+    DownloadFailed { url: String, reason: String },
+
+    #[cfg(feature = "flash-mode-3")]
+    #[error("Image {} is unusable: {reason}", path.display())]
+    InvalidImage { path: PathBuf, reason: String },
+
     #[error("{}: {source}", path.display())]
     PathIo {
         path: PathBuf,

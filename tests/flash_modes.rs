@@ -91,7 +91,7 @@ mod mode_2_detection {
 
     #[test]
     fn without_the_flag_an_unknown_key_boots_normally() {
-        let mut env = MockBootEnv::new().with_env(BootEnvKey::FlashMode, "3");
+        let mut env = MockBootEnv::new().with_env(BootEnvKey::FlashMode, "9");
         assert_eq!(detected_mode(Some(&mut env), EnforceFlag::Absent), None);
     }
 
@@ -158,5 +158,63 @@ mod mode_2_detection {
             );
             assert!(env.set_env_calls.is_empty());
         }
+    }
+}
+
+#[cfg(feature = "flash-mode-3")]
+mod mode_3_detection {
+    use omnect_os_init::MockBootEnv;
+    use omnect_os_init::bootloader::BootEnvKey;
+    use omnect_os_init::mode::flash::config::{EnvUrl, FlashMode};
+    use omnect_os_init::mode::{BootMode, EnforceFlag};
+
+    /// base64 of `https://example.invalid/omnect.wic.xz?sig=secret` plus the
+    /// newline of `echo | base64`.
+    const ENCODED: &str = "aHR0cHM6Ly9leGFtcGxlLmludmFsaWQvb21uZWN0LndpYy54ej9zaWc9c2VjcmV0Cg==";
+    const URL: &str = "https://example.invalid/omnect.wic.xz?sig=secret";
+
+    #[test]
+    fn key_3_carries_both_urls_without_clearing_them() {
+        let mut env = MockBootEnv::new()
+            .with_env(BootEnvKey::FlashMode, "3")
+            .with_env(BootEnvKey::FlashModeUrl, ENCODED)
+            .with_env(BootEnvKey::FlashModeUrlSha256, ENCODED);
+        let BootMode::Flash(config) =
+            BootMode::detect_with(Some(&mut env), EnforceFlag::Absent).unwrap()
+        else {
+            panic!("key 3 must select a flash mode");
+        };
+        assert_eq!(config.mode, FlashMode::Mode3);
+        assert_eq!(config.image_url, EnvUrl::Set(URL.to_string()));
+        assert_eq!(config.sha256_url, EnvUrl::Set(URL.to_string()));
+        // Clearing is the mode's own first step, so it reaches the run log.
+        assert!(env.set_env_calls.is_empty());
+    }
+
+    #[test]
+    fn a_url_that_cannot_be_read_is_carried_into_the_mode() {
+        let mut env = MockBootEnv::new()
+            .with_env(BootEnvKey::FlashMode, "3")
+            .with_get_env_error_for(BootEnvKey::FlashModeUrlSha256);
+        let BootMode::Flash(config) =
+            BootMode::detect_with(Some(&mut env), EnforceFlag::Absent).unwrap()
+        else {
+            panic!("key 3 must select a flash mode");
+        };
+        assert_eq!(config.image_url, EnvUrl::NotSet);
+        assert!(matches!(config.sha256_url, EnvUrl::Unreadable(_)));
+    }
+
+    #[cfg(feature = "factory-reset")]
+    #[test]
+    fn key_3_wins_over_a_factory_reset() {
+        let mut env = MockBootEnv::new()
+            .with_env(BootEnvKey::FlashMode, "3")
+            .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
+        assert!(matches!(
+            BootMode::detect_with(Some(&mut env), EnforceFlag::Absent).unwrap(),
+            BootMode::Flash(config) if config.mode == FlashMode::Mode3
+        ));
+        assert!(env.set_env_calls.is_empty());
     }
 }
