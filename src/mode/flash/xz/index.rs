@@ -15,9 +15,8 @@ const MAX_NUMBER_LEN: u32 = 9;
 const NUMBER_PAYLOAD_BITS: u32 = 7;
 const NUMBER_MORE_BIT: u8 = 0x80;
 
-/// The size `file` decodes to, from the index at its end. Only a file that
-/// holds exactly one xz stream is accepted. The checksums are left to the
-/// decoder, which checks the index against the data again.
+/// The uncompressed size that the index at the end of `file` records. Only a
+/// file that holds exactly one xz stream is accepted.
 // TODO: remove me, as soon as a lzma-rust2 release that reports the
 // uncompressed size of an xz file is CR.
 pub(crate) fn uncompressed_size<F: Read + Seek>(file: &mut F) -> Result<u64, String> {
