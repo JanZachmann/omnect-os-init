@@ -1,18 +1,13 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 
-use lzma_rust2::{XzReader, lzma2_get_memory_usage};
+use lzma_rust2::XzReader;
 use sha2::{Digest, Sha256};
 
 use crate::error::FlashError;
 use crate::mode::flash::bmap::{Bmap, Destination, Source};
 use crate::mode::flash::rawio::{ByteRange, COPY_BUFFER_SIZE, chunk_len, open_existing_for_write};
-
-/// The largest dictionary of the xz presets (`-9`). The decoder allocates the
-/// dictionary that each block header asks for, so a larger one is rejected
-/// before it can push the device out of memory.
-const MAX_XZ_DICT_SIZE: u32 = 64 * MIB;
-const MIB: u32 = 1024 * 1024;
+use crate::mode::flash::xz::{self, FullReads};
 
 /// Copy the mapped ranges of `source` to `destination` and check each range's
 /// checksum.
@@ -60,13 +55,9 @@ fn pass_through(
     let mut left = len;
     while left > 0 {
         let chunk = chunk_len(left, buf.len());
-        let read = input.read(&mut buf[..chunk]).map_err(|e| match e.kind() {
-            ErrorKind::OutOfMemory => format!(
-                "decoding needs too much memory, the xz dictionary limit is {} MiB: {e}",
-                MAX_XZ_DICT_SIZE / MIB
-            ),
-            _ => format!("reading source: {e}"),
-        })?;
+        let read = input
+            .read(&mut buf[..chunk])
+            .map_err(|e| xz::read_error(&e))?;
         if read == 0 {
             return Err(format!(
                 "source ended at byte {}, the image has more",
@@ -93,31 +84,7 @@ fn distance(position: u64, target: u64) -> Result<u64, String> {
 }
 
 fn xz_stream<R: Read>(compressed: R) -> Stream<XzReader<FullReads<R>>> {
-    Stream::new(XzReader::new_mem_limit(
-        FullReads(compressed),
-        true,
-        lzma2_get_memory_usage(MAX_XZ_DICT_SIZE),
-    ))
-}
-
-/// The xz decoder treats a short read as a broken stream; a pipe returns only
-/// what has arrived, so each read here fills the buffer or reaches the end of
-/// input.
-struct FullReads<R>(R);
-
-impl<R: Read> Read for FullReads<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut filled = 0;
-        while filled < buf.len() {
-            match self.0.read(&mut buf[filled..]) {
-                Ok(0) => break,
-                Ok(n) => filled += n,
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(filled)
-    }
+    Stream::new(xz::decoder(compressed))
 }
 
 struct Stream<R> {
@@ -237,7 +204,7 @@ mod tests {
     use crate::mode::flash::bmap::test_support::{
         BLOCK_SIZE, FIXTURE_BMAP, FIXTURE_XZ, bmap_xml, image, xz,
     };
-    use lzma_rust2::{XzOptions, XzWriter};
+    use crate::mode::flash::xz::test_support::xz_with;
     use std::io::Cursor;
 
     fn copied(bmap: &Bmap, source: &[u8]) -> Result<Vec<u8>, String> {
@@ -378,11 +345,7 @@ mod tests {
         for tail in 1..=8 {
             let image = image(8, tail);
             let bmap = Bmap::parse(&bmap_xml(&image, &[(0, 8)])).unwrap();
-            let mut options = XzOptions::with_preset(1);
-            options.set_block_size(std::num::NonZeroU64::new(XZ_BLOCK_SIZE));
-            let mut writer = XzWriter::new(Vec::new(), options).unwrap();
-            writer.write_all(&image).unwrap();
-            let compressed = writer.finish().unwrap();
+            let compressed = xz_with(&image, std::num::NonZeroU64::new(XZ_BLOCK_SIZE));
 
             let mut out = Cursor::new(Vec::new());
             copy_stream(&bmap, &mut xz_stream(Trickle(&compressed)), &mut out)
@@ -399,37 +362,6 @@ mod tests {
         copy_stream(&bmap, &mut Stream::new(Trickle(&image)), &mut out).unwrap();
         let block = usize::try_from(BLOCK_SIZE).unwrap();
         assert_eq!(out.get_ref()[3 * block..], image[3 * block..]);
-    }
-
-    /// Fails every other read with `Interrupted`.
-    struct Interrupting<R> {
-        inner: R,
-        interrupt: bool,
-    }
-
-    impl<R: Read> Read for Interrupting<R> {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.interrupt = !self.interrupt;
-            if self.interrupt {
-                return Err(ErrorKind::Interrupted.into());
-            }
-            self.inner.read(buf)
-        }
-    }
-
-    #[test]
-    fn full_reads_fill_the_buffer_until_the_input_ends() {
-        let data: Vec<u8> = (0..10).collect();
-        let mut reader = FullReads(Interrupting {
-            inner: Trickle(&data),
-            interrupt: false,
-        });
-        let mut buf = [0u8; 6];
-        assert_eq!(reader.read(&mut buf).unwrap(), 6);
-        assert_eq!(buf, [0, 1, 2, 3, 4, 5]);
-        assert_eq!(reader.read(&mut buf).unwrap(), 4, "the input ends");
-        assert_eq!(buf[..4], [6, 7, 8, 9]);
-        assert_eq!(reader.read(&mut buf).unwrap(), 0);
     }
 
     fn crc32(data: &[u8]) -> u32 {

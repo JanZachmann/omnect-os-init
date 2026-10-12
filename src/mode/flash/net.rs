@@ -4,6 +4,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
+#[cfg(feature = "flash-mode-2")]
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -11,15 +12,20 @@ use std::time::Duration;
 use nix::ifaddrs::getifaddrs;
 
 use crate::error::FlashError;
+#[cfg(feature = "flash-mode-2")]
 use crate::filesystem::{FsType, MountOptions, MountPoint, is_path_mounted, mount};
 use crate::mode::flash::run_inherited;
 
 const FLASH_INTERFACE: &str = "eth0";
 const IP_CMD: &str = "/sbin/ip";
 const DHCPCD_CMD: &str = "/sbin/dhcpcd";
+#[cfg(feature = "flash-mode-2")]
 const DROPBEAR_CMD: &str = "/sbin/dropbear";
+#[cfg(feature = "flash-mode-2")]
 const DROPBEAR_GENERATE_HOSTKEY_FLAG: &str = "-R";
+#[cfg(feature = "flash-mode-2")]
 const DROPBEAR_KEY_DIR: &str = "/etc/dropbear";
+#[cfg(feature = "flash-mode-2")]
 const DEVPTS_MOUNT_POINT: &str = "/dev/pts";
 const TMP_DIR: &str = "/tmp";
 const INTERFACE_UP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -155,6 +161,7 @@ pub(crate) fn bring_up() -> Result<Ipv4Addr, FlashError> {
     Ok(ip)
 }
 
+#[cfg(feature = "flash-mode-2")]
 /// Start dropbear, which generates a host key on first use and daemonizes.
 pub(crate) fn start_dropbear() -> Result<(), FlashError> {
     let pts = Path::new(DEVPTS_MOUNT_POINT);

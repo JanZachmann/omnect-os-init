@@ -8,7 +8,7 @@ pub(crate) mod clone;
 pub mod config;
 #[cfg(feature = "grub")]
 pub(crate) mod efi;
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 pub(crate) mod net;
 #[cfg(feature = "flash-mode")]
 pub(crate) mod rawio;
@@ -18,14 +18,16 @@ pub(crate) mod scp;
 pub(crate) mod sfdisk;
 #[cfg(feature = "flash-mode")]
 pub(crate) mod unmount;
+#[cfg(feature = "flash-mode-network")]
+pub(crate) mod xz;
 
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 use std::ffi::OsStr;
 use std::fs;
 use std::path::Path;
 #[cfg(any(feature = "flash-mode-1", feature = "grub"))]
 use std::path::PathBuf;
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 use std::process::Command;
 
 use nix::sys::reboot::{RebootMode, reboot};
@@ -41,7 +43,7 @@ use crate::partition::{PartitionLayout, PartitionName};
 
 /// `PATH` for child processes: PID 1 has no login environment, and tools such
 /// as `dhcpcd` run hook scripts that look up their own helpers.
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 const CHILD_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Scratch mount points. They sit outside the rootfs mount, which is unmounted
@@ -68,7 +70,7 @@ type LogWriter<'a> = &'a mut dyn FnMut(&Path, &str, &[String]) -> Result<(), Fla
 type ModeRunner<'a> =
     &'a mut dyn FnMut(&config::FlashConfig, &BootContext<'_>) -> Result<(), FlashError>;
 
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 fn child(cmd: &str) -> Command {
     let mut command = Command::new(cmd);
     command.env("PATH", CHILD_PATH);
@@ -77,7 +79,7 @@ fn child(cmd: &str) -> Command {
 
 /// Run `cmd` with inherited stdout and stderr, so the operator sees its
 /// output.
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 pub(crate) fn run_inherited(cmd: &str, args: &[&OsStr]) -> Result<(), String> {
     let status = child(cmd)
         .args(args)
@@ -102,7 +104,7 @@ fn log_file(mode: config::FlashMode) -> &'static str {
 /// partition table the disk no longer has.
 fn keeps_log(outcome: &Result<(), FlashError>) -> bool {
     match outcome {
-        #[cfg(feature = "flash-mode-2")]
+        #[cfg(feature = "flash-mode-network")]
         Err(FlashError::DiskPartlyWritten { .. } | FlashError::StalePartitionTable { .. }) => false,
         _ => true,
     }
@@ -291,7 +293,7 @@ mod tests {
     #[cfg(not(any(feature = "flash-mode-1", feature = "grub")))]
     use std::path::PathBuf;
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[test]
     fn children_get_the_explicit_path() {
         let command = child("/bin/true");
@@ -302,7 +304,7 @@ mod tests {
         assert_eq!(path, Some(OsStr::new(CHILD_PATH)));
     }
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[test]
     fn a_failing_child_is_reported_with_its_status() {
         let reason = run_inherited("/bin/false", &[]).unwrap_err();

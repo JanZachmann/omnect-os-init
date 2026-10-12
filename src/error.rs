@@ -374,14 +374,14 @@ pub enum FlashError {
     #[error("EFI handling failed: {0}")]
     EfiFailed(String),
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[error("{} may be partly written: {source}", disk.display())]
     DiskPartlyWritten {
         disk: PathBuf,
         source: Box<FlashError>,
     },
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[error("the kernel may still use the old partition table of {}: {source}", disk.display())]
     StalePartitionTable {
         disk: PathBuf,
@@ -392,7 +392,7 @@ pub enum FlashError {
     #[error("bmap {} is unusable: {reason}", path.display())]
     InvalidBmap { path: PathBuf, reason: String },
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[error("Network setup failed: {0}")]
     NetworkFailed(String),
 

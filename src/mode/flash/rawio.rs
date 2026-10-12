@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 #[cfg(feature = "flash-mode-1")]
 use std::io::{ErrorKind, Read};
 use std::io::{Seek, SeekFrom, Write};
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
@@ -19,12 +19,12 @@ pub const KIB: u64 = 1024;
 pub const COPY_BUFFER_SIZE: usize = 1024 * 1024;
 
 // BLKRRPART from <linux/fs.h>.
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 const BLK_IOC_MAGIC: u8 = 0x12;
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 const BLKRRPART_NR: u8 = 95;
 
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 nix::ioctl_none!(blkrrpart, BLK_IOC_MAGIC, BLKRRPART_NR);
 
 #[derive(Debug, PartialEq, Eq)]
@@ -164,7 +164,7 @@ pub fn zero_range(dst: &Path, range: &ByteRange) -> Result<(), FlashError> {
 
 /// Make the kernel re-read the partition table of `disk`. Fails while any
 /// partition of `disk` is mounted.
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 pub fn reread_partition_table(disk: &Path) -> Result<(), FlashError> {
     let io_failed = |source| FlashError::PathIo {
         path: disk.to_path_buf(),
@@ -317,7 +317,7 @@ mod tests {
         assert!(!dst.exists());
     }
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[test]
     fn reread_partition_table_fails_on_a_regular_file() {
         let disk = file_with(b"");

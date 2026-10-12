@@ -118,9 +118,6 @@ pub(crate) fn read(path: &Path) -> Result<Bmap, FlashError> {
 
 #[cfg(test)]
 mod test_support {
-    use std::io::Write;
-
-    use lzma_rust2::{XzOptions, XzWriter};
     use sha2::{Digest, Sha256};
 
     use crate::mode::flash::bmap::SHA256_LEN;
@@ -184,11 +181,7 @@ mod test_support {
         image
     }
 
-    pub(super) fn xz(data: &[u8]) -> Vec<u8> {
-        let mut writer = XzWriter::new(Vec::new(), XzOptions::with_preset(1)).unwrap();
-        writer.write_all(data).unwrap();
-        writer.finish().unwrap()
-    }
+    pub(super) use crate::mode::flash::xz::test_support::xz;
 
     pub(super) const FIXTURE_BMAP: &str = include_str!("../testdata/wic.bmap");
     pub(super) const FIXTURE_XZ: &[u8] = include_bytes!("../testdata/wic.xz");
