@@ -141,7 +141,7 @@ src/mode/flash/
   rawio.rs      in-process replacement for every `dd` call               flash-mode, per item
   unmount.rs    rootfs unmount, /proc/mounts sweep                       flash-mode
   net.rs        interface up, dhcpcd, dropbear                           flash-mode-2/3
-  bmap.rs       bmaptool wrapper                                         flash-mode-2/3
+  bmap/         bmap parser and in-process flasher                       flash-mode-2/3
   scp.rs        mode 2 orchestration                                     flash-mode-2
   url.rs        mode 3 orchestration                                     flash-mode-3
 ```
@@ -230,13 +230,13 @@ path.
 | `e2image` | `/usr/sbin/e2image` | `e2fsprogs` | 1 |
 | `mkfs.ext4` | `/usr/sbin/mkfs.ext4` | `e2fsprogs-mke2fs` | 1 |
 | `tune2fs` | `/usr/sbin/tune2fs` | `e2fsprogs-tune2fs` | 1 |
-| `bmaptool` | `/usr/bin/bmaptool` | `bmaptool` | 2, 3 |
+| `bmaptool` | `/usr/bin/bmaptool` | `bmaptool` | 3 |
 | `curl` | `/usr/bin/curl` | `curl` | 3 |
 | `dhcpcd` | `/usr/sbin/dhcpcd` | `dhcpcd` | 2, 3 |
 | `dropbear` | `/usr/sbin/dropbear` | `dropbear` | 2 |
 | `efibootmgr` | `/usr/sbin/efibootmgr` | `efibootmgr` | 1, 2, 3, EFI machines only |
 | `ip` | `/usr/sbin/ip` | busybox applet | 2, 3 |
-| `xz` | `/usr/bin/xz` | `xz`, run by `bmaptool` | 2, 3 |
+| `xz` | `/usr/bin/xz` | `xz`, run by `bmaptool` | 3 |
 
 `efibootmgr` is absent from the verified image, which has no `efi` in
 `MACHINE_FEATURES` — consistent with the recipe gating and with §6 applying only
@@ -249,13 +249,13 @@ machines, `efibootmgr` itself (§12).
 
 The remaining tools stay external because no pure-Rust equivalent exists at a
 dependency weight an initramfs can carry: `sfdisk` (partition tables),
-`e2image`, `mkfs.ext4` and `tune2fs` (ext4), `bmaptool` (block maps),
-`efibootmgr` (EFI variables), `curl`, `dhcpcd` and `dropbear`.
+`e2image`, `mkfs.ext4` and `tune2fs` (ext4), `efibootmgr` (EFI variables), `curl`, `dhcpcd` and `dropbear`.
 
-Seven operations the legacy scripts shell out for are done in-process instead.
+Eight operations the legacy scripts shell out for are done in-process instead.
 Five use `nix`, which is already a dependency; `getifaddrs` needs its `net`
 feature, the others are enabled already. `uuidgen` needs the new `uuid` crate;
-`dd` needs nothing:
+`dd` needs nothing; `bmaptool copy` needs `hex`, `lzma-rust2`, `quick-xml` and
+`sha2`:
 
 | Legacy | In-process |
 |---|---|
@@ -266,12 +266,22 @@ feature, the others are enabled already. `uuidgen` needs the new `uuid` crate;
 | `ip addr show` | `nix::ifaddrs::getifaddrs` |
 | `sync` | `nix::unistd::sync` |
 | `reboot -f` / `poweroff -f` | `nix::sys::reboot::reboot` with `RB_AUTOBOOT` / `RB_POWER_OFF` |
+| `bmaptool copy` (mode 2) | `bmap/`: bmap parsed with `quick-xml` and `hex`, ranges checked with `sha2`, `xz` decoded with `lzma-rust2` (§5.4) |
 
 Every `dd` call in the three modes is a plain read and write at a byte offset —
 the bootloader area copy, the `boot`, `factory` and `cert` partition copies, the
 `uboot-env.bin` writes and the zeroing in mode 2 — so `File::seek` plus a
 buffered copy covers all of them, followed by the explicit `sync` the legacy
 scripts get from `dd` returning.
+
+The in-process `bmaptool copy` makes the release binary about 166 KiB larger
+(x86-64, `core,uboot,gpt,flash-mode-1,flash-mode-2,factory-reset`: 656 400 to
+826 152 bytes). In exchange, mode 2 drops `bmaptool`, its Python runtime and
+`xz` from the initramfs. The decoder and the parser run in PID 1 with
+`panic = "abort"`, so a panic on a malformed stream is a kernel panic, where a
+crashed `bmaptool` was a failed attempt. `lzma-rust2` and `quick-xml` have no
+`unsafe` code in the features used, and `lzma-rust2` is pinned to an exact
+version until it reaches 1.0, because each 0.x update can change the decoder.
 
 The reboot call follows the existing pattern in `handle_fatal_error`: it returns
 `Result<Infallible>`, so the `Ok` arm is uninhabited and only the error path is
@@ -411,11 +421,12 @@ flash-mode-3 = ["flash-mode"]            # URL download
 `flash-mode` gates the shared layer — the selector env key, `BootMode::Flash`,
 `config.rs`, `efi.rs`, and the dispatch branch. It is never enabled directly;
 each mode feature pulls it in. `flash-mode-2` and `flash-mode-3` additionally
-gate `net.rs` and `bmap.rs`.
+gate `net.rs` and `bmap/`.
 
-One new dependency, pulled in by `flash-mode-1` only:
+`flash-mode-1` pulls in one new dependency,
 `uuid = { version = "1.11", default-features = false }`. The bytes come from
 `/dev/urandom`, so a failing random source is an error and not a panic in PID 1.
+`flash-mode-2` pulls in `hex`, `lzma-rust2`, `quick-xml` and `sha2` (§2.8).
 
 `default = ["core", "flash-mode-1"]`, mirroring the legacy recipe, which installs
 `flash-mode-1` unconditionally and gates 2 and 3 on `DISTRO_FEATURES`. This also
@@ -534,9 +545,8 @@ succeeds — the interface may be probed late, e.g. a USB NIC — then start
 additionally creates and mounts `devpts` at `/dev/pts`, creates `/etc/dropbear`
 and starts `dropbear -R`, generating the host key at runtime.
 
-Child processes get an explicit `PATH`, as legacy exports it before `bmaptool`:
-PID 1 has no login environment, `bmaptool` runs `xz`, and `dhcpcd` runs hook
-scripts.
+Child processes get an explicit `PATH`: PID 1 has no login environment, and
+`dhcpcd` runs hook scripts.
 
 ### 5.3 Mode 3 — pull from URL
 
@@ -563,43 +573,63 @@ flag file shipped by `omnect-os-initramfs-test`. Both are kept.
 1. Clear `flash-mode`.
 2. Unmount (§5.1), network up (§5.2).
 3. Create the image FIFO at `/home/omnect/wic.xz`, owned by the `omnect` user, so
-   `scp` streams directly into `bmaptool`. Then start `dropbear` (§5.2). The FIFO
+   `scp` streams directly into the flash. Then start `dropbear` (§5.2). The FIFO
    comes first, so a client that can log in always finds it; CI checks for it
    over `ssh` to know the device is ready.
 4. Log the first command the operator must run, with the acquired IP address:
    `scp <bmap-file> omnect@<ip>:wic.bmap`.
 5. Wait for `/home/omnect/wic.bmap` to be complete, unbounded — this waits for
    a person (§7). Complete means a regular file whose content ends with the
-   closing `</bmap>` tag, so a half-copied bmap does not end the wait. Then log
+   closing `</bmap>` tag, so a half-copied bmap does not end the wait. A file
+   that stops changing without that tag, such as the image pushed under the
+   wrong name, is reported once in the log.
+6. Check the bmap before anything is written: at most 1 MiB, XML syntax,
+   version `2.<minor>` (1.x, including the 1.4 that `bmaptool` reads as 2.0,
+   is rejected; `bmaptool create` writes 2.0), checksum type `sha256`, the
+   `BmapFileChecksum` (the sha256 of the file with that value replaced by
+   zeros), block counts, at least one range, ranges sorted, not overlapping
+   and inside `ImageSize`, and `ImageSize` not larger than the disk. Then log
    the second command, `scp <wic-image> omnect@<ip>:wic.xz`, in the same order
    as legacy.
-6. Flash. Every `bmaptool` call uses `--bmap /home/omnect/wic.bmap`:
-   - **default** — verify pass first:
-     `bmaptool copy --bmap wic.bmap wic.xz /home/omnect/wic`, which consumes the
-     FIFO and materializes the mapped, decompressed image as a file in the
-     initramfs root. Then zero the first `BOOT_START + BOOT_SIZE` KB of the
-     disk, then `bmaptool copy --bmap wic.bmap /home/omnect/wic
-     /dev/omnect/rootblk`. The RAM cost of the verify pass is the size of the
-     mapped image; that cost is why the direct path exists. The kernel makes
-     the initramfs root a tmpfs when `CONFIG_TMPFS` is set and the command
-     line has no `root=` (GRUB), and a ramfs otherwise (U-Boot passes
-     `root=`). ramfs has no size limit, so an image too big for RAM fails by
-     running out of memory; tmpfs stops at its size limit, half the RAM by
-     default, with `ENOSPC`.
-   - **`flash-mode-2-direct`** — zero the head, then
-     `bmaptool copy --bmap wic.bmap wic.xz /dev/omnect/rootblk` straight from
-     the FIFO. No verification.
-7. Re-read the partition table (§8.3), EFI handling (§6), `sync`, log (§8),
+7. Flash. The image is `xz`-decoded in-process (`lzma-rust2`), only the
+   ranges the bmap maps are written, and each range is checked against its
+   sha256. The stream is read to its end, so a cut-off or extended stream
+   fails. A dictionary larger than 64 MiB, the size of `xz -9`, is rejected
+   before the decoder allocates it.
+   - **default** — verify pass first: decode the FIFO into
+     `/home/omnect/wic`, a sparse file in the initramfs root, then copy its
+     mapped ranges to `/dev/omnect/rootblk`. The RAM cost of the verify pass
+     is the size of the mapped image; that cost is why the direct path exists.
+     The kernel makes the initramfs root a tmpfs when `CONFIG_TMPFS` is set
+     and the command line has no `root=` (GRUB), and a ramfs otherwise (U-Boot
+     passes `root=`). ramfs has no size limit, so an image too big for RAM
+     fails by running out of memory; tmpfs stops at its size limit, half the
+     RAM by default, with `ENOSPC`.
+   - **`flash-mode-2-direct`** — decode the FIFO straight onto
+     `/dev/omnect/rootblk`. A broken image is seen only after writing started.
+8. Zero the parts of the first `BOOT_START + BOOT_SIZE` KB that the bmap does
+   not map (§10.1).
+9. Re-read the partition table (§8.3), EFI handling (§6), `sync`, log (§8),
    `reboot`.
 
-Once `bmaptool` starts it blocks reading the FIFO until the operator's `scp`
+A failure in steps 6 to 8 does not end the mode. It is logged, `wic.bmap`, the
+decoded image and the FIFO are removed, a new FIFO is created and the operator
+is asked again from step 4. The init runs from RAM, so even a partly written
+disk can be repaired by a new upload as long as the device stays powered. An
+`scp` that still writes into the old FIFO fails with `EPIPE` once the flash
+closes the read end. An `scp` still blocked in opening the old FIFO would wait
+forever after the FIFO is removed, so the FIFO is opened for reading once
+before the removal; that `scp` then fails the same way.
+
+Once the flash starts it blocks reading the FIFO until the operator's `scp`
 feeds it, and that wait stays unbounded too: a timeout there would kill a flash
 in progress and leave the disk half-written (§10.8).
 
 The zeroing step is the legacy `non_bmap_dd_handling`. Its comment records
 post-flash boot failures observed on both GRUB (mismatched `bootx64.efi`
 checksums) and U-Boot (boot-partition errors after `bmaptool`). It is ported —
-see §10.1.
+see §10.1 — but runs after the flash, so a bad bmap, and with the verify pass
+a bad image, leaves the old disk bootable.
 
 ## 6. EFI handling
 
@@ -688,14 +718,18 @@ See §10.4.
 | Destination bootloader-env write failure | Fatal |
 | Network setup or wait timeout | Fatal |
 | Download failure or checksum mismatch | Fatal |
-| `bmaptool` failure | Fatal |
+| Mode 2: bmap check, verify pass, flash pass or head zeroing failure | Log error → ask for bmap and image again (§5.4) |
+| Mode 3: `bmaptool` failure | Fatal |
 | Partition-table re-read failure after the flash (§8.3) | Fatal, no log. The image is on the disk, but the EFI step and the log mount must not use the old table |
 | EFI handling failure | Fatal. The machine keeps its old entries if the create failed, and the new entry plus any not yet deleted if a delete failed |
 | Log persistence failure | Log warn → continue |
 
 "Fatal" means the mode aborts into §8.1's failure path. For mode 1 the source
-disk is untouched, so a power cycle boots normally. For modes 2 and 3 the disk is
-left half-written, which is unavoidable for a whole-disk flash.
+disk is untouched, so a power cycle boots normally. For mode 3 the disk is
+left half-written, which is unavoidable for a whole-disk flash. Mode 2 ends
+fatally only after the flash, when the re-read or the EFI step fails, or when
+the new FIFO for the next attempt cannot be created; the disk is half-written
+in the last case only if an earlier attempt wrote it.
 
 ### 8.3 Logging
 
@@ -723,7 +757,9 @@ runs. Persistence depends on whether a safe target exists:
   a later change to break the property while the doc still reads as true.
 - **Modes 2 and 3** — the whole disk is overwritten. A failure while the disk
   is written leaves it in an unknown partly written state, and mounting anything
-  on it is unsafe. That failure is `FlashError::DiskPartlyWritten`, and it leaves
+  on it is unsafe. That failure is `FlashError::DiskPartlyWritten`. Mode 2 asks
+  for the image again instead (§5.4), and ends on it only when the new FIFO
+  cannot be created after such an attempt; a mode that ends on it leaves
   nothing on disk; diagnosis stays on kmsg and the console. The new image may
   place partitions elsewhere, so right after the flash pass the kernel re-reads
   the partition table (`BLKRRPART`), before the EFI dump mount (§6 step 5) and
@@ -773,6 +809,9 @@ Behaviour changes, as opposed to bug fixes:
   `dropbear` first, so a login could briefly find no `wic.xz` (§5.4);
 - the `wic.bmap` wait ends when the file is complete, where legacy stopped as
   soon as the file existed (§5.4);
+- mode 2 flashes in-process instead of with `bmaptool`, zeroes the unmapped
+  head after the flash instead of the whole head before it, and asks for bmap
+  and image again after a failed attempt instead of stopping (§5.4, §10.1);
 - `dd` is replaced by in-process file I/O (§2.8);
 - the EFI loader is passed to `efibootmgr` as `\EFI\BOOT\bootx64.efi`. The
   legacy script's unquoted `\\\\EFI\\\\BOOT` reached it as
@@ -843,12 +882,18 @@ Every item below is decided, and the rest of the spec follows that decision.
 
 ### 10.1 Keep `non_bmap_dd_handling`?
 
-Zeroing the first `BOOT_START + BOOT_SIZE` KB of the disk before flashing in
-mode 2. The legacy comment records post-flash boot failures observed on both GRUB and U-Boot,
+Zeroing the first `BOOT_START + BOOT_SIZE` KB of the disk in mode 2. The legacy comment records post-flash boot failures observed on both GRUB and U-Boot,
 but the root cause was never established, so this may be masking a `bmaptool` or
 partition-alignment problem rather than fixing one.
 
-**Decided: keep.**
+**Decided: keep.** Only the parts the bmap does not map are zeroed, after the
+flash: the final disk is the same, and the old disk stays bootable until the
+flash pass starts (§5.4).
+
+> **Correction (2026-10-09).** This decision first zeroed the whole head
+> before `bmaptool` ran. With `bmaptool` replaced by the in-process flash, the
+> zeroing moved behind the flash and covers only the unmapped parts, so a bmap
+> that fails its checks no longer leaves the device unbootable.
 
 ### 10.2 Keep the duplicate EFI boot entry?
 
@@ -931,7 +976,7 @@ who starts the copy after the bound still gets a flash today, but would get the
 unbounded code path" rule. Production images never reach this mode, and on a
 development image a shell after the bound says nothing the missing data has not
 already said. The same decision removes the `bmaptool` watchdog, whose timeout
-would kill a flash in progress and leave the disk half-written (§5.4).
+would have killed a flash in progress and left the disk half-written (§5.4).
 
 ## 11. Testing
 
@@ -954,6 +999,10 @@ only smoke-tested. Real end-to-end coverage stays in Concourse CI on hardware.
 | Detection: every row of the §3.3 trigger table | integration | `tests/flash_modes.rs` |
 | `/proc/mounts` sweep: device numbers, deepest first | unit | `src/mode/flash/unmount.rs` |
 | Mode 2 step order, default and `flash-mode-2-direct` | unit | `src/mode/flash/scp.rs` |
+| Mode 2 asks again after a failed bmap check, verify pass, flash pass or zeroing | unit | `src/mode/flash/scp.rs` |
+| bmap checks: bad input is an error, never a panic | unit | `src/mode/flash/bmap/parse.rs` |
+| bmap copy: only mapped ranges written, range checksum, early and late stream end, `xz` round trip, `xz` input in small reads | unit | `src/mode/flash/bmap/copy.rs` |
+| `bmaptool create` output: parsed, and flash plus zeroing the unmapped parts gives the image | unit | `src/mode/flash/bmap/mod.rs` |
 | Mode 2 log skipped only on a partly written disk | unit | `src/mode/flash/mod.rs`, `src/mode/flash/scp.rs` |
 | Clear-first ordering: a failing mode still leaves its triggers cleared | unit | `src/mode/flash/mod.rs` |
 | Destination refusal by device number, parent disk from a fake sysfs tree | unit | `src/mode/flash/clone.rs` |
@@ -986,6 +1035,8 @@ Implemented separately, listed here so nothing is lost:
   same distro features as the legacy image, and keep the `omnect_user` class
   inherited for mode 2. The Rust image does not install them while the modes
   are not ported;
+- mode 2 needs neither `bmaptool` nor `xz` in the Rust initramfs (§5.4); only
+  mode 3 still installs them;
 - when mode 2 or 3 is ported, remove the "does not implement flash mode N yet"
   note from that mode's section in the meta-omnect `README.md`, and check its
   console output example and behaviour notes against the port

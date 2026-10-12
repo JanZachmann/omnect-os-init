@@ -313,8 +313,8 @@ impl std::fmt::Display for PartitionTableOperation {
 
 /// Errors during a flash mode.
 ///
-/// Every variant is fatal: a flash either completes or leaves the operator to
-/// power-cycle.
+/// Every error that ends a mode is fatal: a flash either completes or leaves
+/// the operator to power-cycle.
 #[cfg(feature = "flash-mode")]
 #[derive(Error, Debug)]
 pub enum FlashError {
@@ -387,6 +387,10 @@ pub enum FlashError {
         disk: PathBuf,
         source: Box<FlashError>,
     },
+
+    #[cfg(feature = "flash-mode-2")]
+    #[error("bmap {} is unusable: {reason}", path.display())]
+    InvalidBmap { path: PathBuf, reason: String },
 
     #[cfg(feature = "flash-mode-2")]
     #[error("Network setup failed: {0}")]

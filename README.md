@@ -21,7 +21,7 @@ Implemented functionality:
 - **switch\_root**: MS_MOVE + chroot + exec systemd
 - **Factory reset (modes 1-3)**: Selective-preserve backup → wipe `data`/`etc` (modes 2 and 3 only) → reformat → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
 - **Flash mode 1**: Clones the running disk onto another block device given by the `flash-mode-devpath` bootloader env key, triggered by `flash-mode`; powers off on success so the clone can be moved to its own device (feature `flash-mode-1`, part of the default feature set)
-- **Flash mode 2**: Brings up `eth0` with DHCP and starts `dropbear`; the operator pushes a `wic.xz` with `scp`, and `bmaptool` flashes it onto the running disk. Triggered by `flash-mode=2` in the bootloader env or by the flag file `/etc/enforce_flash_mode` (feature `flash-mode-2`). Mode 2 wins over a `factory-reset` set at the same time: the reset does not run and an error is logged, with no further handling
+- **Flash mode 2**: Brings up `eth0` with DHCP and starts `dropbear`; the operator pushes a bmap and a `wic.xz` with `scp`, and the init checks the bmap and flashes the image onto the running disk; a failed attempt asks for both again. Triggered by `flash-mode=2` in the bootloader env or by the flag file `/etc/enforce_flash_mode` (feature `flash-mode-2`). Mode 2 wins over a `factory-reset` set at the same time: the reset does not run and an error is logged, with no further handling
 
 Not yet implemented (planned):
 
@@ -264,7 +264,7 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 | `flash-mode` | Shared flash layer: trigger detection, dispatch, log capture. Pulled in by a mode feature, never selected on its own | Implemented |
 | `flash-mode-1` | Disk cloning (part of the default feature set) | Implemented |
 | `flash-mode-2` | Flash a `wic.xz` pushed in over `scp` | Implemented |
-| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream. The disk head is zeroed before the image arrives, so if no image is pushed the disk no longer boots | Implemented |
+| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream. A broken image is seen only after writing started; the init then asks for bmap and image again, and the disk does not boot until a good one was flashed | Implemented |
 | `flash-mode-3` | HTTP/HTTPS flashing | Planned |
 
 > **Note:** `grub` and `uboot` are mutually exclusive, and so are `gpt` and `dos`.
@@ -313,8 +313,6 @@ time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
 | `/sbin/ip` | `flash-mode-2` | `busybox` |
 | `/sbin/dhcpcd` | `flash-mode-2` | `dhcpcd` |
 | `/sbin/dropbear` | `flash-mode-2` | `dropbear` |
-| `/usr/bin/bmaptool` | `flash-mode-2` | `bmaptool` |
-| `xz` (run by `bmaptool`) | `flash-mode-2` | `xz` |
 | `omnect` user and `/home/omnect` | `flash-mode-2` | image recipe (`inherit omnect_user`) |
 | `devpts` filesystem | `flash-mode-2` | kernel (`CONFIG_UNIX98_PTYS`) |
 

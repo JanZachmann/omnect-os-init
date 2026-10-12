@@ -33,6 +33,10 @@ pub struct ByteRange {
     pub len: u64,
 }
 
+pub(crate) fn chunk_len(left: u64, buf_len: usize) -> usize {
+    usize::try_from(left).map_or(buf_len, |left| left.min(buf_len))
+}
+
 pub fn kb_to_bytes(kb: u64, name: BuildConstant) -> Result<u64, FlashError> {
     kb.checked_mul(KIB)
         .ok_or_else(|| FlashError::InvalidBuildConstant {
@@ -83,9 +87,7 @@ pub fn copy_range(
         }
 
         let want = match len {
-            Some(len) => usize::try_from(len - copied)
-                .unwrap_or(buf.len())
-                .min(buf.len()),
+            Some(len) => chunk_len(len - copied, buf.len()),
             None => buf.len(),
         };
 
@@ -133,7 +135,7 @@ pub fn copy_range(
 
 /// The destination must already exist: a mistyped device path has to fail
 /// instead of creating a regular file that makes the write look done.
-fn open_existing_for_write(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_existing_for_write(path: &Path) -> std::io::Result<File> {
     OpenOptions::new().write(true).open(path)
 }
 
@@ -152,7 +154,7 @@ pub fn zero_range(dst: &Path, range: &ByteRange) -> Result<(), FlashError> {
     let buf = vec![0u8; COPY_BUFFER_SIZE];
     let mut left = range.len;
     while left > 0 {
-        let chunk = usize::try_from(left).unwrap_or(buf.len()).min(buf.len());
+        let chunk = chunk_len(left, buf.len());
         dst_file.write_all(&buf[..chunk]).map_err(io_failed)?;
         left -= chunk as u64;
     }
@@ -186,6 +188,13 @@ mod tests {
         f.write_all(bytes).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    #[test]
+    fn a_chunk_is_at_most_one_buffer() {
+        assert_eq!(chunk_len(3, 8), 3);
+        assert_eq!(chunk_len(8, 8), 8);
+        assert_eq!(chunk_len(u64::MAX, 8), 8);
     }
 
     #[cfg(feature = "flash-mode-1")]

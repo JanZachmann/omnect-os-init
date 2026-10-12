@@ -16,10 +16,16 @@ name = "omnect-os-init"
 path = "src/main.rs"
 
 [dependencies]
+hex = { version = "0.4", default-features = false, optional = true }
 log = { version = "0.4", default-features = false, features = ["std"] }
+# TODO: remove me, as soon as lzma-rust2 1.0 is released: until then a 0.x
+# update can change the decoder that runs in PID 1, so it needs a review.
+lzma-rust2 = { version = "=0.21.0", default-features = false, features = ["std", "xz"], optional = true }
 nix = { version = "0.29", default-features = false, features = ["fs", "ioctl", "mount", "net", "process", "reboot", "user"] }
+quick-xml = { version = "0.42", default-features = false, features = ["serialize"], optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = { version = "0.11", default-features = false, optional = true }
 thiserror = { version = "2.0", default-features = false }
 uuid = { version = "1.11", default-features = false, optional = true }
 
@@ -30,7 +36,7 @@ dos = ["core"]            # DOS/MBR partition table (extended container at slot 
 factory-reset = ["core"]
 flash-mode = ["core"]     # Shared flash layer; pulled in by a mode, never selected on its own
 flash-mode-1 = ["flash-mode", "dep:uuid"]  # Clone the running disk onto another block device
-flash-mode-2 = ["flash-mode"]         # Flash a wic.xz pushed in over scp
+flash-mode-2 = ["flash-mode", "dep:hex", "dep:lzma-rust2", "dep:quick-xml", "dep:sha2"] # Flash a wic.xz pushed in over scp
 flash-mode-2-direct = ["flash-mode-2"] # Flash straight from the scp stream, no verify pass
 gpt = ["core"]            # GPT partition table (primary partitions 1-7)
 grub = ["core"]           # x86-64 EFI targets (GRUB bootloader)
@@ -60,4 +66,6 @@ name = "flash_modes"
 required-features = ["test-utils", "flash-mode"]
 
 [dev-dependencies]
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+lzma-rust2 = { version = "=0.21.0", default-features = false, features = ["encoder", "std", "xz"] }
 tempfile = { version = "3.20", default-features = false }
