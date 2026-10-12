@@ -1,8 +1,13 @@
+#[cfg(feature = "flash-mode-3")]
+use std::fmt;
 #[cfg(feature = "flash-mode-1")]
 use std::path::PathBuf;
 
 #[cfg(feature = "flash-mode-3")]
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+
+#[cfg(feature = "flash-mode-3")]
+const SCHEME_SEPARATOR: &str = "://";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashMode {
@@ -42,23 +47,65 @@ impl FlashMode {
     }
 }
 
-/// What `flash-mode-devpath` held when the mode was detected.
-#[cfg(feature = "flash-mode-1")]
+/// What a boot-env key held when the mode was detected.
+#[cfg(any(feature = "flash-mode-1", feature = "flash-mode-3"))]
 #[derive(Debug, PartialEq, Eq)]
-pub enum Devpath {
-    Set(PathBuf),
-    NotSet,
-    Unreadable(String),
-}
-
-/// What a mode 3 URL key held when the mode was detected.
-#[cfg(feature = "flash-mode-3")]
-#[derive(Debug, PartialEq, Eq)]
-pub enum EnvUrl {
-    Set(String),
+pub enum EnvValue<T> {
+    Set(T),
     NotSet,
     Invalid(String),
     Unreadable(String),
+}
+
+/// The value of `flash-mode-devpath`.
+#[cfg(feature = "flash-mode-1")]
+pub type Devpath = EnvValue<PathBuf>;
+
+/// The value of a mode 3 URL key.
+#[cfg(feature = "flash-mode-3")]
+pub type EnvUrl = EnvValue<Url>;
+
+/// A URL that can hold credentials or an access token. `Debug` prints it
+/// redacted.
+#[cfg(feature = "flash-mode-3")]
+#[derive(PartialEq, Eq)]
+pub struct Url(String);
+
+#[cfg(feature = "flash-mode-3")]
+impl Url {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[cfg(feature = "flash-mode-3")]
+impl From<&str> for Url {
+    fn from(url: &str) -> Self {
+        Self(url.to_string())
+    }
+}
+
+#[cfg(feature = "flash-mode-3")]
+impl fmt::Debug for Url {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Url").field(&redacted(&self.0)).finish()
+    }
+}
+
+/// `url` without user info, query string and fragment, which can hold
+/// credentials or an access token, so it can go to kmsg and the run log.
+#[cfg(feature = "flash-mode-3")]
+pub(crate) fn redacted(url: &str) -> String {
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    // curl also takes a URL without a scheme, user info included.
+    let (scheme, rest) = url
+        .find(SCHEME_SEPARATOR)
+        .map_or(("", url), |at| url.split_at(at + SCHEME_SEPARATOR.len()));
+    let (authority, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    format!("{scheme}{host}{path}")
 }
 
 #[derive(Debug)]
@@ -122,7 +169,7 @@ pub(crate) fn parse_url(value: Option<&str>) -> EnvUrl {
     };
     match String::from_utf8(decoded) {
         Ok(url) if url.trim().is_empty() => EnvUrl::Invalid("decodes to an empty URL".to_string()),
-        Ok(url) => EnvUrl::Set(url.trim().to_string()),
+        Ok(url) => EnvUrl::Set(url.trim().into()),
         Err(_) => EnvUrl::Invalid("decodes to text that is not UTF-8".to_string()),
     }
 }
@@ -182,13 +229,13 @@ mod tests {
 
         #[test]
         fn a_base64_url_is_decoded() {
-            assert_eq!(parse_url(Some(&encoded(URL))), EnvUrl::Set(URL.to_string()));
+            assert_eq!(parse_url(Some(&encoded(URL))), EnvUrl::Set(URL.into()));
         }
 
         #[test]
         fn the_newline_of_an_echo_encoder_is_trimmed() {
             let value = format!(" {}\n", encoded(format!("{URL}\n")));
-            assert_eq!(parse_url(Some(&value)), EnvUrl::Set(URL.to_string()));
+            assert_eq!(parse_url(Some(&value)), EnvUrl::Set(URL.into()));
         }
 
         #[test]
@@ -196,6 +243,34 @@ mod tests {
             for value in [None, Some(""), Some("  ")] {
                 assert_eq!(parse_url(value), EnvUrl::NotSet, "{value:?}");
             }
+        }
+
+        #[test]
+        fn a_url_loses_its_credentials_and_query_in_logs() {
+            assert_eq!(
+                redacted(URL),
+                "https://example.invalid/images/omnect.wic.xz"
+            );
+            assert_eq!(redacted("http://host/a#token"), "http://host/a");
+            assert_eq!(redacted("http://host/a"), "http://host/a");
+            assert_eq!(redacted("https://user:pass@host/a"), "https://host/a");
+            assert_eq!(redacted("https://user:pass@host"), "https://host");
+            assert_eq!(redacted("host/a?sig=secret"), "host/a");
+            assert_eq!(redacted("user:pass@host/a?sig=secret"), "host/a");
+        }
+
+        #[test]
+        fn a_debug_print_does_not_show_the_token() {
+            let config = FlashConfig {
+                image_url: EnvUrl::Set("https://user:pass@example.invalid/a?sig=secret".into()),
+                ..FlashConfig::new(FlashMode::Mode3)
+            };
+            let printed = format!("{config:?}");
+            assert!(printed.contains("example.invalid/a"), "{printed}");
+            assert!(
+                !printed.contains("secret") && !printed.contains("pass"),
+                "{printed}"
+            );
         }
 
         #[test]

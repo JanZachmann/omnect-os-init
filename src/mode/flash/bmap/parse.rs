@@ -3,8 +3,9 @@
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::mode::flash::bmap::{Bmap, MappedRange, SHA256_LEN};
+use crate::mode::flash::bmap::{Bmap, MappedRange};
 use crate::mode::flash::rawio::ByteRange;
+use crate::mode::flash::{SHA256_LEN, sha256_from_hex};
 
 const SUPPORTED_MAJOR_VERSION: u64 = 2;
 const CHECKSUM_TYPE: &str = "sha256";
@@ -49,19 +50,16 @@ fn number(name: &str, text: &str) -> Result<u64, String> {
         .map_err(|e| format!("{name} '{}': {e}", text.trim()))
 }
 
-fn sha256_from_hex(text: &str) -> Result<[u8; SHA256_LEN], String> {
+fn checksum_from_hex(text: &str) -> Result<[u8; SHA256_LEN], String> {
     let text = text.trim();
-    let mut digest = [0u8; SHA256_LEN];
-    hex::decode_to_slice(text, &mut digest)
-        .map_err(|_| format!("checksum '{text}' is not a sha256"))?;
-    Ok(digest)
+    sha256_from_hex(text).map_err(|_| format!("checksum '{text}' is not a sha256"))
 }
 
 /// The file checksum is the sha256 of the file with the checksum value
 /// replaced by zeros.
 fn check_file_checksum(text: &str, checksum: &str) -> Result<(), String> {
     let checksum = checksum.trim();
-    let expected = sha256_from_hex(checksum)?;
+    let expected = checksum_from_hex(checksum)?;
     let zeros = "0".repeat(checksum.len());
     let actual = Sha256::digest(text.replacen(checksum, &zeros, 1).as_bytes());
     if actual[..] != expected {
@@ -152,7 +150,7 @@ impl Bmap {
                     offset,
                     len: end - offset,
                 },
-                sha256: sha256_from_hex(&range.chksum)?,
+                sha256: checksum_from_hex(&range.chksum)?,
             });
         }
 

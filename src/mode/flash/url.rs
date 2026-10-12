@@ -11,8 +11,11 @@ use sha2::{Digest, Sha256};
 
 use crate::bootloader::sync_filesystems;
 use crate::error::FlashError;
+use crate::mode::flash::config::redacted;
 use crate::mode::flash::rawio::{self, COPY_BUFFER_SIZE, open_existing_for_write};
-use crate::mode::flash::{child, net, partly_written, unmount, xz};
+use crate::mode::flash::{
+    SHA256_LEN, child, net, partly_written, read_small_text, sha256_from_hex, unmount, xz,
+};
 #[cfg(feature = "grub")]
 use crate::mode::flash::{efi, layout_partition};
 use crate::partition::PartitionLayout;
@@ -37,14 +40,10 @@ const CURL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CURL_STALL_SPEED: u32 = 1;
 const CURL_STALL_TIME: Duration = Duration::from_secs(60);
 
-const SCHEME_SEPARATOR: &str = "://";
-
 const DOWNLOAD_DIR: &str = "/tmp/flash-mode-3";
 const IMAGE_FILE_NAME: &str = "wic.xz";
 const SHA256_FILE_NAME: &str = "wic.xz.sha256";
-const SHA256_LEN: usize = 32;
-/// Room for a digest and a long file name. A larger file comes from a wrong
-/// URL, and reading it whole would hold a second copy of it in RAM.
+/// Room for a digest and a long file name.
 const MAX_SHA256_FILE_LEN: u64 = 4096;
 
 pub(crate) struct UrlCtx<'a> {
@@ -52,21 +51,6 @@ pub(crate) struct UrlCtx<'a> {
     pub(crate) rootfs: &'a Path,
     pub(crate) image_url: &'a str,
     pub(crate) sha256_url: &'a str,
-}
-
-/// `url` without user info, query string and fragment, which can hold
-/// credentials or an access token, so it can go to kmsg and the run log.
-fn redacted(url: &str) -> String {
-    let url = url.split(['?', '#']).next().unwrap_or(url);
-    // curl also takes a URL without a scheme, user info included.
-    let (scheme, rest) = url
-        .find(SCHEME_SEPARATOR)
-        .map_or(("", url), |at| url.split_at(at + SCHEME_SEPARATOR.len()));
-    let (authority, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    format!("{scheme}{host}{path}")
 }
 
 fn curl_args(url: &str, target: &Path) -> Vec<OsString> {
@@ -95,30 +79,16 @@ fn expected_sha256(sha256_file: &str) -> Result<[u8; SHA256_LEN], String> {
         .split_whitespace()
         .next()
         .ok_or("the sha256 file is empty")?;
-    let mut digest = [0u8; SHA256_LEN];
-    hex::decode_to_slice(field, &mut digest)
-        .map_err(|e| format!("'{field}' is not a sha256 digest: {e}"))?;
-    Ok(digest)
+    sha256_from_hex(field).map_err(|e| format!("'{field}' is not a sha256 digest: {e}"))
 }
 
 fn read_sha256_file(path: &Path) -> Result<String, FlashError> {
-    let invalid = |reason: String| FlashError::InvalidImage {
-        path: path.to_path_buf(),
-        reason,
-    };
-    let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|file| file.take(MAX_SHA256_FILE_LEN + 1).read_to_end(&mut bytes))
-        .map_err(|source| FlashError::PathIo {
+    read_small_text(path, MAX_SHA256_FILE_LEN, |reason| {
+        FlashError::InvalidImage {
             path: path.to_path_buf(),
-            source,
-        })?;
-    if bytes.len() as u64 > MAX_SHA256_FILE_LEN {
-        return Err(invalid(format!(
-            "the sha256 file is larger than {MAX_SHA256_FILE_LEN} bytes"
-        )));
-    }
-    String::from_utf8(bytes).map_err(|_| invalid("the sha256 file is not UTF-8 text".to_string()))
+            reason: format!("the sha256 file is {reason}"),
+        }
+    })
 }
 
 fn sha256_of(path: &Path) -> Result<[u8; SHA256_LEN], FlashError> {
@@ -396,17 +366,6 @@ mod tests {
             "{}  /build/omnect.wic.xz\n",
             hex::encode(Sha256::digest(data))
         )
-    }
-
-    #[test]
-    fn a_url_loses_its_query_and_fragment_in_logs() {
-        assert_eq!(redacted(IMAGE_URL), "https://example.invalid/omnect.wic.xz");
-        assert_eq!(redacted("http://host/a#token"), "http://host/a");
-        assert_eq!(redacted("http://host/a"), "http://host/a");
-        assert_eq!(redacted("https://user:pass@host/a"), "https://host/a");
-        assert_eq!(redacted("https://user:pass@host"), "https://host");
-        assert_eq!(redacted("host/a?sig=secret"), "host/a");
-        assert_eq!(redacted("user:pass@host/a?sig=secret"), "host/a");
     }
 
     #[test]

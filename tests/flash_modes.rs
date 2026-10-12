@@ -185,8 +185,8 @@ mod mode_3_detection {
             panic!("key 3 must select a flash mode");
         };
         assert_eq!(config.mode, FlashMode::Mode3);
-        assert_eq!(config.image_url, EnvUrl::Set(URL.to_string()));
-        assert_eq!(config.sha256_url, EnvUrl::Set(URL.to_string()));
+        assert_eq!(config.image_url, EnvUrl::Set(URL.into()));
+        assert_eq!(config.sha256_url, EnvUrl::Set(URL.into()));
         // Clearing is the mode's own first step, so it reaches the run log.
         assert!(env.set_env_calls.is_empty());
     }

@@ -26,6 +26,10 @@ pub(crate) mod xz;
 #[cfg(feature = "flash-mode-network")]
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(feature = "flash-mode-network")]
+use std::fs::File;
+#[cfg(feature = "flash-mode-network")]
+use std::io::Read;
 use std::path::Path;
 #[cfg(any(feature = "flash-mode-1", feature = "grub"))]
 use std::path::PathBuf;
@@ -73,6 +77,37 @@ type LogWriter<'a> = &'a mut dyn FnMut(&Path, &str, &[String]) -> Result<(), Fla
 
 type ModeRunner<'a> =
     &'a mut dyn FnMut(&config::FlashConfig, &BootContext<'_>) -> Result<(), FlashError>;
+
+#[cfg(feature = "flash-mode-network")]
+pub(crate) const SHA256_LEN: usize = 32;
+
+#[cfg(feature = "flash-mode-network")]
+pub(crate) fn sha256_from_hex(text: &str) -> Result<[u8; SHA256_LEN], hex::FromHexError> {
+    let mut digest = [0u8; SHA256_LEN];
+    hex::decode_to_slice(text, &mut digest)?;
+    Ok(digest)
+}
+
+/// A file larger than `max_len` comes from a wrong source, and reading it
+/// whole would fill RAM, so it is refused through `invalid`.
+#[cfg(feature = "flash-mode-network")]
+pub(crate) fn read_small_text(
+    path: &Path,
+    max_len: u64,
+    invalid: impl Fn(String) -> FlashError,
+) -> Result<String, FlashError> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(max_len + 1).read_to_end(&mut bytes))
+        .map_err(|source| FlashError::PathIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > max_len {
+        return Err(invalid(format!("larger than {max_len} bytes")));
+    }
+    String::from_utf8(bytes).map_err(|_| invalid("not UTF-8 text".to_string()))
+}
 
 #[cfg(feature = "flash-mode-network")]
 fn child(cmd: &str) -> Command {
@@ -167,29 +202,14 @@ pub(crate) fn with_mount<T>(
     result
 }
 
-/// The destination mode 1 was given.
-#[cfg(feature = "flash-mode-1")]
-fn destination(flash_config: &config::FlashConfig) -> Result<&Path, FlashError> {
-    let invalid = |reason: String| FlashError::InvalidEnvValue {
-        key: BootEnvKey::FlashModeDevPath,
-        reason,
-    };
-    match &flash_config.devpath {
-        config::Devpath::Set(path) => Ok(path),
-        config::Devpath::NotSet => Err(invalid("not set".to_string())),
-        config::Devpath::Unreadable(e) => Err(invalid(format!("failed to read env: {e}"))),
-    }
-}
-
-/// A mode 3 URL as `detect` found it.
-#[cfg(feature = "flash-mode-3")]
-fn env_url(url: &config::EnvUrl, key: BootEnvKey) -> Result<&str, FlashError> {
+#[cfg(any(feature = "flash-mode-1", feature = "flash-mode-3"))]
+fn env_value<T>(value: &config::EnvValue<T>, key: BootEnvKey) -> Result<&T, FlashError> {
     let invalid = |reason: String| FlashError::InvalidEnvValue { key, reason };
-    match url {
-        config::EnvUrl::Set(url) => Ok(url),
-        config::EnvUrl::NotSet => Err(invalid("not set".to_string())),
-        config::EnvUrl::Invalid(reason) => Err(invalid(reason.clone())),
-        config::EnvUrl::Unreadable(e) => Err(invalid(format!("failed to read env: {e}"))),
+    match value {
+        config::EnvValue::Set(value) => Ok(value),
+        config::EnvValue::NotSet => Err(invalid("not set".to_string())),
+        config::EnvValue::Invalid(reason) => Err(invalid(reason.clone())),
+        config::EnvValue::Unreadable(e) => Err(invalid(format!("failed to read env: {e}"))),
     }
 }
 
@@ -247,7 +267,7 @@ fn run_selected_mode(
     match flash_config.mode {
         #[cfg(feature = "flash-mode-1")]
         config::FlashMode::Mode1 => clone::run_clone(&clone::CloneCtx {
-            destination: destination(flash_config)?,
+            destination: env_value(&flash_config.devpath, BootEnvKey::FlashModeDevPath)?,
             layout: ctx.layout,
             rootfs: ctx.rootfs,
         }),
@@ -260,8 +280,9 @@ fn run_selected_mode(
         config::FlashMode::Mode3 => url::run_url(&url::UrlCtx {
             layout: ctx.layout,
             rootfs: ctx.rootfs,
-            image_url: env_url(&flash_config.image_url, BootEnvKey::FlashModeUrl)?,
-            sha256_url: env_url(&flash_config.sha256_url, BootEnvKey::FlashModeUrlSha256)?,
+            image_url: env_value(&flash_config.image_url, BootEnvKey::FlashModeUrl)?.as_str(),
+            sha256_url: env_value(&flash_config.sha256_url, BootEnvKey::FlashModeUrlSha256)?
+                .as_str(),
         }),
     }
 }
@@ -665,7 +686,7 @@ mod tests {
     #[test]
     fn a_missing_destination_is_reported_with_its_reason() {
         let flash_config = config::FlashConfig::new(config::FlashMode::Mode1);
-        let err = destination(&flash_config).unwrap_err();
+        let err = env_value(&flash_config.devpath, BootEnvKey::FlashModeDevPath).unwrap_err();
         assert!(
             matches!(&err, FlashError::InvalidEnvValue { key, reason }
                 if *key == BootEnvKey::FlashModeDevPath && reason == "not set"),
@@ -736,16 +757,16 @@ mod tests {
             ),
         ];
         for (url, expected) in cases {
-            let err = env_url(&url, BootEnvKey::FlashModeUrlSha256).unwrap_err();
+            let err = env_value(&url, BootEnvKey::FlashModeUrlSha256).unwrap_err();
             assert!(
                 matches!(&err, FlashError::InvalidEnvValue { key, reason }
                     if *key == BootEnvKey::FlashModeUrlSha256 && reason == expected),
                 "{err}"
             );
         }
-        let set = config::EnvUrl::Set("https://example.invalid/wic.xz".to_string());
+        let set = config::EnvUrl::Set("https://example.invalid/wic.xz".into());
         assert_eq!(
-            env_url(&set, BootEnvKey::FlashModeUrl).unwrap(),
+            env_value(&set, BootEnvKey::FlashModeUrl).unwrap().as_str(),
             "https://example.invalid/wic.xz"
         );
     }
