@@ -19,7 +19,8 @@ const NUMBER_MORE_BIT: u8 = 0x80;
 /// The uncompressed size that the index at the end of `file` records. Only a
 /// file that holds exactly one xz stream is accepted.
 // TODO: remove me, as soon as a lzma-rust2 release that reports the
-// uncompressed size of an xz file is CR.
+// uncompressed size of an xz file is CR:
+// https://github.com/hasenbanck/lzma-rust2/pull/134
 pub(crate) fn uncompressed_size<F: Read + Seek>(file: &mut F) -> Result<u64, String> {
     let io = |e: io::Error| format!("reading the xz index: {e}");
     let file_len = file.seek(SeekFrom::End(0)).map_err(io)?;
