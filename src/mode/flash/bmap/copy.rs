@@ -1,10 +1,12 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Read, Seek, SeekFrom, Write};
+use std::time::{Duration, Instant};
 
 use lzma_rust2::{XzReader, lzma2_get_memory_usage};
 use sha2::{Digest, Sha256};
 
 use crate::error::FlashError;
+use crate::mode::flash::bmap::progress::Progress;
 use crate::mode::flash::bmap::{Bmap, Destination, Source};
 use crate::mode::flash::rawio::{ByteRange, COPY_BUFFER_SIZE, chunk_len, open_existing_for_write};
 
@@ -13,6 +15,11 @@ use crate::mode::flash::rawio::{ByteRange, COPY_BUFFER_SIZE, chunk_len, open_exi
 /// before it can push the device out of memory.
 const MAX_XZ_DICT_SIZE: u32 = 64 * MIB;
 const MIB: u32 = 1024 * 1024;
+
+const PROGRESS_LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// A sync every this many bytes keeps the final sync short and limits the
+/// dirty pages in RAM.
+const DEVICE_SYNC_INTERVAL: u64 = 64 * MIB as u64;
 
 /// Copy the mapped ranges of `source` to `destination` and check each range's
 /// checksum.
@@ -44,10 +51,36 @@ pub(crate) fn copy(
     }
     .map_err(|e| failed(format!("opening destination: {e}")))?;
 
-    copy_stream(bmap, input.as_mut(), &mut output).map_err(failed)?;
+    let start = Instant::now();
+    let mut progress = Progress::new(
+        destination.path(),
+        bmap.image_size,
+        PROGRESS_LOG_INTERVAL,
+        Box::new(move || start.elapsed()),
+    );
+    let sync_interval =
+        matches!(destination, Destination::Device(_)).then_some(DEVICE_SYNC_INTERVAL);
+    copy_stream(
+        bmap,
+        input.as_mut(),
+        &mut output,
+        &mut progress,
+        sync_interval,
+    )
+    .map_err(failed)?;
     output
         .sync_all()
         .map_err(|e| failed(format!("syncing destination: {e}")))
+}
+
+trait Output: Write + Seek {
+    fn sync(&mut self) -> io::Result<()>;
+}
+
+impl Output for File {
+    fn sync(&mut self) -> io::Result<()> {
+        self.sync_data()
+    }
 }
 
 /// Read exactly `len` bytes, handing each chunk to `sink`.
@@ -55,6 +88,7 @@ fn pass_through(
     input: &mut dyn Input,
     len: u64,
     buf: &mut [u8],
+    progress: &mut Progress<'_>,
     sink: &mut dyn FnMut(&[u8]) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut left = len;
@@ -75,6 +109,7 @@ fn pass_through(
         }
         sink(&buf[..read])?;
         left -= read as u64;
+        progress.update(input.position());
     }
     Ok(())
 }
@@ -83,7 +118,12 @@ trait Input: Read {
     /// The number of image bytes read or skipped so far.
     fn position(&self) -> u64;
     /// Move forward to `target` without using the bytes in between.
-    fn skip_to(&mut self, target: u64, buf: &mut [u8]) -> Result<(), String>;
+    fn skip_to(
+        &mut self,
+        target: u64,
+        buf: &mut [u8],
+        progress: &mut Progress<'_>,
+    ) -> Result<(), String>;
 }
 
 fn distance(position: u64, target: u64) -> Result<u64, String> {
@@ -144,9 +184,14 @@ impl<R: Read> Input for Stream<R> {
         self.position
     }
 
-    fn skip_to(&mut self, target: u64, buf: &mut [u8]) -> Result<(), String> {
+    fn skip_to(
+        &mut self,
+        target: u64,
+        buf: &mut [u8],
+        progress: &mut Progress<'_>,
+    ) -> Result<(), String> {
         let len = distance(self.position, target)?;
-        pass_through(self, len, buf, &mut |_| Ok(()))
+        pass_through(self, len, buf, progress, &mut |_| Ok(()))
     }
 }
 
@@ -177,7 +222,12 @@ impl<R: Read + Seek> Input for Seekable<R> {
         self.position
     }
 
-    fn skip_to(&mut self, target: u64, _buf: &mut [u8]) -> Result<(), String> {
+    fn skip_to(
+        &mut self,
+        target: u64,
+        _buf: &mut [u8],
+        _progress: &mut Progress<'_>,
+    ) -> Result<(), String> {
         distance(self.position, target)?;
         self.inner
             .seek(SeekFrom::Start(target))
@@ -188,27 +238,39 @@ impl<R: Read + Seek> Input for Seekable<R> {
 }
 
 /// The source is read to its end, so a cut xz stream or data after the image
-/// is an error instead of a complete image.
-fn copy_stream<W: Write + Seek>(
+/// is an error instead of a complete image. With `sync_interval`, `output` is
+/// synced each time that many bytes were written since the last sync.
+fn copy_stream(
     bmap: &Bmap,
     input: &mut dyn Input,
-    output: &mut W,
+    output: &mut dyn Output,
+    progress: &mut Progress<'_>,
+    sync_interval: Option<u64>,
 ) -> Result<(), String> {
     let mut buf = vec![0u8; COPY_BUFFER_SIZE];
+    let mut unsynced: u64 = 0;
 
     for range in &bmap.ranges {
         let ByteRange { offset, len } = range.bytes;
-        input.skip_to(offset, &mut buf)?;
+        input.skip_to(offset, &mut buf, progress)?;
         output
             .seek(SeekFrom::Start(offset))
             .map_err(|e| format!("seeking destination: {e}"))?;
 
         let mut hasher = Sha256::new();
-        pass_through(input, len, &mut buf, &mut |chunk| {
+        pass_through(input, len, &mut buf, progress, &mut |chunk| {
             hasher.update(chunk);
             output
                 .write_all(chunk)
-                .map_err(|e| format!("writing destination: {e}"))
+                .map_err(|e| format!("writing destination: {e}"))?;
+            unsynced += chunk.len() as u64;
+            if sync_interval.is_some_and(|interval| unsynced >= interval) {
+                output
+                    .sync()
+                    .map_err(|e| format!("syncing destination: {e}"))?;
+                unsynced = 0;
+            }
+            Ok(())
         })?;
         if hasher.finalize()[..] != range.sha256 {
             return Err(format!(
@@ -218,7 +280,7 @@ fn copy_stream<W: Write + Seek>(
         }
     }
 
-    input.skip_to(bmap.image_size, &mut buf)?;
+    input.skip_to(bmap.image_size, &mut buf, progress)?;
     let extra = input
         .read(&mut buf[..1])
         .map_err(|e| format!("reading source: {e}"))?;
@@ -235,14 +297,38 @@ fn copy_stream<W: Write + Seek>(
 mod tests {
     use super::*;
     use crate::mode::flash::bmap::test_support::{
-        BLOCK_SIZE, FIXTURE_BMAP, FIXTURE_XZ, bmap_xml, image, xz,
+        BLOCK_SIZE, FIXTURE_BMAP, FIXTURE_XZ, PROGRESS_LABEL, bmap_xml, image, progress_lines, xz,
     };
     use lzma_rust2::{XzOptions, XzWriter};
     use std::io::Cursor;
+    use std::path::Path;
+
+    impl Output for Cursor<Vec<u8>> {
+        fn sync(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn quiet() -> Progress<'static> {
+        Progress::new(
+            Path::new("out"),
+            0,
+            Duration::MAX,
+            Box::new(|| Duration::ZERO),
+        )
+    }
+
+    fn copy_quietly(
+        bmap: &Bmap,
+        input: &mut dyn Input,
+        output: &mut dyn Output,
+    ) -> Result<(), String> {
+        copy_stream(bmap, input, output, &mut quiet(), None)
+    }
 
     fn copied(bmap: &Bmap, source: &[u8]) -> Result<Vec<u8>, String> {
         let mut out = Cursor::new(Vec::new());
-        copy_stream(bmap, &mut Stream::new(Cursor::new(source)), &mut out)?;
+        copy_quietly(bmap, &mut Stream::new(Cursor::new(source)), &mut out)?;
         Ok(out.into_inner())
     }
 
@@ -274,10 +360,10 @@ mod tests {
             Box::new(Seekable::new(Cursor::new(&data))),
         ];
         for mut input in inputs {
-            input.skip_to(6, &mut buf).unwrap();
+            input.skip_to(6, &mut buf, &mut quiet()).unwrap();
             assert_eq!(input.position(), 6);
-            input.skip_to(6, &mut buf).unwrap();
-            let err = input.skip_to(5, &mut buf).unwrap_err();
+            input.skip_to(6, &mut buf, &mut quiet()).unwrap();
+            let err = input.skip_to(5, &mut buf, &mut quiet()).unwrap_err();
             assert!(err.contains("cannot move back"), "{err}");
         }
     }
@@ -291,7 +377,7 @@ mod tests {
             read: 0,
         });
         let mut out = Cursor::new(Vec::new());
-        copy_stream(&bmap, &mut input, &mut out).unwrap();
+        copy_quietly(&bmap, &mut input, &mut out).unwrap();
 
         assert_eq!(input.inner.read, 2 * BLOCK_SIZE);
         let block = usize::try_from(BLOCK_SIZE).unwrap();
@@ -366,7 +452,7 @@ mod tests {
             let bmap = Bmap::parse(&bmap_xml(&image, &[(0, 2)])).unwrap();
             let compressed = xz(&image);
             let mut out = Cursor::new(Vec::new());
-            copy_stream(&bmap, &mut xz_stream(Trickle(&compressed)), &mut out)
+            copy_quietly(&bmap, &mut xz_stream(Trickle(&compressed)), &mut out)
                 .unwrap_or_else(|e| panic!("tail {tail}: {e}"));
             assert_eq!(out.into_inner(), image, "tail {tail}");
         }
@@ -385,7 +471,7 @@ mod tests {
             let compressed = writer.finish().unwrap();
 
             let mut out = Cursor::new(Vec::new());
-            copy_stream(&bmap, &mut xz_stream(Trickle(&compressed)), &mut out)
+            copy_quietly(&bmap, &mut xz_stream(Trickle(&compressed)), &mut out)
                 .unwrap_or_else(|e| panic!("tail {tail}: {e}"));
             assert_eq!(out.into_inner(), image, "tail {tail}");
         }
@@ -396,7 +482,7 @@ mod tests {
         let image = image(5, 100);
         let bmap = Bmap::parse(&bmap_xml(&image, &[(1, 1), (3, 5)])).unwrap();
         let mut out = Cursor::new(Vec::new());
-        copy_stream(&bmap, &mut Stream::new(Trickle(&image)), &mut out).unwrap();
+        copy_quietly(&bmap, &mut Stream::new(Trickle(&image)), &mut out).unwrap();
         let block = usize::try_from(BLOCK_SIZE).unwrap();
         assert_eq!(out.get_ref()[3 * block..], image[3 * block..]);
     }
@@ -472,7 +558,7 @@ mod tests {
         let decode = |dict_byte| {
             let compressed = with_dict_byte(xz(&image), dict_byte);
             let mut out = Cursor::new(Vec::new());
-            copy_stream(&bmap, &mut xz_stream(Cursor::new(compressed)), &mut out)
+            copy_quietly(&bmap, &mut xz_stream(Cursor::new(compressed)), &mut out)
         };
         decode(DICT_64_MIB).unwrap();
         let err = decode(DICT_96_MIB).unwrap_err();
@@ -548,6 +634,105 @@ mod tests {
         assert!(
             matches!(result, Err(FlashError::CopyFailed { .. })),
             "{result:?}"
+        );
+    }
+
+    /// Counts syncs; with `failing_sync`, every sync fails.
+    #[derive(Default)]
+    struct SyncCounting {
+        inner: Cursor<Vec<u8>>,
+        syncs: usize,
+        failing_sync: bool,
+    }
+
+    impl Write for SyncCounting {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl Seek for SyncCounting {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    impl Output for SyncCounting {
+        fn sync(&mut self) -> io::Result<()> {
+            self.syncs += 1;
+            if self.failing_sync {
+                return Err(io::Error::other("disk gone"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_output_is_synced_once_per_sync_interval() {
+        let image = image(5, 100);
+        let bmap = Bmap::parse(&bmap_xml(&image, &[(1, 1), (3, 5)])).unwrap();
+        let written = BLOCK_SIZE + 2 * BLOCK_SIZE + 100;
+        for (interval, syncs) in [(None, 0), (Some(BLOCK_SIZE), 3), (Some(written), 1)] {
+            let mut out = SyncCounting::default();
+            copy_stream(
+                &bmap,
+                &mut Stream::new(Trickle(&image)),
+                &mut out,
+                &mut quiet(),
+                interval,
+            )
+            .unwrap();
+            assert_eq!(out.syncs, syncs, "interval {interval:?}");
+        }
+    }
+
+    #[test]
+    fn a_failed_sync_is_an_error() {
+        let image = image(2, 0);
+        let bmap = Bmap::parse(&bmap_xml(&image, &[(0, 1)])).unwrap();
+        let mut out = SyncCounting {
+            failing_sync: true,
+            ..Default::default()
+        };
+        let err = copy_stream(
+            &bmap,
+            &mut Stream::new(Cursor::new(&image)),
+            &mut out,
+            &mut quiet(),
+            Some(BLOCK_SIZE),
+        )
+        .unwrap_err();
+        assert!(err.contains("syncing destination: disk gone"), "{err}");
+        assert_eq!(out.syncs, 1);
+    }
+
+    #[test]
+    fn an_unmapped_xz_tail_is_logged_while_it_is_decoded() {
+        let image = image(8, 0);
+        let bmap = Bmap::parse(&bmap_xml(&image, &[(0, 0)])).unwrap();
+        let lines = progress_lines(|| {
+            let mut progress = Progress::new(
+                Path::new(PROGRESS_LABEL),
+                bmap.image_size,
+                Duration::ZERO,
+                Box::new(|| Duration::ZERO),
+            );
+            copy_stream(
+                &bmap,
+                &mut xz_stream(Cursor::new(xz(&image))),
+                &mut Cursor::new(Vec::new()),
+                &mut progress,
+                None,
+            )
+            .unwrap();
+        });
+        assert!(
+            lines.last().is_some_and(|line| line.ends_with("(100%)")),
+            "{lines:?}"
         );
     }
 }

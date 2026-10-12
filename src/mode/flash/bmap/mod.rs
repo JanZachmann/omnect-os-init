@@ -5,6 +5,7 @@
 
 mod copy;
 mod parse;
+mod progress;
 
 use std::fs::File;
 use std::io::Read;
@@ -126,6 +127,23 @@ mod test_support {
     use crate::mode::flash::bmap::SHA256_LEN;
 
     pub(super) const BLOCK_SIZE: u64 = 4096;
+
+    /// Progress tests log under this destination, so they find their own
+    /// lines in the global capture.
+    pub(super) const PROGRESS_LABEL: &str = "progress-test";
+
+    pub(super) fn progress_lines(run: impl FnOnce()) -> Vec<String> {
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::logging::capture::install_test_logger();
+        crate::logging::start_capture();
+        run();
+        crate::logging::take_capture()
+            .into_iter()
+            .filter(|line| line.contains(PROGRESS_LABEL))
+            .collect()
+    }
 
     /// A bmap in bmaptool's layout, with a correct file checksum.
     pub(super) fn bmap_xml(image: &[u8], blocks: &[(u64, u64)]) -> String {
