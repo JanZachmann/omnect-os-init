@@ -180,7 +180,7 @@ impl UrlOps for RealUrlOps {
     }
 
     fn bring_up_network(&mut self) -> Result<(), FlashError> {
-        net::bring_up().map(|_| ())
+        net::bring_up(net::Ipv4Need::Lease).map(|_| ())
     }
 
     /// The error names the redacted URL, because the arguments and the full

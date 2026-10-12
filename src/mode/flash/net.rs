@@ -36,6 +36,39 @@ const NET_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 const IP_LINK_ARGS: [&str; 4] = ["link", "set", FLASH_INTERFACE, "up"];
 
+/// The IPv4 address a mode waits for.
+#[derive(Clone, Copy)]
+pub(crate) enum Ipv4Need {
+    /// Any address, also the link-local one dhcpcd sets without a DHCP
+    /// server: a peer on the same cable can reach it.
+    #[cfg(feature = "flash-mode-2")]
+    AnyAddress,
+    /// A link-local address has no route and no DNS.
+    #[cfg(feature = "flash-mode-3")]
+    Lease,
+}
+
+impl Ipv4Need {
+    #[cfg_attr(not(feature = "flash-mode-3"), allow(unused_variables))]
+    fn accepts(self, ip: Ipv4Addr) -> bool {
+        match self {
+            #[cfg(feature = "flash-mode-2")]
+            Self::AnyAddress => true,
+            #[cfg(feature = "flash-mode-3")]
+            Self::Lease => !ip.is_link_local(),
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            #[cfg(feature = "flash-mode-2")]
+            Self::AnyAddress => "an IPv4 address",
+            #[cfg(feature = "flash-mode-3")]
+            Self::Lease => "a DHCP lease",
+        }
+    }
+}
+
 trait NetOps {
     /// An error means "try again later".
     fn link_up(&mut self) -> Result<(), FlashError>;
@@ -85,9 +118,9 @@ impl NetOps for RealNetOps {
     }
 }
 
-fn ipv4_of(addrs: &[(String, Option<IpAddr>)], iface: &str) -> Option<Ipv4Addr> {
+fn ipv4_of(addrs: &[(String, Option<IpAddr>)], iface: &str, need: Ipv4Need) -> Option<Ipv4Addr> {
     addrs.iter().find_map(|(name, ip)| match ip {
-        Some(IpAddr::V4(v4)) if name == iface => Some(*v4),
+        Some(IpAddr::V4(v4)) if name == iface && need.accepts(*v4) => Some(*v4),
         _ => None,
     })
 }
@@ -129,6 +162,7 @@ fn wait_for<T>(
 
 fn bring_up_with(
     ops: &mut dyn NetOps,
+    need: Ipv4Need,
     up_timeout: Duration,
     address_timeout: Duration,
     interval: Duration,
@@ -143,16 +177,17 @@ fn bring_up_with(
     ops.run_dhcpcd()?;
     wait_for(
         ops,
-        &format!("an IPv4 address on {FLASH_INTERFACE}"),
+        &format!("{} on {FLASH_INTERFACE}", need.describe()),
         address_timeout,
         interval,
-        |ops| Ok(ipv4_of(&ops.addresses()?, FLASH_INTERFACE)),
+        |ops| Ok(ipv4_of(&ops.addresses()?, FLASH_INTERFACE, need)),
     )
 }
 
-pub(crate) fn bring_up() -> Result<Ipv4Addr, FlashError> {
+pub(crate) fn bring_up(need: Ipv4Need) -> Result<Ipv4Addr, FlashError> {
     let ip = bring_up_with(
         &mut RealNetOps,
+        need,
         INTERFACE_UP_TIMEOUT,
         DHCP_ADDRESS_TIMEOUT,
         NET_POLL_INTERVAL,
@@ -189,6 +224,10 @@ mod tests {
 
     const ZERO: Duration = Duration::ZERO;
     const STEP: Duration = Duration::from_secs(1);
+    #[cfg(feature = "flash-mode-2")]
+    const NEED: Ipv4Need = Ipv4Need::AnyAddress;
+    #[cfg(not(feature = "flash-mode-2"))]
+    const NEED: Ipv4Need = Ipv4Need::Lease;
 
     fn addr(name: &str, ip: Option<&str>) -> (String, Option<IpAddr>) {
         (name.to_string(), ip.map(|s| s.parse().unwrap()))
@@ -201,19 +240,59 @@ mod tests {
             addr("eth0", Some("fe80::1")),
             addr("eth0", Some("192.168.1.5")),
         ];
-        assert_eq!(ipv4_of(&addrs, "eth0"), Some(Ipv4Addr::new(192, 168, 1, 5)));
+        assert_eq!(
+            ipv4_of(&addrs, "eth0", NEED),
+            Some(Ipv4Addr::new(192, 168, 1, 5))
+        );
     }
 
     #[test]
     fn ipv4_of_is_none_for_an_ipv6_only_interface() {
         let addrs = [addr("eth0", Some("fe80::1")), addr("eth0", None)];
-        assert_eq!(ipv4_of(&addrs, "eth0"), None);
+        assert_eq!(ipv4_of(&addrs, "eth0", NEED), None);
     }
 
     #[test]
     fn ipv4_of_is_none_when_only_lo_has_an_address() {
         let addrs = [addr("lo", Some("127.0.0.1"))];
-        assert_eq!(ipv4_of(&addrs, "eth0"), None);
+        assert_eq!(ipv4_of(&addrs, "eth0", NEED), None);
+    }
+
+    #[cfg(feature = "flash-mode-2")]
+    #[test]
+    fn mode_2_accepts_a_link_local_address() {
+        let addrs = [addr("eth0", Some("169.254.3.4"))];
+        assert_eq!(
+            ipv4_of(&addrs, "eth0", Ipv4Need::AnyAddress),
+            Some(Ipv4Addr::new(169, 254, 3, 4))
+        );
+    }
+
+    #[cfg(feature = "flash-mode-3")]
+    #[test]
+    fn mode_3_waits_for_a_lease_past_a_link_local_address() {
+        let only_link_local = [addr("eth0", Some("169.254.3.4"))];
+        assert_eq!(ipv4_of(&only_link_local, "eth0", Ipv4Need::Lease), None);
+        let both = [
+            addr("eth0", Some("169.254.3.4")),
+            addr("eth0", Some("10.0.0.7")),
+        ];
+        assert_eq!(
+            ipv4_of(&both, "eth0", Ipv4Need::Lease),
+            Some(Ipv4Addr::new(10, 0, 0, 7))
+        );
+    }
+
+    #[cfg(feature = "flash-mode-3")]
+    #[test]
+    fn mode_3_times_out_without_a_lease() {
+        let _guard = serialized();
+        let mut ops = FakeNetOps {
+            address_misses: usize::MAX,
+            ..Default::default()
+        };
+        let err = bring_up_with(&mut ops, Ipv4Need::Lease, ZERO, STEP, STEP).unwrap_err();
+        assert!(err.to_string().contains("a DHCP lease on eth0"), "{err}");
     }
 
     /// The log capture is global, so a test that logs "still waiting" must not
@@ -276,7 +355,7 @@ mod tests {
             address_misses: 1,
             ..Default::default()
         };
-        let ip = bring_up_with(&mut ops, STEP * 5, STEP * 5, STEP).unwrap();
+        let ip = bring_up_with(&mut ops, NEED, STEP * 5, STEP * 5, STEP).unwrap();
         assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 7));
         assert_eq!(
             ops.calls,
@@ -301,7 +380,7 @@ mod tests {
             address_errors: 2,
             ..Default::default()
         };
-        let ip = bring_up_with(&mut ops, STEP * 5, STEP * 5, STEP).unwrap();
+        let ip = bring_up_with(&mut ops, NEED, STEP * 5, STEP * 5, STEP).unwrap();
         assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 7));
         assert_eq!(ops.calls.iter().filter(|c| *c == "sleep").count(), 2);
     }
@@ -313,7 +392,7 @@ mod tests {
             link_failures: usize::MAX,
             ..Default::default()
         };
-        let err = bring_up_with(&mut ops, STEP * 2, STEP, STEP).unwrap_err();
+        let err = bring_up_with(&mut ops, NEED, STEP * 2, STEP, STEP).unwrap_err();
         assert!(matches!(err, FlashError::NetworkFailed(_)), "{err}");
         assert_eq!(
             ops.calls,
@@ -328,7 +407,7 @@ mod tests {
             address_misses: usize::MAX,
             ..Default::default()
         };
-        let err = bring_up_with(&mut ops, ZERO, STEP, STEP).unwrap_err();
+        let err = bring_up_with(&mut ops, NEED, ZERO, STEP, STEP).unwrap_err();
         assert!(matches!(err, FlashError::NetworkFailed(_)), "{err}");
         assert_eq!(ops.calls.iter().filter(|c| *c == "dhcpcd").count(), 1);
         assert_eq!(ops.calls.iter().filter(|c| *c == "addresses").count(), 2);
@@ -338,7 +417,7 @@ mod tests {
         let _guard = serialized();
         crate::logging::capture::install_test_logger();
         crate::logging::start_capture();
-        bring_up_with(ops, timeout, timeout, STEP).unwrap_err();
+        bring_up_with(ops, NEED, timeout, timeout, STEP).unwrap_err();
         crate::logging::take_capture()
             .into_iter()
             .filter(|line| line.contains("still waiting"))

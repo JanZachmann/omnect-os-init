@@ -222,7 +222,7 @@ impl ScpOps for RealScpOps {
     }
 
     fn bring_up_network(&mut self) -> Result<Ipv4Addr, FlashError> {
-        net::bring_up()
+        net::bring_up(net::Ipv4Need::AnyAddress)
     }
 
     fn start_dropbear(&mut self) -> Result<(), FlashError> {

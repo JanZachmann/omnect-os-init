@@ -562,6 +562,9 @@ target disk, by sweeping `/proc/mounts`.
 Restricted to `eth0`, as in legacy. Retry `ip link set eth0 up` until it
 succeeds — the interface may be probed late, e.g. a USB NIC — then start
 `dhcpcd eth0` and wait for an IPv4 address. Both waits are bounded (§7). Mode 2
+accepts the IPv4LL address `dhcpcd` sets without a DHCP server, so a peer on
+the same cable can reach it. Mode 3 waits for a DHCP lease, because an IPv4LL
+address has no route and no DNS. Mode 2
 additionally creates and mounts `devpts` at `/dev/pts`, creates `/etc/dropbear`
 and starts `dropbear -R`, generating the host key at runtime.
 
@@ -866,6 +869,8 @@ Behaviour changes, as opposed to bug fixes:
   image, and with the timeouts of §7;
 - mode 3 logs the URLs without user info, query string and fragment; legacy
   echoed them in full (§5.3);
+- mode 3 waits for a DHCP lease and does not start with an IPv4LL address
+  (§5.2);
 - the EFI loader is passed to `efibootmgr` as `\EFI\BOOT\bootx64.efi`. The
   legacy script's unquoted `\\\\EFI\\\\BOOT` reached it as
   `\\EFI\\BOOT\\bootx64.efi`. Whether the firmware treats both the same is
