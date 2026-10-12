@@ -1,6 +1,9 @@
 #[cfg(feature = "flash-mode-1")]
 use std::path::PathBuf;
 
+#[cfg(feature = "flash-mode-3")]
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashMode {
     #[cfg(feature = "flash-mode-1")]
@@ -110,12 +113,10 @@ pub(crate) fn parse_devpath(value: Option<&str>) -> Devpath {
 /// `echo | base64` encoder adds a newline.
 #[cfg(feature = "flash-mode-3")]
 pub(crate) fn parse_url(value: Option<&str>) -> EnvUrl {
-    use base64::Engine;
-
     let Some(encoded) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return EnvUrl::NotSet;
     };
-    let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
+    let decoded = match BASE64.decode(encoded) {
         Ok(bytes) => bytes,
         Err(e) => return EnvUrl::Invalid(format!("not base64: {e}")),
     };
@@ -172,12 +173,11 @@ mod tests {
     #[cfg(feature = "flash-mode-3")]
     mod mode_3 {
         use super::*;
-        use base64::Engine;
 
         const URL: &str = "https://example.invalid/images/omnect.wic.xz?sv=2024&sig=secret";
 
-        fn encoded(text: &str) -> String {
-            base64::engine::general_purpose::STANDARD.encode(text)
+        fn encoded(text: impl AsRef<[u8]>) -> String {
+            BASE64.encode(text)
         }
 
         #[test]
@@ -187,7 +187,7 @@ mod tests {
 
         #[test]
         fn the_newline_of_an_echo_encoder_is_trimmed() {
-            let value = format!(" {}\n", encoded(&format!("{URL}\n")));
+            let value = format!(" {}\n", encoded(format!("{URL}\n")));
             assert_eq!(parse_url(Some(&value)), EnvUrl::Set(URL.to_string()));
         }
 
@@ -200,8 +200,11 @@ mod tests {
 
         #[test]
         fn unusable_values_are_invalid() {
-            let not_utf8 = base64::engine::general_purpose::STANDARD.encode([0xff_u8, 0xfe]);
-            for value in ["not base64!!".to_string(), encoded("  \n"), not_utf8] {
+            for value in [
+                "not base64!!".to_string(),
+                encoded("  \n"),
+                encoded([0xff_u8, 0xfe]),
+            ] {
                 assert!(
                     matches!(parse_url(Some(&value)), EnvUrl::Invalid(_)),
                     "{value:?}"

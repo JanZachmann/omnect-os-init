@@ -16,7 +16,7 @@ name = "omnect-os-init"
 path = "src/main.rs"
 
 [dependencies]
-base64 = { version = "0.22", default-features = false, features = ["std"], optional = true }
+base64 = { version = "0.22", default-features = false, features = ["alloc"], optional = true }
 hex = { version = "0.4", default-features = false, features = ["alloc"], optional = true }
 log = { version = "0.4", default-features = false, features = ["std"] }
 # TODO: remove me, as soon as lzma-rust2 1.0 is released: until then a 0.x

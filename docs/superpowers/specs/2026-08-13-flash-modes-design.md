@@ -71,9 +71,9 @@ U-Boot writeable-variable whitelist: `flash-mode:dw` and
 
 ### 2.2 Clear-trigger-first invariant
 
-Every mode clears `flash-mode` before doing any work, together with the keys
-detection read for it: `flash-mode-devpath` for mode 1, the two URL keys for
-mode 3. A crash or power loss mid-flash then
+Every mode clears `flash-mode` before doing any work, together with every other
+flash key the build has: `flash-mode-devpath` with mode 1, the two URL keys
+with mode 3. A crash or power loss mid-flash then
 leads to a normal boot attempt, never to an endless re-entry into flash mode.
 This matches the factory-reset precedent.
 
@@ -140,16 +140,20 @@ src/mode/flash/
   clone.rs      mode 1 orchestration                                     flash-mode-1
   sfdisk.rs     partition-table dump parsing and rewriting      (pure)   flash-mode-1
   rawio.rs      in-process replacement for every `dd` call               flash-mode, per item
-  unmount.rs    rootfs unmount, /proc/mounts sweep                       flash-mode
-  net.rs        interface up, dhcpcd, dropbear                           flash-mode-2/3
-  bmap/         bmap parser and in-process flasher                       flash-mode-2/3
+  unmount.rs    rootfs unmount; /proc/mounts sweep                       flash-mode; sweep flash-mode-network
+  net.rs        interface up, dhcpcd; dropbear                           flash-mode-network; dropbear flash-mode-2
+  xz/           xz decoder; xz index size reader                         flash-mode-network; reader flash-mode-3
+  bmap/         bmap parser and in-process flasher                       flash-mode-2
   scp.rs        mode 2 orchestration                                     flash-mode-2
   url.rs        mode 3 orchestration                                     flash-mode-3
 ```
 
 The right column is the gating feature (§3.6). In `rawio.rs` each item is gated
 on the modes that use it: `copy_range` on `flash-mode-1`, `zero_range` on
-`flash-mode-2`, the shared constants on `flash-mode`. The device-number helpers
+`flash-mode-2`, the KB and byte-range helpers on `flash-mode-1` or
+`flash-mode-2`, `device_len` and the partition-table re-read on
+`flash-mode-network`, `COPY_BUFFER_SIZE` and `open_existing_for_write` on
+`flash-mode`. The device-number helpers
 (`block_devnum`, `whole_disk_devnum`) are in `partition/device.rs`, gated on
 `flash-mode`, and shared by the mode 1 refusal and the §5.1 sweep.
 
@@ -250,11 +254,12 @@ The remaining tools stay external because no pure-Rust equivalent exists at a
 dependency weight an initramfs can carry: `sfdisk` (partition tables),
 `e2image`, `mkfs.ext4` and `tune2fs` (ext4), `efibootmgr` (EFI variables), `curl`, `dhcpcd` and `dropbear`.
 
-Eight operations the legacy scripts shell out for are done in-process instead.
+Eleven operations the legacy scripts shell out for are done in-process instead.
 Five use `nix`, which is already a dependency; `getifaddrs` needs its `net`
 feature, the others are enabled already. `uuidgen` needs the new `uuid` crate;
 `dd` needs nothing; `bmaptool copy` needs `hex`, `lzma-rust2`, `quick-xml` and
-`sha2`; mode 3 adds `base64`:
+`sha2`; the three mode 3 operations reuse `lzma-rust2` and `sha2` and add
+`base64`:
 
 | Legacy | In-process |
 |---|---|
@@ -572,14 +577,16 @@ Child processes get an explicit `PATH`: PID 1 has no login environment, and
    all three keys first (§2.2), then fails on an unusable URL.
 2. Unmount (§5.1), network up (§5.2).
 3. Download the sha256 file, then the image, into `/tmp/flash-mode-3` in
-   initramfs RAM, with `curl --fail --no-progress-meter --location`, a 30 s
-   connect timeout and an abort when the transfer stays below 1 byte/s for
-   60 s. Add `--insecure` when the build has no `rtc` feature: without a
+   initramfs RAM, with `curl --fail --no-progress-meter --location --globoff`,
+   a 30 s connect timeout and an abort when the transfer stays below 1 byte/s
+   for 60 s. The URL is passed with `--url`, so a URL that starts with `-` is
+   still a URL. Add `--insecure` when the build has no `rtc` feature: without a
    reliable clock, certificate validity cannot be checked. The recipe maps
    `MACHINE_FEATURES` `rtc` onto the feature, so the choice is made at build
    time.
 4. Hash the image with `sha2` in `COPY_BUFFER_SIZE` chunks and compare it with
-   the first field of the sha256 file.
+   the first field of the sha256 file. A sha256 file larger than 4 KiB or not
+   UTF-8 is refused as `InvalidImage`: it comes from a wrong URL.
 5. Read the uncompressed size from the xz index and refuse an image larger than
    the disk. The reader accepts exactly one xz stream; it is own code until
    `lzma-rust2` reports the size itself.

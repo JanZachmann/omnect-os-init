@@ -9,7 +9,8 @@ const HEADER_FLAGS_AT: usize = STREAM_HEADER_MAGIC.len();
 const FOOTER_BACKWARD_SIZE_AT: usize = 4;
 const FOOTER_FLAGS_AT: usize = 8;
 const INDEX_INDICATOR: u8 = 0x00;
-/// Blocks, the index and the backward size are counted in units of 4 bytes.
+/// Blocks and the index are padded to a multiple of 4 bytes, and the backward
+/// size counts in units of 4 bytes.
 const XZ_ALIGNMENT: u64 = 4;
 const MAX_NUMBER_LEN: u32 = 9;
 const NUMBER_PAYLOAD_BITS: u32 = 7;

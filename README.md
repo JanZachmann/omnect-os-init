@@ -377,6 +377,7 @@ cargo test --no-default-features --features core,uboot,gpt,flash-mode-3,rtc,test
 # Flash modes together
 cargo test --features uboot,gpt,flash-mode-1,flash-mode-2,factory-reset,test-utils
 cargo test --no-default-features --features core,uboot,gpt,flash-mode-2,flash-mode-3,test-utils
+cargo test --features uboot,gpt,flash-mode-3,factory-reset,test-utils
 cargo test --features grub,gpt,flash-mode-1,flash-mode-2,flash-mode-3,factory-reset,test-utils
 
 # Lint without --tests too: dev-dependencies enable crate features that the

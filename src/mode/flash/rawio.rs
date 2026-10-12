@@ -169,8 +169,6 @@ pub fn zero_range(dst: &Path, range: &ByteRange) -> Result<(), FlashError> {
     dst_file.sync_all().map_err(io_failed)
 }
 
-/// Make the kernel re-read the partition table of `disk`. Fails while any
-/// partition of `disk` is mounted.
 #[cfg(feature = "flash-mode-network")]
 pub(crate) fn device_len(disk: &Path) -> Result<u64, FlashError> {
     File::open(disk)
@@ -181,6 +179,8 @@ pub(crate) fn device_len(disk: &Path) -> Result<u64, FlashError> {
         })
 }
 
+/// Make the kernel re-read the partition table of `disk`. Fails while any
+/// partition of `disk` is mounted.
 #[cfg(feature = "flash-mode-network")]
 pub fn reread_partition_table(disk: &Path) -> Result<(), FlashError> {
     let io_failed = |source| FlashError::PathIo {

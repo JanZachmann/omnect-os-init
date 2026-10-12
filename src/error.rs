@@ -396,7 +396,7 @@ pub enum FlashError {
     #[error("Network setup failed: {0}")]
     NetworkFailed(String),
 
-    /// `url` carries no query string, which can hold an access token.
+    /// `url` is redacted, because the full URL can hold an access token.
     #[cfg(feature = "flash-mode-3")]
     #[error("Download of {url} failed: {reason}")]
     DownloadFailed { url: String, reason: String },

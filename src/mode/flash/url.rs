@@ -20,11 +20,14 @@ use crate::partition::PartitionLayout;
 use crate::partition::PartitionName;
 
 const CURL_CMD: &str = "/usr/bin/curl";
-const CURL_FLAGS: [&str; 3] = ["--fail", "--no-progress-meter", "--location"];
+/// `--globoff`: brackets and braces in a URL are literal characters.
+const CURL_FLAGS: [&str; 4] = ["--fail", "--no-progress-meter", "--location", "--globoff"];
 const CURL_CONNECT_TIMEOUT_FLAG: &str = "--connect-timeout";
 const CURL_SPEED_LIMIT_FLAG: &str = "--speed-limit";
 const CURL_SPEED_TIME_FLAG: &str = "--speed-time";
 const CURL_OUTPUT_FLAG: &str = "--output";
+/// Marks the next argument as the URL, also when it starts with `-`.
+const CURL_URL_FLAG: &str = "--url";
 /// Without a reliable clock, the validity of a certificate cannot be checked.
 #[cfg(not(feature = "rtc"))]
 const CURL_INSECURE_FLAG: &str = "--insecure";
@@ -34,10 +37,15 @@ const CURL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CURL_STALL_SPEED: u32 = 1;
 const CURL_STALL_TIME: Duration = Duration::from_secs(60);
 
+const SCHEME_SEPARATOR: &str = "://";
+
 const DOWNLOAD_DIR: &str = "/tmp/flash-mode-3";
 const IMAGE_FILE_NAME: &str = "wic.xz";
 const SHA256_FILE_NAME: &str = "wic.xz.sha256";
 const SHA256_LEN: usize = 32;
+/// Room for a digest and a long file name. A larger file comes from a wrong
+/// URL, and reading it whole would hold a second copy of it in RAM.
+const MAX_SHA256_FILE_LEN: u64 = 4096;
 
 pub(crate) struct UrlCtx<'a> {
     pub(crate) layout: &'a PartitionLayout,
@@ -50,14 +58,15 @@ pub(crate) struct UrlCtx<'a> {
 /// credentials or an access token, so it can go to kmsg and the run log.
 fn redacted(url: &str) -> String {
     let url = url.split(['?', '#']).next().unwrap_or(url);
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
-    };
+    // curl also takes a URL without a scheme, user info included.
+    let (scheme, rest) = url
+        .find(SCHEME_SEPARATOR)
+        .map_or(("", url), |at| url.split_at(at + SCHEME_SEPARATOR.len()));
     let (authority, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
     let host = authority
         .rsplit_once('@')
         .map_or(authority, |(_, host)| host);
-    format!("{scheme}://{host}{path}")
+    format!("{scheme}{host}{path}")
 }
 
 fn curl_args(url: &str, target: &Path) -> Vec<OsString> {
@@ -73,6 +82,7 @@ fn curl_args(url: &str, target: &Path) -> Vec<OsString> {
         CURL_STALL_TIME.as_secs().to_string().into(),
         CURL_OUTPUT_FLAG.into(),
         target.into(),
+        CURL_URL_FLAG.into(),
         url.into(),
     ]);
     args
@@ -89,6 +99,26 @@ fn expected_sha256(sha256_file: &str) -> Result<[u8; SHA256_LEN], String> {
     hex::decode_to_slice(field, &mut digest)
         .map_err(|e| format!("'{field}' is not a sha256 digest: {e}"))?;
     Ok(digest)
+}
+
+fn read_sha256_file(path: &Path) -> Result<String, FlashError> {
+    let invalid = |reason: String| FlashError::InvalidImage {
+        path: path.to_path_buf(),
+        reason,
+    };
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(MAX_SHA256_FILE_LEN + 1).read_to_end(&mut bytes))
+        .map_err(|source| FlashError::PathIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_SHA256_FILE_LEN {
+        return Err(invalid(format!(
+            "the sha256 file is larger than {MAX_SHA256_FILE_LEN} bytes"
+        )));
+    }
+    String::from_utf8(bytes).map_err(|_| invalid("the sha256 file is not UTF-8 text".to_string()))
 }
 
 fn sha256_of(path: &Path) -> Result<[u8; SHA256_LEN], FlashError> {
@@ -183,8 +213,8 @@ impl UrlOps for RealUrlOps {
         net::bring_up().map(|_| ())
     }
 
-    /// The error names neither the arguments nor the full URL, which can hold
-    /// an access token.
+    /// The error names the redacted URL, because the arguments and the full
+    /// URL can hold an access token.
     fn download(&mut self, url: &str, target: &Path) -> Result<(), FlashError> {
         let failed = |reason: String| FlashError::DownloadFailed {
             url: redacted(url),
@@ -207,10 +237,7 @@ impl UrlOps for RealUrlOps {
     }
 
     fn read_sha256_file(&mut self, path: &Path) -> Result<String, FlashError> {
-        fs::read_to_string(path).map_err(|source| FlashError::PathIo {
-            path: path.to_path_buf(),
-            source,
-        })
+        read_sha256_file(path)
     }
 
     fn sha256_of(&mut self, path: &Path) -> Result<[u8; SHA256_LEN], FlashError> {
@@ -373,6 +400,7 @@ mod tests {
         assert_eq!(redacted("https://user:pass@host/a"), "https://host/a");
         assert_eq!(redacted("https://user:pass@host"), "https://host");
         assert_eq!(redacted("host/a?sig=secret"), "host/a");
+        assert_eq!(redacted("user:pass@host/a?sig=secret"), "host/a");
     }
 
     #[test]
@@ -392,6 +420,7 @@ mod tests {
         assert_eq!(after(CURL_SPEED_LIMIT_FLAG), "1");
         assert_eq!(after(CURL_SPEED_TIME_FLAG), "60");
         assert_eq!(after(CURL_OUTPUT_FLAG), "/tmp/wic.xz");
+        assert_eq!(after(CURL_URL_FLAG), IMAGE_URL);
         assert_eq!(args.last().unwrap(), IMAGE_URL);
     }
 
@@ -427,6 +456,33 @@ mod tests {
         ] {
             assert!(expected_sha256(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_sha256_file_is_read_up_to_its_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SHA256_FILE_NAME);
+        let line = sha256_line(IMAGE);
+        fs::write(&path, &line).unwrap();
+        assert_eq!(read_sha256_file(&path).unwrap(), line);
+
+        let limit = usize::try_from(MAX_SHA256_FILE_LEN).unwrap();
+        fs::write(&path, vec![b'a'; limit]).unwrap();
+        assert!(read_sha256_file(&path).is_ok());
+
+        fs::write(&path, vec![b'a'; limit + 1]).unwrap();
+        let err = read_sha256_file(&path).unwrap_err();
+        assert!(
+            matches!(&err, FlashError::InvalidImage { reason, .. } if reason.contains("larger than")),
+            "{err}"
+        );
+        assert!(keeps_log(&Err(err)));
+
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(matches!(
+            read_sha256_file(&path),
+            Err(FlashError::InvalidImage { .. })
+        ));
     }
 
     #[test]
@@ -702,6 +758,34 @@ mod tests {
             let (result, calls) = run_recorded(ops);
             assert!(result.is_err());
             assert!(calls.iter().all(|c| !c.starts_with("write ")), "{calls:?}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_image_size_stops_before_the_write() {
+        let mut ops = RecordingUrlOps::new();
+        ops.faults.push(Fault {
+            step: "size of",
+            passes: 0,
+        });
+        let (result, calls) = run_recorded(ops);
+        let err = result.unwrap_err();
+        assert!(keeps_log(&Err(err)));
+        assert_eq!(
+            calls.last().unwrap(),
+            "size of /tmp/flash-mode-3/wic.xz",
+            "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_unmount_or_network_stops_before_any_download() {
+        for step in ["unmount", "network"] {
+            let mut ops = RecordingUrlOps::new();
+            ops.faults.push(Fault { step, passes: 0 });
+            let (result, calls) = run_recorded(ops);
+            assert!(result.is_err(), "{step}");
+            assert!(calls.last().unwrap().starts_with(step), "{calls:?}");
         }
     }
 
