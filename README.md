@@ -310,12 +310,12 @@ time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
 | `/etc/omnect/grubenv.in` | `flash-mode-1` with `grub` | `grub-env` |
 | `/etc/omnect/uboot-env.bin` | `flash-mode-1` with `uboot` | image recipe (`add_uboot_env`) |
 | `/sbin/ip` | `flash-mode-2`, `flash-mode-3` | `busybox` |
-| `/sbin/dhcpcd` | `flash-mode-2`, `flash-mode-3` | `dhcpcd` |
+| `/sbin/dhcpcd` | `flash-mode-2`, `flash-mode-3` | `dhcpcd`, `base-passwd` for its system user |
 | `/sbin/dropbear` | `flash-mode-2` | `dropbear` |
 | `omnect` user and `/home/omnect` | `flash-mode-2` | image recipe (`inherit omnect_user`) |
 | `devpts` filesystem | `flash-mode-2` | kernel (`CONFIG_UNIX98_PTYS`) |
 | `/usr/bin/curl` | `flash-mode-3` | `curl` |
-| CA certificates | `flash-mode-3` with `rtc` | `ca-certificates` |
+| CA certificates | `flash-mode-3`, checked only with `rtc` | `ca-certificates` |
 
 ## Testing
 

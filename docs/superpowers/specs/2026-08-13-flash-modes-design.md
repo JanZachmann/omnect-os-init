@@ -1083,8 +1083,9 @@ Implemented separately, listed here so nothing is lost:
   inherited for mode 2. The Rust image does not install them while the modes
   are not ported;
 - neither mode needs `bmaptool` or `xz` in the Rust initramfs (§5.3, §5.4).
-  Mode 3 needs `dhcpcd` and `curl`, and on a machine with `rtc` the CA
-  certificates `curl` checks against;
+  Mode 3 needs `dhcpcd`, `base-passwd` for the `dhcpcd` system user, `curl`
+  and `ca-certificates`. libcurl recommends the CA bundle, so it is installed
+  on every machine; `curl` checks against it only with `rtc`;
 - when mode 2 or 3 is ported, remove the "does not implement flash mode N yet"
   note from that mode's section in the meta-omnect `README.md`, and check its
   console output example and behaviour notes against the port
