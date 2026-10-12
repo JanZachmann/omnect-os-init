@@ -22,10 +22,7 @@ Implemented functionality:
 - **Factory reset (modes 1-3)**: Selective-preserve backup → wipe `data`/`etc` (modes 2 and 3 only) → reformat → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
 - **Flash mode 1**: Clones the running disk onto another block device given by the `flash-mode-devpath` bootloader env key, triggered by `flash-mode`; powers off on success so the clone can be moved to its own device (feature `flash-mode-1`, part of the default feature set)
 - **Flash mode 2**: Brings up `eth0` with DHCP and starts `dropbear`; the operator pushes a bmap and a `wic.xz` with `scp`, and the init checks the bmap and flashes the image onto the running disk; a failed attempt asks for both again. Triggered by `flash-mode=2` in the bootloader env or by the flag file `/etc/enforce_flash_mode` (feature `flash-mode-2`). Mode 2 wins over a `factory-reset` set at the same time: the reset does not run and an error is logged, with no further handling
-
-Not yet implemented (planned):
-
-- Flash mode 3 (HTTP/HTTPS download)
+- **Flash mode 3**: Brings up `eth0` with DHCP, downloads a `wic.xz` and its sha256 file from the base64 URLs in `flash-mode-url` and `flash-mode-url-sha256`, checks the image and flashes it onto the running disk. Triggered by `flash-mode=3` (feature `flash-mode-3`). Like mode 2, it wins over a `factory-reset` set at the same time
 
 ## Startup Flow
 
@@ -265,7 +262,9 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 | `flash-mode-1` | Disk cloning (part of the default feature set) | Implemented |
 | `flash-mode-2` | Flash a `wic.xz` pushed in over `scp` | Implemented |
 | `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream. A broken image is seen only after writing started; the init then asks for bmap and image again, and the disk does not boot until a good one was flashed | Implemented |
-| `flash-mode-3` | HTTP/HTTPS flashing | Planned |
+| `flash-mode-3` | Flash a `wic.xz` downloaded from a URL | Implemented |
+| `flash-mode-network` | Shared layer of modes 2 and 3: network, unmount sweep, xz decoding. Pulled in by a mode feature, never selected on its own | Implemented |
+| `rtc` | The machine has a reliable real-time clock. Without it, mode 3 does not check TLS certificates, because their validity depends on the time | Implemented |
 
 > **Note:** `grub` and `uboot` are mutually exclusive, and so are `gpt` and `dos`.
 > Exactly one of each pair must be set at build time — `build.rs` panics otherwise.
@@ -306,15 +305,17 @@ time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
 | `sgdisk`, `parted`, `resize2fs` | `resize-data` | `gptfdisk`, `parted`, `e2fsprogs-resize2fs` |
 | `sfdisk` | `flash-mode-1` | `util-linux-sfdisk` |
 | `e2image` | `flash-mode-1` | `e2fsprogs` |
-| `efibootmgr` | `flash-mode-1`, `flash-mode-2` on EFI machines | `efibootmgr` |
-| `efivarfs` filesystem | `flash-mode-1`, `flash-mode-2` on EFI machines | kernel (`CONFIG_EFIVAR_FS`) |
+| `efibootmgr` | `flash-mode-1`, `flash-mode-2`, `flash-mode-3` on EFI machines | `efibootmgr` |
+| `efivarfs` filesystem | `flash-mode-1`, `flash-mode-2`, `flash-mode-3` on EFI machines | kernel (`CONFIG_EFIVAR_FS`) |
 | `/etc/omnect/grubenv.in` | `flash-mode-1` with `grub` | `grub-env` |
 | `/etc/omnect/uboot-env.bin` | `flash-mode-1` with `uboot` | image recipe (`add_uboot_env`) |
-| `/sbin/ip` | `flash-mode-2` | `busybox` |
-| `/sbin/dhcpcd` | `flash-mode-2` | `dhcpcd` |
+| `/sbin/ip` | `flash-mode-2`, `flash-mode-3` | `busybox` |
+| `/sbin/dhcpcd` | `flash-mode-2`, `flash-mode-3` | `dhcpcd` |
 | `/sbin/dropbear` | `flash-mode-2` | `dropbear` |
 | `omnect` user and `/home/omnect` | `flash-mode-2` | image recipe (`inherit omnect_user`) |
 | `devpts` filesystem | `flash-mode-2` | kernel (`CONFIG_UNIX98_PTYS`) |
+| `/usr/bin/curl` | `flash-mode-3` | `curl` |
+| CA certificates | `flash-mode-3` with `rtc` | `ca-certificates` |
 
 ## Testing
 
@@ -366,14 +367,27 @@ cargo test --no-default-features --features core,uboot,dos,flash-mode-2,test-uti
 cargo test --no-default-features --features core,uboot,gpt,flash-mode-2-direct,test-utils
 cargo test --no-default-features --features core,grub,gpt,flash-mode-2-direct,test-utils
 
-# Flash modes 1 and 2 together
+# Flash mode 3 (mode-3-only build), also with a real-time clock
+cargo test --no-default-features --features core,grub,gpt,flash-mode-3,test-utils
+cargo test --no-default-features --features core,grub,dos,flash-mode-3,test-utils
+cargo test --no-default-features --features core,uboot,gpt,flash-mode-3,test-utils
+cargo test --no-default-features --features core,uboot,dos,flash-mode-3,test-utils
+cargo test --no-default-features --features core,uboot,gpt,flash-mode-3,rtc,test-utils
+
+# Flash modes together
 cargo test --features uboot,gpt,flash-mode-1,flash-mode-2,factory-reset,test-utils
+cargo test --no-default-features --features core,uboot,gpt,flash-mode-2,flash-mode-3,test-utils
+cargo test --features grub,gpt,flash-mode-1,flash-mode-2,flash-mode-3,factory-reset,test-utils
+
+# Lint without --tests too: dev-dependencies enable crate features that the
+# release build does not have
+cargo clippy --no-default-features --features core,uboot,gpt,flash-mode-2,flash-mode-3 -- -D warnings
 
 # Verbose output
 cargo test --features grub,gpt,test-utils -- --nocapture
 ```
 
-`flash-mode` alone, without `flash-mode-1` or `flash-mode-2` (or a future `flash-mode-3`),
+`flash-mode` or `flash-mode-network` alone, without a mode feature,
 is not a supported configuration — no combination above builds it that way,
 and no gate covers it.
 
@@ -390,7 +404,7 @@ cargo clippy --target armv7-unknown-linux-gnueabihf --tests \
 # Run the tests on a 32-bit host target (needs no cross-linker on x86-64)
 rustup target add i686-unknown-linux-gnu
 cargo test --target i686-unknown-linux-gnu --no-default-features \
-  --features core,uboot,dos,flash-mode-2,test-utils
+  --features core,uboot,dos,flash-mode-2,flash-mode-3,test-utils
 
 # Narrowing casts, reviewed by hand — not part of the gate, it also flags safe ones
 cargo clippy --target armv7-unknown-linux-gnueabihf \
