@@ -58,7 +58,6 @@ struct SysPaths<'a> {
     sys_module: &'a Path,
 }
 
-/// Best effort: every failure is logged, none is returned.
 pub fn load(rootfs: &Path) {
     let paths = SysPaths {
         rootfs,
@@ -75,14 +74,17 @@ fn load_with(paths: &SysPaths, loader: &mut impl ModuleLoader) -> Vec<String> {
     if entries.is_empty() {
         return Vec::new();
     }
-    let failed: Vec<String> = match Session::prepare(paths, &entries, loader) {
-        Some((mut session, deps)) => entries
-            .iter()
-            .filter(|e| !session.load_listed(&deps, &e.name))
-            .map(|e| e.name.clone())
-            .collect(),
-        None => entries.iter().map(|e| e.name.clone()).collect(),
-    };
+    let mut failed = Vec::new();
+    match Session::prepare(paths, &entries, loader) {
+        Some((mut session, deps)) => {
+            for entry in &entries {
+                if !session.load_listed(&deps, &entry.name) {
+                    failed.push(entry.name.clone());
+                }
+            }
+        }
+        None => failed.extend(entries.iter().map(|e| e.name.clone())),
+    }
     if !failed.is_empty() {
         warn!("early modules: not loaded: {}", failed.join(", "));
     }
@@ -452,6 +454,34 @@ mod tests {
         assert_eq!(load_with(&fx.paths(), &mut l), ["plain"]);
         assert!(l.calls.is_empty());
         assert_eq!(fx.fw_param(), FW_PARAM_DEFAULT);
+    }
+
+    #[test]
+    fn missing_modules_builtin_skips_all() {
+        let fx = Fixture::new("plain\n", DEP, "");
+        fs::remove_file(fx.module_file("modules.builtin")).unwrap();
+        let mut l = MockLoader::new(&fx);
+        assert_eq!(load_with(&fx.paths(), &mut l), ["plain"]);
+        assert!(l.calls.is_empty());
+        assert_eq!(fx.fw_param(), FW_PARAM_DEFAULT);
+    }
+
+    #[test]
+    fn missing_osrelease_skips_all() {
+        let fx = Fixture::new("plain\n", DEP, "");
+        fs::remove_file(&fx.osrelease).unwrap();
+        let mut l = MockLoader::new(&fx);
+        assert_eq!(load_with(&fx.paths(), &mut l), ["plain"]);
+        assert!(l.calls.is_empty());
+        assert_eq!(fx.fw_param(), FW_PARAM_DEFAULT);
+    }
+
+    #[test]
+    fn bad_dependency_path_skips_module() {
+        let fx = Fixture::new("top\n", "kernel/a/top.ko: kernel/b/mid.bin\n", "");
+        let mut l = MockLoader::new(&fx);
+        assert_eq!(load_with(&fx.paths(), &mut l), ["top"]);
+        assert!(l.calls.is_empty());
     }
 
     #[test]

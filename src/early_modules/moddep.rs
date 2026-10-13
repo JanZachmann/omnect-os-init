@@ -14,7 +14,6 @@ pub(super) struct ModEntry {
     pub deps: Vec<PathBuf>,
 }
 
-/// File name without a compression suffix, and whether it had one.
 fn split_compression(path: &Path) -> Option<(&str, bool)> {
     let file = path.file_name()?.to_str()?;
     Some(

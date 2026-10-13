@@ -324,9 +324,10 @@ With `early-modules`, the init also reads from the rootfs:
 `/etc/omnect/early-modules.d/*.conf`, `/lib/modules/<release>/modules.dep` and
 `modules.builtin`, the listed modules and their firmware. Each line of a
 `.conf` file names a module and optional parameters; a line that starts with
-`#` is a comment. A listed module gets its parameters only from that line:
-`modprobe.d` options do not apply, because the module is already loaded when
-the rootfs takes over. A compressed module needs `CONFIG_MODULE_DECOMPRESS`.
+`#` is a comment. A listed module gets its parameters only from that line.
+Options in `modprobe.d` and `<module>.<param>=` on the kernel command line do
+not apply: `modprobe` reads both, and the module is loaded before `modprobe`
+runs. A compressed module needs `CONFIG_MODULE_DECOMPRESS`.
 
 ## Testing
 
