@@ -60,6 +60,9 @@ Non-goals:
 - Module aliases and `modules.softdep`. The config names modules by name.
 - Changing the kernel configuration or the firmware packaging, except the one
   kernel option in section 10.
+- Changing the list or adding modules on a device. The list changes only at
+  build time (section 4). A follow-up covers customer modules on a device and
+  keeps them over a factory reset and a firmware update.
 
 ## 4. Config file
 
