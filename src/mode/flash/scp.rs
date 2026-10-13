@@ -359,8 +359,6 @@ fn scp_with(
         }
     }
 
-    // The new image may move partitions. Everything after this point mounts
-    // them, so the kernel must drop the table from before the flash first.
     ops.reread_table(disk)
         .map_err(|source| FlashError::StalePartitionTable {
             disk: disk.to_path_buf(),

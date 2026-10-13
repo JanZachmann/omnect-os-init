@@ -180,7 +180,8 @@ pub(crate) fn device_len(disk: &Path) -> Result<u64, FlashError> {
 }
 
 /// Make the kernel re-read the partition table of `disk`. Fails while any
-/// partition of `disk` is mounted.
+/// partition of `disk` is mounted. Call it before anything mounts a partition
+/// of a new image, which may sit at another offset.
 #[cfg(feature = "flash-mode-network")]
 pub fn reread_partition_table(disk: &Path) -> Result<(), FlashError> {
     let io_failed = |source| FlashError::PathIo {
@@ -333,6 +334,18 @@ mod tests {
         let dst = dir.path().join("sdz");
         assert!(zero_range(&dst, &ByteRange { offset: 0, len: 1 }).is_err());
         assert!(!dst.exists());
+    }
+
+    #[cfg(feature = "flash-mode-network")]
+    #[test]
+    fn device_len_is_the_length_of_a_file_and_refuses_a_missing_path() {
+        let disk = file_with(b"0123456789");
+        assert_eq!(device_len(disk.path()).unwrap(), 10);
+        let missing = disk.path().with_extension("missing");
+        assert!(matches!(
+            device_len(&missing),
+            Err(FlashError::InvalidDestination { device, .. }) if device == missing
+        ));
     }
 
     #[cfg(feature = "flash-mode-network")]

@@ -39,13 +39,11 @@ const CURL_SPEED_TIME_FLAG: &str = "--speed-time";
 const CURL_MAX_FILESIZE_FLAG: &str = "--max-filesize";
 const CURL_PROTO_REDIR_FLAG: &str = "--proto-redir";
 const CURL_HTTPS_ONLY: &str = "=https";
-/// Prints the URL of the last redirect target on stdout.
 const CURL_WRITE_OUT_FLAG: &str = "--write-out";
 const CURL_EFFECTIVE_URL: &str = "%{url_effective}";
 const CURL_OUTPUT_FLAG: &str = "--output";
 /// Marks the next argument as the URL, also when it starts with `-`.
 const CURL_URL_FLAG: &str = "--url";
-/// Without a reliable clock, the validity of a certificate cannot be checked.
 #[cfg(not(feature = "rtc"))]
 const CURL_INSECURE_FLAG: &str = "--insecure";
 const CURL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -153,7 +151,8 @@ fn sha256_of(path: &Path) -> Result<[u8; SHA256_LEN], FlashError> {
 }
 
 /// Every byte is written, also the zero blocks, so nothing of the old image
-/// survives inside the new one.
+/// survives inside the new one. Only an error after both files are open is
+/// `DiskPartlyWritten`.
 fn write_image(image: &Path, disk: &Path, size: u64) -> Result<(), FlashError> {
     let failed = |reason: String| FlashError::CopyFailed {
         src: image.to_path_buf(),
@@ -163,14 +162,15 @@ fn write_image(image: &Path, disk: &Path, size: u64) -> Result<(), FlashError> {
     let input = File::open(image).map_err(|e| failed(format!("opening source: {e}")))?;
     let mut output =
         open_existing_for_write(disk).map_err(|e| failed(format!("opening destination: {e}")))?;
-    decode_into(xz::decoder(input), &mut output, size).map_err(failed)?;
-    output
-        .sync_all()
-        .map_err(|e| failed(format!("syncing destination: {e}")))
+    decode_into(xz::decoder(input), &mut output, size)
+        .and_then(|()| {
+            output
+                .sync_all()
+                .map_err(|e| format!("syncing destination: {e}"))
+        })
+        .map_err(|reason| partly_written(disk, failed(reason)))
 }
 
-/// Stops at `size`, so a stream that does not match its index cannot write
-/// beyond the checked length.
 fn decode_into(mut input: impl Read, output: &mut impl Write, size: u64) -> Result<(), String> {
     let mut buf = vec![0u8; COPY_BUFFER_SIZE];
     let mut written: u64 = 0;
@@ -375,7 +375,7 @@ fn url_with(ctx: &UrlCtx<'_>, ops: &mut dyn UrlOps) -> Result<(), FlashError> {
         return Err(FlashError::InvalidImage {
             path: downloads.image,
             reason: format!(
-                "its sha256 is {}, the sha256 file expects {}",
+                "its sha256 is {}, the first digest in the sha256 file is {}",
                 hex::encode(actual),
                 hex::encode(expected)
             ),
@@ -401,11 +401,7 @@ fn url_with(ctx: &UrlCtx<'_>, ops: &mut dyn UrlOps) -> Result<(), FlashError> {
         downloads.image.display(),
         disk.display()
     );
-    ops.write_image(&downloads.image, disk, size)
-        .map_err(|e| partly_written(disk, e))?;
-
-    // The new image may move partitions. Everything after this point mounts
-    // them, so the kernel must drop the table from before the flash first.
+    ops.write_image(&downloads.image, disk, size)?;
     ops.reread_table(disk)
         .map_err(|source| FlashError::StalePartitionTable {
             disk: disk.to_path_buf(),
@@ -592,8 +588,31 @@ mod tests {
         let image = dir.path().join(IMAGE_FILE_NAME);
         fs::write(&image, xz(IMAGE)).unwrap();
         let disk = dir.path().join("sdz");
-        assert!(write_image(&image, &disk, IMAGE.len() as u64).is_err());
+        let result = write_image(&image, &disk, IMAGE.len() as u64);
+        assert!(
+            matches!(result, Err(FlashError::CopyFailed { .. })),
+            "{result:?}"
+        );
+        assert!(keeps_log(&result), "nothing was written");
         assert!(!disk.exists());
+    }
+
+    #[test]
+    fn a_cut_or_broken_stream_leaves_the_disk_partly_written() {
+        let mut cut = xz(IMAGE);
+        cut.truncate(cut.len() / 2);
+        for (case, stream) in [("cut", cut), ("not xz", IMAGE.to_vec())] {
+            let dir = tempfile::tempdir().unwrap();
+            let image = dir.path().join(IMAGE_FILE_NAME);
+            let disk = dir.path().join("sdz");
+            fs::write(&image, stream).unwrap();
+            fs::write(&disk, vec![0xff; usize::try_from(DISK_LEN).unwrap()]).unwrap();
+            let result = write_image(&image, &disk, IMAGE.len() as u64);
+            assert!(
+                matches!(result, Err(FlashError::DiskPartlyWritten { .. })),
+                "{case}: {result:?}"
+            );
+        }
     }
 
     #[test]
@@ -602,7 +621,7 @@ mod tests {
         let short = IMAGE.len() as u64 - 1;
         let err = decode_into(IMAGE, &mut out, short).unwrap_err();
         assert!(err.contains("more than"), "{err}");
-        assert!(out.into_inner().len() < IMAGE.len());
+        assert!(out.into_inner().len() as u64 <= short);
     }
 
     #[test]
@@ -720,12 +739,12 @@ mod tests {
         }
 
         fn image_size(&mut self, image: &Path) -> Result<u64, FlashError> {
-            self.record(format!("size of {}", image.display()))?;
+            self.record(format!("image size of {}", image.display()))?;
             Ok(self.image.len() as u64)
         }
 
         fn device_len(&mut self, disk: &Path) -> Result<u64, FlashError> {
-            self.record(format!("size of {}", disk.display()))?;
+            self.record(format!("device size of {}", disk.display()))?;
             Ok(self.disk_len)
         }
 
@@ -783,8 +802,8 @@ mod tests {
                  (at most {IMAGE_RAM} bytes)"
             ),
             "hash /tmp/flash-mode-3/wic.xz".to_string(),
-            "size of /tmp/flash-mode-3/wic.xz".to_string(),
-            "size of /dev/sda".to_string(),
+            "image size of /tmp/flash-mode-3/wic.xz".to_string(),
+            "device size of /dev/sda".to_string(),
             format!(
                 "write /tmp/flash-mode-3/wic.xz to /dev/sda ({} bytes)",
                 IMAGE.len()
@@ -816,7 +835,7 @@ mod tests {
         let (result, calls) = run_recorded(ops);
         let err = result.unwrap_err();
         assert!(
-            matches!(&err, FlashError::InvalidImage { reason, .. } if reason.contains("sha256 file expects")),
+            matches!(&err, FlashError::InvalidImage { reason, .. } if reason.contains("first digest in the sha256 file")),
             "{err}"
         );
         assert!(keeps_log(&Err(err)));
@@ -832,7 +851,15 @@ mod tests {
             matches!(result, Err(FlashError::InvalidDestination { .. })),
             "{result:?}"
         );
-        assert_eq!(calls.last().unwrap(), "size of /dev/sda");
+        assert_eq!(calls.last().unwrap(), "device size of /dev/sda");
+    }
+
+    #[test]
+    fn an_image_that_fills_the_disk_exactly_is_flashed() {
+        let mut ops = RecordingUrlOps::new();
+        ops.disk_len = IMAGE.len() as u64;
+        let (result, _) = run_recorded(ops);
+        result.unwrap();
     }
 
     #[test]
@@ -849,7 +876,7 @@ mod tests {
         assert!(keeps_log(&Err(err)));
         assert_eq!(
             calls.last().unwrap(),
-            "size of /tmp/flash-mode-3/wic.xz",
+            "image size of /tmp/flash-mode-3/wic.xz",
             "{calls:?}"
         );
     }
@@ -872,7 +899,7 @@ mod tests {
     fn an_unreadable_image_size_stops_before_the_write() {
         let mut ops = RecordingUrlOps::new();
         ops.faults.push(Fault {
-            step: "size of",
+            step: "image size",
             passes: 0,
         });
         let (result, calls) = run_recorded(ops);
@@ -880,39 +907,36 @@ mod tests {
         assert!(keeps_log(&Err(err)));
         assert_eq!(
             calls.last().unwrap(),
-            "size of /tmp/flash-mode-3/wic.xz",
+            "image size of /tmp/flash-mode-3/wic.xz",
             "{calls:?}"
         );
     }
 
     #[test]
-    fn a_failed_unmount_or_network_stops_before_any_download() {
-        for step in ["unmount", "network"] {
+    fn a_failed_setup_or_finish_step_stops_mode_3_there() {
+        let steps = [
+            ("unmount", true),
+            ("network", true),
+            ("write", true),
+            ("reread", false),
+            #[cfg(feature = "grub")]
+            ("mount efivarfs", true),
+            #[cfg(feature = "grub")]
+            ("efibootmgr", true),
+            #[cfg(feature = "grub")]
+            ("write entry dump", true),
+        ];
+        for (step, log_is_kept) in steps {
             let mut ops = RecordingUrlOps::new();
             ops.faults.push(Fault { step, passes: 0 });
             let (result, calls) = run_recorded(ops);
             assert!(result.is_err(), "{step}");
-            assert!(calls.last().unwrap().starts_with(step), "{calls:?}");
+            assert!(
+                calls.last().unwrap().starts_with(step),
+                "{step} must be the last step, got {calls:?}"
+            );
+            assert_eq!(keeps_log(&result), log_is_kept, "{step}: {result:?}");
         }
-    }
-
-    #[test]
-    fn a_failed_write_marks_the_disk_as_partly_written() {
-        let mut ops = RecordingUrlOps::new();
-        ops.faults.push(Fault {
-            step: "write",
-            passes: 0,
-        });
-        let (result, _) = run_recorded(ops);
-        assert!(
-            matches!(result, Err(FlashError::DiskPartlyWritten { .. })),
-            "{result:?}"
-        );
-        assert!(!keeps_log(&result));
-    }
-
-    #[test]
-    fn a_failed_table_reread_is_a_stale_table() {
         let mut ops = RecordingUrlOps::new();
         ops.faults.push(Fault {
             step: "reread",
