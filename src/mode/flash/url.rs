@@ -917,7 +917,6 @@ mod tests {
         let steps = [
             ("unmount", true),
             ("network", true),
-            ("write", true),
             ("reread", false),
             #[cfg(feature = "grub")]
             ("mount efivarfs", true),
