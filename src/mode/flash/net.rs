@@ -1,5 +1,6 @@
 //! Network setup for the flash modes that receive their image over the
-//! network: bring the interface up, get an address by DHCP, start dropbear.
+//! network: bring the interface up and get an address by DHCP. Mode 2 also
+//! starts dropbear.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -36,14 +37,14 @@ const NET_WAIT_LOG_INTERVAL: Duration = Duration::from_secs(10);
 
 const IP_LINK_ARGS: [&str; 4] = ["link", "set", FLASH_INTERFACE, "up"];
 
-/// The IPv4 address a mode waits for.
 #[derive(Clone, Copy)]
 pub(crate) enum Ipv4Need {
     /// Any address, also the link-local one dhcpcd sets without a DHCP
-    /// server: a peer on the same cable can reach it.
+    /// server: a peer on the same link can reach it.
     #[cfg(feature = "flash-mode-2")]
     AnyAddress,
-    /// A link-local address has no route and no DNS.
+    /// An IPv4LL address has no default route and no DNS server, so a
+    /// download cannot start.
     #[cfg(feature = "flash-mode-3")]
     Lease,
 }
@@ -59,7 +60,7 @@ impl Ipv4Need {
         }
     }
 
-    fn describe(self) -> &'static str {
+    pub(crate) fn describe(self) -> &'static str {
         match self {
             #[cfg(feature = "flash-mode-2")]
             Self::AnyAddress => "an IPv4 address",
@@ -295,6 +296,31 @@ mod tests {
         assert!(err.to_string().contains("a DHCP lease on eth0"), "{err}");
     }
 
+    #[cfg(feature = "flash-mode-3")]
+    #[test]
+    fn mode_3_polls_past_the_link_local_address_until_the_lease() {
+        let _guard = serialized();
+        let mut ops = FakeNetOps {
+            link_local_polls: 2,
+            ..Default::default()
+        };
+        let ip = bring_up_with(&mut ops, Ipv4Need::Lease, STEP, STEP * 5, STEP).unwrap();
+        assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 7));
+        assert_eq!(ops.calls.iter().filter(|c| *c == "addresses").count(), 3);
+    }
+
+    #[cfg(feature = "flash-mode-2")]
+    #[test]
+    fn mode_2_takes_the_link_local_address_at_once() {
+        let _guard = serialized();
+        let mut ops = FakeNetOps {
+            link_local_polls: 2,
+            ..Default::default()
+        };
+        let ip = bring_up_with(&mut ops, Ipv4Need::AnyAddress, STEP, STEP * 5, STEP).unwrap();
+        assert_eq!(ip, Ipv4Addr::new(169, 254, 3, 4));
+    }
+
     /// The log capture is global, so a test that logs "still waiting" must not
     /// run while another one captures.
     fn serialized() -> std::sync::MutexGuard<'static, ()> {
@@ -304,14 +330,15 @@ mod tests {
     }
 
     /// Records every side effect as one line. `link_failures` link attempts
-    /// fail first; the address shows up after `address_errors` failed and
-    /// `address_misses` empty polls.
+    /// fail first; the address shows up after `address_errors` failed,
+    /// `address_misses` empty and `link_local_polls` IPv4LL-only polls.
     #[derive(Default)]
     struct FakeNetOps {
         calls: Vec<String>,
         link_failures: usize,
         address_errors: usize,
         address_misses: usize,
+        link_local_polls: usize,
     }
 
     impl NetOps for FakeNetOps {
@@ -338,6 +365,10 @@ mod tests {
             if self.address_misses > 0 {
                 self.address_misses -= 1;
                 return Ok(vec![addr("lo", Some("127.0.0.1"))]);
+            }
+            if self.link_local_polls > 0 {
+                self.link_local_polls -= 1;
+                return Ok(vec![addr("eth0", Some("169.254.3.4"))]);
             }
             Ok(vec![addr("eth0", Some("10.0.0.7"))])
         }

@@ -199,7 +199,7 @@ fn decode_into(mut input: impl Read, output: &mut impl Write, size: u64) -> Resu
 
 trait UrlOps {
     fn unmount(&mut self, rootfs: &Path, disk: &Path) -> Result<(), FlashError>;
-    fn bring_up_network(&mut self) -> Result<(), FlashError>;
+    fn bring_up_network(&mut self, need: net::Ipv4Need) -> Result<(), FlashError>;
     fn download(&mut self, url: &Url, target: &Path, max_len: u64) -> Result<(), FlashError>;
     fn available_ram(&mut self) -> Result<u64, FlashError>;
     fn read_sha256_file(&mut self, path: &Path) -> Result<String, FlashError>;
@@ -224,8 +224,8 @@ impl UrlOps for RealUrlOps {
         unmount::unmount_target_disk(rootfs, disk)
     }
 
-    fn bring_up_network(&mut self) -> Result<(), FlashError> {
-        net::bring_up(net::Ipv4Need::Lease).map(|_| ())
+    fn bring_up_network(&mut self, need: net::Ipv4Need) -> Result<(), FlashError> {
+        net::bring_up(need).map(|_| ())
     }
 
     fn download(&mut self, url: &Url, target: &Path, max_len: u64) -> Result<(), FlashError> {
@@ -345,7 +345,7 @@ fn url_with(ctx: &UrlCtx<'_>, ops: &mut dyn UrlOps) -> Result<(), FlashError> {
     );
 
     ops.unmount(ctx.rootfs, disk)?;
-    ops.bring_up_network()?;
+    ops.bring_up_network(net::Ipv4Need::Lease)?;
 
     log::info!("downloading {}", ctx.sha256_url);
     ops.download(ctx.sha256_url, &downloads.sha256, MAX_SHA256_FILE_LEN)?;
@@ -693,8 +693,8 @@ mod tests {
             ))
         }
 
-        fn bring_up_network(&mut self) -> Result<(), FlashError> {
-            self.record("network".to_string())
+        fn bring_up_network(&mut self, need: net::Ipv4Need) -> Result<(), FlashError> {
+            self.record(format!("network, waiting for {}", need.describe()))
         }
 
         fn download(&mut self, url: &Url, target: &Path, max_len: u64) -> Result<(), FlashError> {
@@ -772,7 +772,7 @@ mod tests {
     fn calls_up_to_the_flash() -> Vec<String> {
         vec![
             "unmount /rootfs and /dev/sda".to_string(),
-            "network".to_string(),
+            "network, waiting for a DHCP lease".to_string(),
             "download https://example.invalid/omnect.wic.sha256 to /tmp/flash-mode-3/wic.xz.sha256 \
              (at most 4096 bytes)"
                 .to_string(),

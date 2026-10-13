@@ -46,7 +46,7 @@ src/
 │       ├── mod.rs           # Dispatch, terminal action, log capture and persistence
 │       ├── config.rs        # Environment read, validation -> FlashConfig
 │       ├── efi.rs           # efibootmgr handling (feature = grub)
-│       ├── net.rs           # eth0 up, dhcpcd, dropbear (feature = flash-mode-network)
+│       ├── net.rs           # eth0 up, dhcpcd; dropbear for mode 2 (feature = flash-mode-network)
 │       ├── scp.rs           # Mode 2 orchestration: scp upload, flash, retry (feature = flash-mode-2)
 │       ├── url.rs           # Mode 3 orchestration: download, check, flash (feature = flash-mode-3)
 │       ├── xz/              # xz decoder; index size reader for mode 3 (feature = flash-mode-network)
