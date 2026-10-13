@@ -358,7 +358,7 @@ mod tests {
     #[cfg(feature = "flash-mode-1")]
     use crate::bootloader::{BootEnv, MockBootEnv};
     #[cfg(all(
-        feature = "flash-mode-2",
+        feature = "flash-mode-network",
         not(any(feature = "flash-mode-1", feature = "grub"))
     ))]
     use std::path::PathBuf;
@@ -549,16 +549,36 @@ mod tests {
         .to_vec()
     }
 
-    #[cfg(feature = "flash-mode-2")]
-    fn run_mode_2(
+    #[cfg(feature = "flash-mode-network")]
+    fn network_modes() -> Vec<config::FlashMode> {
+        [
+            #[cfg(feature = "flash-mode-2")]
+            config::FlashMode::Mode2,
+            #[cfg(feature = "flash-mode-3")]
+            config::FlashMode::Mode3,
+        ]
+        .to_vec()
+    }
+
+    /// Runs `mode` with every trigger set; returns the outcome, the cleared
+    /// keys, and the triggers still set afterwards.
+    #[cfg(feature = "flash-mode-network")]
+    fn run_network_mode(
+        mode: config::FlashMode,
         result: fn() -> Result<(), FlashError>,
         write: LogWriter<'_>,
-    ) -> (crate::Result<()>, Vec<crate::bootloader::BootEnvKey>) {
+    ) -> (
+        crate::Result<()>,
+        Vec<crate::bootloader::BootEnvKey>,
+        Vec<crate::bootloader::BootEnvKey>,
+    ) {
         use crate::bootloader::{BootEnvState, MockBootEnv};
         use crate::config::Config;
         use crate::runtime::OdsStatus;
 
-        let mock = MockBootEnv::new();
+        let mock = all_flash_triggers()
+            .into_iter()
+            .fold(MockBootEnv::new(), |mock, key| mock.with_env(key, "set"));
         let cleared = mock.shared_set_env_calls();
         let cleared_at_start = cleared.clone();
         let config = Config::default();
@@ -572,7 +592,7 @@ mod tests {
         );
         let outcome = run_and_persist(
             &mut ctx,
-            &crate::mode::mode_2_config(),
+            &config::FlashConfig::new(mode),
             &mut |_, _| {
                 assert_eq!(
                     *cleared_at_start.lock().unwrap(),
@@ -584,13 +604,18 @@ mod tests {
             write,
         )
         .map_err(Into::into);
+        let bl = ctx.boot_env.available_mut().unwrap();
+        let still_set = all_flash_triggers()
+            .into_iter()
+            .filter(|key| bl.get_env(*key).unwrap().is_some())
+            .collect();
         let cleared = cleared.lock().unwrap().clone();
-        (outcome, cleared)
+        (outcome, cleared, still_set)
     }
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[test]
-    fn a_written_disk_gets_no_mode_2_log_after_a_failure() {
+    fn a_written_disk_gets_no_run_log_after_a_failure() {
         let _guard = crate::logging::capture::SERIALIZE
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -610,68 +635,88 @@ mod tests {
                 })
             },
         ];
-        for result in results {
-            let mut writes = 0;
-            let (outcome, cleared) = run_mode_2(result, &mut |_, _, _| {
-                writes += 1;
-                Ok(())
-            });
+        for mode in network_modes() {
+            for result in results {
+                let mut writes = 0;
+                let (outcome, cleared, still_set) =
+                    run_network_mode(mode, result, &mut |_, _, _| {
+                        writes += 1;
+                        Ok(())
+                    });
+                assert!(outcome.is_err());
+                assert_eq!(
+                    writes, 0,
+                    "{mode:?}: the data partition must not be mounted"
+                );
+                assert_eq!(cleared, all_flash_triggers(), "{mode:?}");
+                assert!(still_set.is_empty(), "{mode:?}: {still_set:?}");
+            }
+        }
+    }
+
+    #[cfg(feature = "flash-mode-network")]
+    #[test]
+    fn a_run_that_fails_before_the_disk_is_written_keeps_its_log() {
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::logging::capture::install_test_logger();
+
+        for mode in network_modes() {
+            let mut written: Vec<(String, Vec<String>)> = Vec::new();
+            let (outcome, _, still_set) = run_network_mode(
+                mode,
+                || Err(FlashError::NetworkFailed("no lease".to_string())),
+                &mut |_, file, lines| {
+                    written.push((file.to_string(), lines.to_vec()));
+                    Ok(())
+                },
+            );
             assert!(outcome.is_err());
-            assert_eq!(writes, 0, "the data partition must not be mounted");
-            assert_eq!(
-                cleared,
-                all_flash_triggers(),
-                "the triggers must be cleared"
+            assert!(still_set.is_empty(), "{mode:?}: {still_set:?}");
+            let [(file, lines)] = written.as_slice() else {
+                panic!("{mode:?}: the run log must be written once, got {written:?}");
+            };
+            assert_eq!(file, log_file(mode));
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with("[ERROR] flash mode failed:")
+                        && line.contains("no lease")),
+                "{mode:?}: {lines:?}"
             );
         }
     }
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[test]
-    fn a_mode_2_run_that_fails_before_the_disk_is_written_keeps_its_log() {
+    fn a_successful_run_writes_its_log_to_the_data_partition() {
         let _guard = crate::logging::capture::SERIALIZE
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         crate::logging::capture::install_test_logger();
 
-        let mut writes = 0;
-        let (outcome, _) = run_mode_2(
-            || Err(FlashError::NetworkFailed("no lease".to_string())),
-            &mut |_, _, _| {
-                writes += 1;
-                Ok(())
-            },
-        );
-        assert!(outcome.is_err());
-        assert_eq!(writes, 1);
-    }
-
-    #[cfg(feature = "flash-mode-2")]
-    #[test]
-    fn a_successful_mode_2_run_writes_its_log_to_the_data_partition() {
-        let _guard = crate::logging::capture::SERIALIZE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        crate::logging::capture::install_test_logger();
-
-        let mut written: Vec<(std::path::PathBuf, String, Vec<String>)> = Vec::new();
-        let (outcome, cleared) = run_mode_2(|| Ok(()), &mut |partition, file, lines| {
-            written.push((partition.to_path_buf(), file.to_string(), lines.to_vec()));
-            Ok(())
-        });
-        assert!(outcome.is_ok());
-        assert_eq!(cleared, all_flash_triggers());
-        let [(partition, file, lines)] = written.as_slice() else {
-            panic!("the run log must be written once, got {written:?}");
-        };
-        assert_eq!(Some(partition), source_layout().get(PartitionName::Data));
-        assert_eq!(file, "flash-mode-2.log");
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("flash mode finished")),
-            "got {lines:?}"
-        );
+        for mode in network_modes() {
+            let mut written: Vec<(std::path::PathBuf, String, Vec<String>)> = Vec::new();
+            let (outcome, cleared, _) =
+                run_network_mode(mode, || Ok(()), &mut |partition, file, lines| {
+                    written.push((partition.to_path_buf(), file.to_string(), lines.to_vec()));
+                    Ok(())
+                });
+            assert!(outcome.is_ok());
+            assert_eq!(cleared, all_flash_triggers());
+            let [(partition, file, lines)] = written.as_slice() else {
+                panic!("{mode:?}: the run log must be written once, got {written:?}");
+            };
+            assert_eq!(Some(partition), source_layout().get(PartitionName::Data));
+            assert_eq!(file, log_file(mode));
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("flash mode finished")),
+                "{mode:?}: {lines:?}"
+            );
+        }
     }
 
     #[test]

@@ -492,27 +492,36 @@ mod tests {
             assert_eq!(mock.get_env(BootEnvKey::FactoryReset).unwrap(), None);
         }
 
-        #[cfg(all(feature = "flash-mode-2", feature = "factory-reset"))]
+        #[cfg(all(feature = "flash-mode-network", feature = "factory-reset"))]
         #[test]
-        fn detect_logs_a_factory_reset_that_mode_2_overrides() {
+        fn detect_logs_a_factory_reset_that_a_network_mode_overrides() {
             let _guard = crate::logging::capture::SERIALIZE
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             crate::logging::capture::install_test_logger();
-            crate::logging::start_capture();
 
-            let mut mock = create_mock_bootloader()
-                .with_env(BootEnvKey::FlashMode, "2")
-                .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
-            let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
-            let lines = crate::logging::take_capture();
+            let selectors = [
+                #[cfg(feature = "flash-mode-2")]
+                "2",
+                #[cfg(feature = "flash-mode-3")]
+                "3",
+            ];
+            for selector in selectors {
+                crate::logging::start_capture();
+                let mut mock = create_mock_bootloader()
+                    .with_env(BootEnvKey::FlashMode, selector)
+                    .with_env(BootEnvKey::FactoryReset, r#"{"mode":1,"preserve":[]}"#);
+                let mode = BootMode::detect_with(Some(&mut mock), EnforceFlag::Absent).unwrap();
+                let lines = crate::logging::take_capture();
 
-            assert!(matches!(mode, BootMode::Flash(_)));
-            assert!(
-                lines.iter().any(|line| line
-                    .starts_with("[ERROR] factory-reset: set together with flash mode 2")),
-                "got {lines:?}"
-            );
+                assert!(matches!(mode, BootMode::Flash(_)), "{selector}");
+                let expected =
+                    format!("[ERROR] factory-reset: set together with flash mode {selector}");
+                assert!(
+                    lines.iter().any(|line| line.starts_with(&expected)),
+                    "got {lines:?}"
+                );
+            }
         }
 
         #[cfg(all(feature = "flash-mode-1", feature = "factory-reset"))]
