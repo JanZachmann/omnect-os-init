@@ -2,37 +2,42 @@ use std::io::{self, BufReader, Read, Seek, SeekFrom};
 
 const STREAM_HEADER_MAGIC: [u8; 6] = [0xfd, b'7', b'z', b'X', b'Z', 0x00];
 const STREAM_FOOTER_MAGIC: [u8; 2] = *b"YZ";
-const STREAM_HEADER_LEN: u64 = 12;
-const STREAM_FOOTER_LEN: u64 = 12;
+const STREAM_HEADER_LEN: usize = 12;
+const STREAM_FOOTER_LEN: usize = 12;
 const STREAM_FLAGS_LEN: usize = 2;
 const HEADER_FLAGS_AT: usize = STREAM_HEADER_MAGIC.len();
 const FOOTER_BACKWARD_SIZE_AT: usize = 4;
 const FOOTER_FLAGS_AT: usize = 8;
+const BACKWARD_SIZE_LEN: usize = FOOTER_FLAGS_AT - FOOTER_BACKWARD_SIZE_AT;
 const INDEX_INDICATOR: u8 = 0x00;
-/// Blocks and the index are padded to a multiple of 4 bytes, and the backward
-/// size counts in units of 4 bytes.
 const XZ_ALIGNMENT: u64 = 4;
 const MAX_NUMBER_LEN: u32 = 9;
 const NUMBER_PAYLOAD_BITS: u32 = 7;
 const NUMBER_MORE_BIT: u8 = 0x80;
 
-/// The uncompressed size that the index at the end of `file` records. Only a
-/// file that holds exactly one xz stream is accepted.
 // TODO: remove me, as soon as a lzma-rust2 release that reports the
 // uncompressed size of an xz file is CR:
 // https://github.com/hasenbanck/lzma-rust2/pull/134
+// Keep the check for exactly one stream from the start of the file: the
+// upstream function adds up concatenated streams and starts at the current
+// position.
+/// The uncompressed size that the index at the end of `file` records. Only a
+/// file that holds exactly one xz stream is accepted, also without stream
+/// padding after it. Index padding and the CRC32 values are not checked: the
+/// sha256 of the image is checked before.
 pub(crate) fn uncompressed_size<F: Read + Seek>(file: &mut F) -> Result<u64, String> {
     let io = |e: io::Error| format!("reading the xz index: {e}");
     let file_len = file.seek(SeekFrom::End(0)).map_err(io)?;
-    if file_len < STREAM_HEADER_LEN + STREAM_FOOTER_LEN {
+    let (header_len, footer_len) = (STREAM_HEADER_LEN as u64, STREAM_FOOTER_LEN as u64);
+    if file_len < header_len + footer_len {
         return Err(format!("{file_len} bytes are too short for an xz file"));
     }
 
-    let mut header = [0u8; STREAM_HEADER_LEN as usize];
+    let mut header = [0u8; STREAM_HEADER_LEN];
     file.seek(SeekFrom::Start(0)).map_err(io)?;
     file.read_exact(&mut header).map_err(io)?;
-    let mut footer = [0u8; STREAM_FOOTER_LEN as usize];
-    file.seek(SeekFrom::Start(file_len - STREAM_FOOTER_LEN))
+    let mut footer = [0u8; STREAM_FOOTER_LEN];
+    file.seek(SeekFrom::Start(file_len - footer_len))
         .map_err(io)?;
     file.read_exact(&mut footer).map_err(io)?;
 
@@ -47,12 +52,13 @@ pub(crate) fn uncompressed_size<F: Read + Seek>(file: &mut F) -> Result<u64, Str
         return Err("the stream header and footer flags differ".to_string());
     }
 
-    let mut backward_size = [0u8; 4];
+    let mut backward_size = [0u8; BACKWARD_SIZE_LEN];
     backward_size.copy_from_slice(&footer[FOOTER_BACKWARD_SIZE_AT..FOOTER_FLAGS_AT]);
+    // Backward Size is stored as `index_len / 4 - 1`.
     let index_len = (u64::from(u32::from_le_bytes(backward_size)) + 1) * XZ_ALIGNMENT;
-    let index_start = (file_len - STREAM_FOOTER_LEN)
+    let index_start = (file_len - footer_len)
         .checked_sub(index_len)
-        .filter(|&start| start >= STREAM_HEADER_LEN)
+        .filter(|&start| start >= header_len)
         .ok_or_else(|| format!("the xz index of {index_len} bytes does not fit the file"))?;
 
     file.seek(SeekFrom::Start(index_start)).map_err(io)?;
@@ -78,7 +84,7 @@ pub(crate) fn uncompressed_size<F: Read + Seek>(file: &mut F) -> Result<u64, Str
             .ok_or("the xz uncompressed size overflows")?;
     }
 
-    let stream_len = [STREAM_HEADER_LEN, index_len, STREAM_FOOTER_LEN]
+    let stream_len = [header_len, index_len, footer_len]
         .into_iter()
         .try_fold(blocks_len, u64::checked_add);
     if stream_len != Some(file_len) {
@@ -180,10 +186,59 @@ mod tests {
     #[test]
     fn a_footer_that_points_outside_the_file_is_refused() {
         let mut file = xz(&data());
-        let at = file.len() - STREAM_FOOTER_LEN as usize + FOOTER_BACKWARD_SIZE_AT;
-        file[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let at = file.len() - STREAM_FOOTER_LEN + FOOTER_BACKWARD_SIZE_AT;
+        file[at..at + BACKWARD_SIZE_LEN].copy_from_slice(&u32::MAX.to_le_bytes());
         let err = size_of(file).unwrap_err();
         assert!(err.contains("does not fit the file"), "{err}");
+    }
+
+    /// One stream with an index of `records` (the record count and its
+    /// pairs) and as many zero bytes as blocks as the records say.
+    fn stream_with_index(records: &[u8], blocks_len: usize) -> Vec<u8> {
+        let header = xz(&[])[..STREAM_HEADER_LEN].to_vec();
+        let mut index = vec![INDEX_INDICATOR];
+        index.extend_from_slice(records);
+        index.resize(index.len().next_multiple_of(XZ_ALIGNMENT as usize), 0);
+        index.extend_from_slice(&[1u8; 4]); // CRC32, not checked
+        let backward_size = u32::try_from(index.len() / XZ_ALIGNMENT as usize - 1).unwrap();
+        let mut footer = vec![0u8; FOOTER_BACKWARD_SIZE_AT];
+        footer.extend_from_slice(&backward_size.to_le_bytes());
+        footer.extend_from_slice(&header[HEADER_FLAGS_AT..HEADER_FLAGS_AT + STREAM_FLAGS_LEN]);
+        footer.extend_from_slice(&STREAM_FOOTER_MAGIC);
+        [header, vec![0u8; blocks_len], index, footer].concat()
+    }
+
+    #[test]
+    fn a_built_index_is_read() {
+        assert_eq!(size_of(stream_with_index(&[1, 5, 9], 8)).unwrap(), 9);
+    }
+
+    #[test]
+    fn a_block_of_0_bytes_is_refused() {
+        let err = size_of(stream_with_index(&[1, 0, 9], 0)).unwrap_err();
+        assert!(err.contains("block of 0 bytes"), "{err}");
+    }
+
+    #[test]
+    fn more_records_than_the_index_holds_are_refused() {
+        let err = size_of(stream_with_index(&[0x7f, 1, 1], 4)).unwrap_err();
+        assert!(err.contains("reading the xz index"), "{err}");
+    }
+
+    #[test]
+    fn different_header_and_footer_flags_are_refused() {
+        let mut file = xz(&data());
+        let at = file.len() - STREAM_FOOTER_LEN + FOOTER_FLAGS_AT + 1;
+        file[at] ^= 1;
+        let err = size_of(file).unwrap_err();
+        assert!(err.contains("flags differ"), "{err}");
+    }
+
+    #[test]
+    fn stream_padding_after_the_stream_is_refused() {
+        let file = [xz(&data()), vec![0u8; XZ_ALIGNMENT as usize]].concat();
+        let err = size_of(file).unwrap_err();
+        assert!(err.contains("data follows the xz stream"), "{err}");
     }
 
     #[test]
