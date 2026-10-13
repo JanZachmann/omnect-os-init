@@ -367,7 +367,8 @@ cargo test --no-default-features --features core,uboot,dos,flash-mode-2,test-uti
 cargo test --no-default-features --features core,uboot,gpt,flash-mode-2-direct,test-utils
 cargo test --no-default-features --features core,grub,gpt,flash-mode-2-direct,test-utils
 
-# Flash mode 3 (mode-3-only build), also with a real-time clock
+# Flash mode 3 (mode-3-only build), also with a real-time clock; two download tests run the
+# host's /usr/bin/curl and fail without it
 cargo test --no-default-features --features core,grub,gpt,flash-mode-3,test-utils
 cargo test --no-default-features --features core,grub,dos,flash-mode-3,test-utils
 cargo test --no-default-features --features core,uboot,gpt,flash-mode-3,test-utils
