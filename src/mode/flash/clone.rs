@@ -22,7 +22,7 @@ use crate::filesystem::reformat_ext4;
 #[cfg(feature = "grub")]
 use crate::mode::flash::efi;
 use crate::mode::flash::rawio::{self, ByteRange, kb_to_bytes};
-use crate::mode::flash::{layout_partition, sfdisk, unmount};
+use crate::mode::flash::{layout_partition, output_tail, sfdisk, unmount};
 #[cfg(feature = "grub")]
 use crate::mode::flash::{scratch_mounts, with_mount};
 use crate::partition::device::{
@@ -284,16 +284,6 @@ fn verify_destination_partitions(destination: &Path) -> Result<(), FlashError> {
     Ok(())
 }
 
-fn output_tail(output: &[u8]) -> String {
-    let text = String::from_utf8_lossy(output);
-    let lines: Vec<&str> = text
-        .split(['\r', '\n'])
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    lines[lines.len().saturating_sub(E2IMAGE_REASON_LINES)..].join("; ")
-}
-
 /// Run `e2image` with its output forwarded to the console and its tail kept.
 ///
 /// Progress goes to stderr, some errors go to stdout, so both share one pipe.
@@ -340,7 +330,7 @@ fn run_e2image(src: &Path, dst: &Path) -> Result<(), String> {
     if !status.success() {
         return Err(format!(
             "{E2IMAGE_CMD} failed ({status}): {}",
-            output_tail(&tail)
+            output_tail(&tail, E2IMAGE_REASON_LINES)
         ));
     }
     Ok(())
@@ -742,7 +732,7 @@ mod tests {
             Copying 0 / 1042 blocks (0%)\rCopying 512 / 1042 blocks (49%)\r\
             e2image: Input/output error while writing block 600\n";
         assert_eq!(
-            output_tail(output),
+            output_tail(output, E2IMAGE_REASON_LINES),
             "Copying 0 / 1042 blocks (0%); Copying 512 / 1042 blocks (49%); \
              e2image: Input/output error while writing block 600"
         );

@@ -6,6 +6,7 @@ use std::{
     fs::{self, File},
     io::{Read, Write},
     path::{Path, PathBuf},
+    process::Stdio,
     time::Duration,
 };
 
@@ -17,7 +18,7 @@ use crate::{
     mode::flash::{
         SHA256_LEN, child,
         config::Url,
-        net, partly_written,
+        net, output_tail, partly_written,
         rawio::{self, COPY_BUFFER_SIZE, open_existing_for_write},
         read_small_text, sha256_from_hex, unmount, xz,
     },
@@ -35,6 +36,12 @@ const CURL_FLAGS: [&str; 4] = ["--fail", "--no-progress-meter", "--location", "-
 const CURL_CONNECT_TIMEOUT_FLAG: &str = "--connect-timeout";
 const CURL_SPEED_LIMIT_FLAG: &str = "--speed-limit";
 const CURL_SPEED_TIME_FLAG: &str = "--speed-time";
+const CURL_MAX_FILESIZE_FLAG: &str = "--max-filesize";
+const CURL_PROTO_REDIR_FLAG: &str = "--proto-redir";
+const CURL_HTTPS_ONLY: &str = "=https";
+/// Prints the URL of the last redirect target on stdout.
+const CURL_WRITE_OUT_FLAG: &str = "--write-out";
+const CURL_EFFECTIVE_URL: &str = "%{url_effective}";
 const CURL_OUTPUT_FLAG: &str = "--output";
 /// Marks the next argument as the URL, also when it starts with `-`.
 const CURL_URL_FLAG: &str = "--url";
@@ -46,12 +53,21 @@ const CURL_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// `CURL_STALL_TIME` is aborted, so a stalled server cannot block PID 1.
 const CURL_STALL_SPEED: u32 = 1;
 const CURL_STALL_TIME: Duration = Duration::from_secs(60);
+const CURL_REASON_LINES: usize = 3;
+const HTTPS_SCHEME: &str = "https://";
 
 const DOWNLOAD_DIR: &str = "/tmp/flash-mode-3";
 const IMAGE_FILE_NAME: &str = "wic.xz";
 const SHA256_FILE_NAME: &str = "wic.xz.sha256";
 /// Room for a digest and a long file name.
 const MAX_SHA256_FILE_LEN: u64 = 4096;
+const MEMINFO_PATH: &str = "/proc/meminfo";
+const MEM_AVAILABLE_KEY: &str = "MemAvailable:";
+const KIB: u64 = 1024;
+const MIB: u64 = 1024 * KIB;
+/// The download sits in initramfs RAM. What stays free holds the xz decoder,
+/// whose dictionary can take 64 MiB, and the rest of the initramfs.
+const RAM_RESERVE: u64 = 128 * MIB;
 
 pub(crate) struct UrlCtx<'a> {
     pub(crate) layout: &'a PartitionLayout,
@@ -60,10 +76,16 @@ pub(crate) struct UrlCtx<'a> {
     pub(crate) sha256_url: &'a Url,
 }
 
-fn curl_args(url: &Url, target: &Path) -> Vec<OsString> {
+/// `max_len` must not be 0: curl reads 0 as no limit.
+fn curl_args(url: &Url, target: &Path, max_len: u64) -> Vec<OsString> {
     let mut args: Vec<OsString> = CURL_FLAGS.iter().map(OsString::from).collect();
     #[cfg(not(feature = "rtc"))]
     args.push(CURL_INSECURE_FLAG.into());
+    // A redirect to plain HTTP would drop the TLS check.
+    let scheme = url.unredacted().get(..HTTPS_SCHEME.len());
+    if scheme.is_some_and(|scheme| scheme.eq_ignore_ascii_case(HTTPS_SCHEME)) {
+        args.extend([CURL_PROTO_REDIR_FLAG.into(), CURL_HTTPS_ONLY.into()]);
+    }
     args.extend([
         CURL_CONNECT_TIMEOUT_FLAG.into(),
         CURL_CONNECT_TIMEOUT.as_secs().to_string().into(),
@@ -71,6 +93,10 @@ fn curl_args(url: &Url, target: &Path) -> Vec<OsString> {
         CURL_STALL_SPEED.to_string().into(),
         CURL_SPEED_TIME_FLAG.into(),
         CURL_STALL_TIME.as_secs().to_string().into(),
+        CURL_MAX_FILESIZE_FLAG.into(),
+        max_len.to_string().into(),
+        CURL_WRITE_OUT_FLAG.into(),
+        CURL_EFFECTIVE_URL.into(),
         CURL_OUTPUT_FLAG.into(),
         target.into(),
         CURL_URL_FLAG.into(),
@@ -87,6 +113,17 @@ fn expected_sha256(sha256_file: &str) -> Result<[u8; SHA256_LEN], String> {
         .next()
         .ok_or("the sha256 file is empty")?;
     sha256_from_hex(field).map_err(|e| format!("'{field}' is not a sha256 digest: {e}"))
+}
+
+/// The `MemAvailable` line of `/proc/meminfo`, in bytes.
+fn mem_available(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|line| {
+        let kib = line
+            .strip_prefix(MEM_AVAILABLE_KEY)?
+            .trim()
+            .strip_suffix("kB")?;
+        kib.trim().parse::<u64>().ok()?.checked_mul(KIB)
+    })
 }
 
 fn read_sha256_file(path: &Path) -> Result<String, FlashError> {
@@ -163,7 +200,8 @@ fn decode_into(mut input: impl Read, output: &mut impl Write, size: u64) -> Resu
 trait UrlOps {
     fn unmount(&mut self, rootfs: &Path, disk: &Path) -> Result<(), FlashError>;
     fn bring_up_network(&mut self) -> Result<(), FlashError>;
-    fn download(&mut self, url: &Url, target: &Path) -> Result<(), FlashError>;
+    fn download(&mut self, url: &Url, target: &Path, max_len: u64) -> Result<(), FlashError>;
+    fn available_ram(&mut self) -> Result<u64, FlashError>;
     fn read_sha256_file(&mut self, path: &Path) -> Result<String, FlashError>;
     fn sha256_of(&mut self, path: &Path) -> Result<[u8; SHA256_LEN], FlashError>;
     fn image_size(&mut self, image: &Path) -> Result<u64, FlashError>;
@@ -190,7 +228,7 @@ impl UrlOps for RealUrlOps {
         net::bring_up(net::Ipv4Need::Lease).map(|_| ())
     }
 
-    fn download(&mut self, url: &Url, target: &Path) -> Result<(), FlashError> {
+    fn download(&mut self, url: &Url, target: &Path, max_len: u64) -> Result<(), FlashError> {
         let failed = |reason: String| FlashError::DownloadFailed {
             url: url.clone(),
             reason,
@@ -201,14 +239,33 @@ impl UrlOps for RealUrlOps {
                 source,
             })?;
         }
-        let status = child(CURL_CMD)
-            .args(curl_args(url, target))
-            .status()
+        let output = child(CURL_CMD)
+            .args(curl_args(url, target, max_len))
+            .stdin(Stdio::null())
+            .output()
             .map_err(|e| failed(format!("failed to run {CURL_CMD}: {e}")))?;
-        if !status.success() {
-            return Err(failed(format!("{CURL_CMD} failed ({status})")));
+        if !output.status.success() {
+            return Err(failed(format!(
+                "{CURL_CMD} failed ({}): {}",
+                output.status,
+                output_tail(&output.stderr, CURL_REASON_LINES)
+            )));
+        }
+        if let Some(effective) = Url::parse(&String::from_utf8_lossy(&output.stdout)) {
+            log::info!("downloaded {effective}");
         }
         Ok(())
+    }
+
+    fn available_ram(&mut self) -> Result<u64, FlashError> {
+        let meminfo = fs::read_to_string(MEMINFO_PATH).map_err(|source| FlashError::PathIo {
+            path: MEMINFO_PATH.into(),
+            source,
+        })?;
+        mem_available(&meminfo).ok_or_else(|| FlashError::PathIo {
+            path: MEMINFO_PATH.into(),
+            source: std::io::Error::other(format!("no {MEM_AVAILABLE_KEY} line")),
+        })
     }
 
     fn read_sha256_file(&mut self, path: &Path) -> Result<String, FlashError> {
@@ -291,7 +348,7 @@ fn url_with(ctx: &UrlCtx<'_>, ops: &mut dyn UrlOps) -> Result<(), FlashError> {
     ops.bring_up_network()?;
 
     log::info!("downloading {}", ctx.sha256_url);
-    ops.download(ctx.sha256_url, &downloads.sha256)?;
+    ops.download(ctx.sha256_url, &downloads.sha256, MAX_SHA256_FILE_LEN)?;
     let expected =
         expected_sha256(&ops.read_sha256_file(&downloads.sha256)?).map_err(|reason| {
             FlashError::InvalidImage {
@@ -299,8 +356,19 @@ fn url_with(ctx: &UrlCtx<'_>, ops: &mut dyn UrlOps) -> Result<(), FlashError> {
                 reason,
             }
         })?;
-    log::info!("downloading {}", ctx.image_url);
-    ops.download(ctx.image_url, &downloads.image)?;
+    let available = ops.available_ram()?;
+    let max_image_len = available
+        .checked_sub(RAM_RESERVE)
+        .filter(|&len| len > 0)
+        .ok_or_else(|| FlashError::DownloadFailed {
+            url: ctx.image_url.clone(),
+            reason: format!("{available} bytes of RAM are free, {RAM_RESERVE} must stay free"),
+        })?;
+    log::info!(
+        "downloading {} (at most {max_image_len} bytes)",
+        ctx.image_url
+    );
+    ops.download(ctx.image_url, &downloads.image, max_image_len)?;
 
     let actual = ops.sha256_of(&downloads.image)?;
     if actual != expected {
@@ -366,6 +434,7 @@ mod tests {
     const SHA256_URL: &str = "https://example.invalid/omnect.wic.sha256?sv=2024&sig=secret";
     const IMAGE: &[u8] = b"a small disk image";
     const DISK_LEN: u64 = 1024;
+    const IMAGE_RAM: u64 = 64 * MIB;
 
     fn url(text: &str) -> Url {
         Url::parse(text).unwrap()
@@ -378,32 +447,65 @@ mod tests {
         )
     }
 
+    fn curl_args_of(url_text: &str) -> Vec<String> {
+        curl_args(
+            &url(url_text),
+            Path::new("/tmp/wic.xz"),
+            MAX_SHA256_FILE_LEN,
+        )
+        .into_iter()
+        .map(|arg| arg.into_string().unwrap())
+        .collect()
+    }
+
+    fn value_after(args: &[String], flag: &str) -> String {
+        let at = args.iter().position(|arg| arg == flag).unwrap();
+        args[at + 1].clone()
+    }
+
     #[test]
-    fn curl_fails_on_http_errors_and_stalls_and_writes_the_target() {
-        let args: Vec<String> = curl_args(&url(IMAGE_URL), Path::new("/tmp/wic.xz"))
-            .into_iter()
-            .map(|arg| arg.into_string().unwrap())
-            .collect();
-        for flag in CURL_FLAGS {
+    fn the_curl_command_line_has_every_flag() {
+        let args = curl_args_of(IMAGE_URL);
+        for flag in ["--fail", "--no-progress-meter", "--location", "--globoff"] {
             assert!(args.contains(&flag.to_string()), "{flag} in {args:?}");
         }
-        let after = |flag: &str| {
-            let at = args.iter().position(|arg| arg == flag).unwrap();
-            args[at + 1].clone()
-        };
-        assert_eq!(after(CURL_CONNECT_TIMEOUT_FLAG), "30");
-        assert_eq!(after(CURL_SPEED_LIMIT_FLAG), "1");
-        assert_eq!(after(CURL_SPEED_TIME_FLAG), "60");
-        assert_eq!(after(CURL_OUTPUT_FLAG), "/tmp/wic.xz");
-        assert_eq!(after(CURL_URL_FLAG), IMAGE_URL);
+        assert_eq!(value_after(&args, "--connect-timeout"), "30");
+        assert_eq!(value_after(&args, "--speed-limit"), "1");
+        assert_eq!(value_after(&args, "--speed-time"), "60");
+        assert_eq!(value_after(&args, "--max-filesize"), "4096");
+        assert_eq!(value_after(&args, "--write-out"), "%{url_effective}");
+        assert_eq!(value_after(&args, "--output"), "/tmp/wic.xz");
+        assert_eq!(value_after(&args, "--url"), IMAGE_URL);
         assert_eq!(args.last().unwrap(), IMAGE_URL);
     }
 
     #[test]
+    fn an_https_download_follows_only_https_redirects() {
+        for https in [IMAGE_URL, "HTTPS://example.invalid/a"] {
+            assert_eq!(value_after(&curl_args_of(https), "--proto-redir"), "=https");
+        }
+        let args = curl_args_of("http://example.invalid/a");
+        assert!(!args.contains(&"--proto-redir".to_string()), "{args:?}");
+    }
+
+    #[test]
     fn certificates_are_checked_only_with_a_clock() {
-        let args = curl_args(&url(IMAGE_URL), Path::new("/tmp/wic.xz"));
-        let insecure = args.iter().any(|arg| arg == "--insecure");
+        let insecure = curl_args_of(IMAGE_URL).contains(&"--insecure".to_string());
         assert_eq!(insecure, cfg!(not(feature = "rtc")));
+    }
+
+    #[test]
+    fn the_free_ram_is_read_from_meminfo() {
+        let meminfo = "MemTotal:        3884000 kB\nMemFree:  1000 kB\nMemAvailable:    2048 kB\n";
+        assert_eq!(mem_available(meminfo), Some(2048 * KIB));
+        for bad in [
+            "",
+            "MemFree: 1000 kB\n",
+            "MemAvailable: many kB\n",
+            "MemAvailable: 1\n",
+        ] {
+            assert_eq!(mem_available(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
@@ -524,6 +626,7 @@ mod tests {
         sha256_file: String,
         image: Vec<u8>,
         disk_len: u64,
+        available_ram: u64,
     }
 
     impl RecordingUrlOps {
@@ -534,6 +637,7 @@ mod tests {
                 sha256_file: sha256_line(IMAGE),
                 image: IMAGE.to_vec(),
                 disk_len: DISK_LEN,
+                available_ram: RAM_RESERVE + IMAGE_RAM,
             }
         }
 
@@ -593,8 +697,16 @@ mod tests {
             self.record("network".to_string())
         }
 
-        fn download(&mut self, url: &Url, target: &Path) -> Result<(), FlashError> {
-            self.record(format!("download {url} to {}", target.display()))
+        fn download(&mut self, url: &Url, target: &Path, max_len: u64) -> Result<(), FlashError> {
+            self.record(format!(
+                "download {url} to {} (at most {max_len} bytes)",
+                target.display()
+            ))
+        }
+
+        fn available_ram(&mut self) -> Result<u64, FlashError> {
+            self.record("free ram".to_string())?;
+            Ok(self.available_ram)
         }
 
         fn read_sha256_file(&mut self, path: &Path) -> Result<String, FlashError> {
@@ -661,11 +773,15 @@ mod tests {
         vec![
             "unmount /rootfs and /dev/sda".to_string(),
             "network".to_string(),
-            "download https://example.invalid/omnect.wic.sha256 to /tmp/flash-mode-3/wic.xz.sha256"
+            "download https://example.invalid/omnect.wic.sha256 to /tmp/flash-mode-3/wic.xz.sha256 \
+             (at most 4096 bytes)"
                 .to_string(),
             "read /tmp/flash-mode-3/wic.xz.sha256".to_string(),
-            "download https://example.invalid/omnect.wic.xz to /tmp/flash-mode-3/wic.xz"
-                .to_string(),
+            "free ram".to_string(),
+            format!(
+                "download https://example.invalid/omnect.wic.xz to /tmp/flash-mode-3/wic.xz \
+                 (at most {IMAGE_RAM} bytes)"
+            ),
             "hash /tmp/flash-mode-3/wic.xz".to_string(),
             "size of /tmp/flash-mode-3/wic.xz".to_string(),
             "size of /dev/sda".to_string(),
@@ -840,7 +956,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = url("file:///nonexistent/omnect.wic.xz?sig=secret");
         let err = RealUrlOps::default()
-            .download(&missing, &dir.path().join(IMAGE_FILE_NAME))
+            .download(
+                &missing,
+                &dir.path().join(IMAGE_FILE_NAME),
+                MAX_SHA256_FILE_LEN,
+            )
             .unwrap_err();
         let printed = err.to_string();
         assert!(
@@ -852,5 +972,52 @@ mod tests {
             "{printed}"
         );
         assert!(!printed.contains("sig="), "{printed}");
+        // curl's own message, so the operator need not map its exit code.
+        assert!(printed.contains("curl: (37)"), "{printed}");
+    }
+
+    #[test]
+    fn a_download_logs_where_it_came_from() {
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::logging::capture::install_test_logger();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        fs::write(&source, sha256_line(IMAGE)).unwrap();
+        let target = dir.path().join(SHA256_FILE_NAME);
+
+        crate::logging::start_capture();
+        let result = RealUrlOps::default().download(
+            &url(&format!("file://{}?sig=secret", source.display())),
+            &target,
+            MAX_SHA256_FILE_LEN,
+        );
+        let lines = crate::logging::take_capture();
+
+        result.unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), sha256_line(IMAGE));
+        let expected = format!("downloaded file://{}", source.display());
+        assert!(
+            lines.iter().any(|line| line.ends_with(&expected)),
+            "{lines:?}"
+        );
+        assert!(lines.iter().all(|line| !line.contains("sig=")), "{lines:?}");
+    }
+
+    #[test]
+    fn too_little_free_ram_stops_before_the_image_download() {
+        for available_ram in [0, RAM_RESERVE] {
+            let mut ops = RecordingUrlOps::new();
+            ops.available_ram = available_ram;
+            let (result, calls) = run_recorded(ops);
+            let err = result.unwrap_err();
+            assert!(
+                matches!(&err, FlashError::DownloadFailed { reason, .. } if reason.contains("must stay free")),
+                "{err}"
+            );
+            assert!(keeps_log(&Err(err)));
+            assert_eq!(calls.last().unwrap(), "free ram", "{calls:?}");
+        }
     }
 }

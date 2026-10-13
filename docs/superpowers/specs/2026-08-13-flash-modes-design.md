@@ -586,7 +586,12 @@ Child processes get an explicit `PATH`: PID 1 has no login environment, and
    still a URL. Add `--insecure` when the build has no `rtc` feature: without a
    reliable clock, certificate validity cannot be checked. The recipe maps
    `MACHINE_FEATURES` `rtc` onto the feature, so the choice is made at build
-   time.
+   time. An `https://` URL gets `--proto-redir =https`, so a redirect cannot
+   drop the TLS check. `--max-filesize` limits the sha256 file to 4 KiB and the
+   image to the free RAM (`MemAvailable`) minus 128 MiB, which stays free for
+   the xz decoder and the rest of the initramfs; curl 8.4 and later also
+   stops a transfer without a known size at that limit. The last lines of
+   curl's stderr go into the error, and the URL after all redirects is logged.
 4. Hash the image with `sha2` in `COPY_BUFFER_SIZE` chunks and compare it with
    the first field of the sha256 file. A sha256 file larger than 4 KiB or not
    UTF-8 is refused as `InvalidImage`: it comes from a wrong URL.
@@ -720,7 +725,7 @@ timeout the mode fails into the normal fatal-error path (§8).
 | IPv4 address after `dhcpcd` returns | unbounded | 120 s | `dhcpcd` returns after its own 30 s timeout and keeps trying in the background; without a DHCP server it assigns an IPv4LL address |
 | Mode 2 `wic.bmap` arrival | unbounded | unbounded | waits for a person to start the `scp` (§10.8) |
 | Mode 3 `curl` connect | unbounded | 30 s | machine-driven |
-| Mode 3 `curl` transfer | unbounded | abort below 1 byte/s for 60 s | a slow but moving download is not cut off |
+| Mode 3 `curl` transfer | unbounded | abort below 1 byte/s for 60 s | a slow but moving download is not cut off; a server that sends a few bytes per second holds the device, which is accepted for a development-only mode |
 
 The values are proposals — reviewers should say if any is wrong for their
 machines. Each becomes a named constant.
