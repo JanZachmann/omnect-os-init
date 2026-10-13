@@ -50,7 +50,9 @@ flowchart TD
     LAYOUT -->|OK| CORE["mount_core_partitions()\nrootfs + boot + fsck"]
     LAYOUT -->|Fail| FEB
 
-    CORE --> BENV["open_boot_env()"]
+    CORE -->|"OK + early-modules"| EMOD["early_modules::load()\nbest effort, never fails"]
+    CORE -->|"Fail or no early-modules"| BENV["open_boot_env()"]
+    EMOD --> BENV
 
     BENV --> CLASSIFY{"classify_boot_env"}
     CLASSIFY -->|"OK → Available"| APPLY["apply_boot_env_decision()\ncore_result × env decision\npersist_fsck_results — always"]
@@ -253,6 +255,7 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 | `uboot` | U-Boot bootloader support — ARM targets | Implemented |
 | `gpt` | GPT partition table layout | Implemented |
 | `dos` | DOS/MBR partition table layout | Implemented |
+| `early-modules` | Load the modules listed in the rootfs before `switch_root`, see below | Implemented |
 | `persistent-var-log` | Bind-mount `/var/log` to data partition | Implemented |
 | `release-image` | Release error handling: loop on fatal error; continue in degraded boot | Implemented |
 | `resize-data` | Data partition auto-resize on first boot | Implemented |
@@ -317,6 +320,14 @@ time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
 | `/usr/bin/curl` | `flash-mode-3` | `curl` |
 | CA certificates | `flash-mode-3`, checked only with `rtc` | `ca-certificates` |
 
+With `early-modules`, the init also reads from the rootfs:
+`/etc/omnect/early-modules.d/*.conf`, `/lib/modules/<release>/modules.dep` and
+`modules.builtin`, the listed modules and their firmware. Each line of a
+`.conf` file names a module and optional parameters; a line that starts with
+`#` is a comment. A listed module gets its parameters only from that line:
+`modprobe.d` options do not apply, because the module is already loaded when
+the rootfs takes over. A compressed module needs `CONFIG_MODULE_DECOMPRESS`.
+
 ## Testing
 
 ```bash
@@ -339,6 +350,10 @@ cargo test --features grub,gpt,resize-data,test-utils
 cargo test --features grub,dos,resize-data,test-utils
 cargo test --features uboot,gpt,resize-data,test-utils
 cargo test --features uboot,dos,resize-data,test-utils
+
+# With early-modules feature
+cargo test --features grub,gpt,early-modules,test-utils
+cargo test --features uboot,gpt,early-modules,test-utils
 
 # With release-image feature
 cargo test --features grub,gpt,release-image,test-utils

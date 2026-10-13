@@ -14,6 +14,7 @@ src/
 ├── lib.rs                   # Library exports + run_init() + apply_boot_env_decision()
 ├── error.rs                 # Error type hierarchy
 ├── early_init.rs            # Mount /dev, /proc, /sys, /run before logging
+├── early_modules/           # Load modules listed in the rootfs before switch_root (feature = early-modules)
 ├── recovery.rs              # RecoveryClass -> Action policy (pure; main.rs executes it)
 ├── bootloader/
 │   ├── mod.rs               # BootEnv trait, BootEnvState, classify_boot_env()

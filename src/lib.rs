@@ -155,6 +155,11 @@ pub fn run_init() -> Result<()> {
     // must persist any fsck diagnostic held in ods_status before the error propagates.
     let core_result = mount_core_partitions(&layout, rootfs, &mut ods_status);
 
+    #[cfg(feature = "early-modules")]
+    if core_result.is_ok() {
+        early_modules::load(rootfs);
+    }
+
     // Best-effort: open the bootloader environment. The image type determines how
     // to proceed when it is unavailable — see classify_boot_env.
     //
