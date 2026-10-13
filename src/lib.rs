@@ -18,6 +18,8 @@ use crate::{
 pub mod bootloader;
 pub mod config;
 pub mod early_init;
+#[cfg(feature = "early-modules")]
+pub mod early_modules;
 pub mod error;
 pub mod filesystem;
 pub mod init_setup;
