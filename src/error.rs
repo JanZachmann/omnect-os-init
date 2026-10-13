@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::filesystem::FsckExitCode;
+#[cfg(feature = "flash-mode-3")]
+use crate::mode::flash::config::Url;
 use crate::recovery::RecoveryClass;
 
 /// Result type alias for the initramfs
@@ -396,10 +398,9 @@ pub enum FlashError {
     #[error("Network setup failed: {0}")]
     NetworkFailed(String),
 
-    /// `url` is redacted, because the full URL can hold an access token.
     #[cfg(feature = "flash-mode-3")]
     #[error("Download of {url} failed: {reason}")]
-    DownloadFailed { url: String, reason: String },
+    DownloadFailed { url: Url, reason: String },
 
     #[cfg(feature = "flash-mode-3")]
     #[error("Image {} is unusable: {reason}", path.display())]

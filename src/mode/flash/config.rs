@@ -20,7 +20,6 @@ pub enum FlashMode {
 }
 
 impl FlashMode {
-    #[cfg(all(feature = "flash-mode-network", feature = "factory-reset"))]
     pub fn selector(self) -> &'static str {
         match self {
             #[cfg(feature = "flash-mode-1")]
@@ -61,22 +60,30 @@ pub type Devpath = EnvValue<PathBuf>;
 #[cfg(feature = "flash-mode-3")]
 pub type EnvUrl = EnvValue<Url>;
 
-/// `Debug` prints the URL redacted.
+/// `Display` and `Debug` print the URL without user info, query string and
+/// fragment, which can hold credentials or an access token.
 #[cfg(feature = "flash-mode-3")]
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Url(String);
 
 #[cfg(feature = "flash-mode-3")]
 impl Url {
-    pub fn as_str(&self) -> &str {
+    /// Trimmed; `None` for a blank `url`.
+    pub fn parse(url: &str) -> Option<Self> {
+        let url = url.trim();
+        (!url.is_empty()).then(|| Self(url.to_string()))
+    }
+
+    /// The full URL, for the curl command line only.
+    pub(crate) fn unredacted(&self) -> &str {
         &self.0
     }
 }
 
 #[cfg(feature = "flash-mode-3")]
-impl From<&str> for Url {
-    fn from(url: &str) -> Self {
-        Self(url.to_string())
+impl fmt::Display for Url {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&redacted(&self.0))
     }
 }
 
@@ -87,20 +94,18 @@ impl fmt::Debug for Url {
     }
 }
 
-/// `url` without user info, query string and fragment, which can hold
-/// credentials or an access token.
 #[cfg(feature = "flash-mode-3")]
-pub(crate) fn redacted(url: &str) -> String {
-    let url = url.split(['?', '#']).next().unwrap_or(url);
+fn redacted(url: &str) -> String {
     // curl also takes a URL without a scheme, user info included.
     let (scheme, rest) = url
         .find(SCHEME_SEPARATOR)
         .map_or(("", url), |at| url.split_at(at + SCHEME_SEPARATOR.len()));
-    let (authority, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    format!("{scheme}{host}{path}")
+    // User info goes first: a `?` or `#` in a password starts no query string.
+    let authority_end = rest.find('/').unwrap_or(rest.len());
+    let host_start = rest[..authority_end].rfind('@').map_or(0, |at| at + 1);
+    let rest = &rest[host_start..];
+    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    format!("{scheme}{rest}")
 }
 
 #[derive(Debug)]
@@ -115,7 +120,6 @@ pub struct FlashConfig {
 }
 
 impl FlashConfig {
-    /// `mode` with none of its boot-env values read.
     pub fn new(mode: FlashMode) -> Self {
         Self {
             mode,
@@ -151,20 +155,28 @@ pub(crate) fn parse_devpath(value: Option<&str>) -> Devpath {
     }
 }
 
-/// The value is base64. The decoded URL is trimmed, because an
-/// `echo | base64` encoder adds a newline.
+/// Line breaks are ignored, as `base64 -d` does: `base64` wraps its output at
+/// 76 columns. Trimmed after decoding: `echo | base64` encodes a trailing
+/// newline.
 #[cfg(feature = "flash-mode-3")]
 pub(crate) fn parse_url(value: Option<&str>) -> EnvUrl {
-    let Some(encoded) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+    let encoded: String = value
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    if encoded.is_empty() {
         return EnvUrl::NotSet;
-    };
+    }
     let decoded = match BASE64.decode(encoded) {
         Ok(bytes) => bytes,
         Err(e) => return EnvUrl::Invalid(format!("not base64: {e}")),
     };
     match String::from_utf8(decoded) {
-        Ok(url) if url.trim().is_empty() => EnvUrl::Invalid("decodes to an empty URL".to_string()),
-        Ok(url) => EnvUrl::Set(url.trim().into()),
+        Ok(url) => Url::parse(&url).map_or_else(
+            || EnvUrl::Invalid("decodes to an empty URL".to_string()),
+            EnvUrl::Set,
+        ),
         Err(_) => EnvUrl::Invalid("decodes to text that is not UTF-8".to_string()),
     }
 }
@@ -189,6 +201,21 @@ mod tests {
                 None,
                 "{unknown:?} must not select a mode"
             );
+        }
+    }
+
+    #[test]
+    fn each_mode_parses_from_its_selector() {
+        let modes = [
+            #[cfg(feature = "flash-mode-1")]
+            FlashMode::Mode1,
+            #[cfg(feature = "flash-mode-2")]
+            FlashMode::Mode2,
+            #[cfg(feature = "flash-mode-3")]
+            FlashMode::Mode3,
+        ];
+        for mode in modes {
+            assert_eq!(parse_mode(mode.selector()), Some(mode));
         }
     }
 
@@ -217,20 +244,44 @@ mod tests {
         use super::*;
 
         const URL: &str = "https://example.invalid/images/omnect.wic.xz?sv=2024&sig=secret";
+        const BASE64_WRAP_COLUMNS: usize = 76;
 
         fn encoded(text: impl AsRef<[u8]>) -> String {
             BASE64.encode(text)
         }
 
+        fn url(text: &str) -> Url {
+            Url::parse(text).unwrap()
+        }
+
         #[test]
         fn a_base64_url_is_decoded() {
-            assert_eq!(parse_url(Some(&encoded(URL))), EnvUrl::Set(URL.into()));
+            assert_eq!(parse_url(Some(&encoded(URL))), EnvUrl::Set(url(URL)));
         }
 
         #[test]
         fn the_newline_of_an_echo_encoder_is_trimmed() {
             let value = format!(" {}\n", encoded(format!("{URL}\n")));
-            assert_eq!(parse_url(Some(&value)), EnvUrl::Set(URL.into()));
+            assert_eq!(parse_url(Some(&value)), EnvUrl::Set(url(URL)));
+        }
+
+        #[test]
+        fn line_breaks_of_a_wrapping_encoder_are_ignored() {
+            let value = encoded(URL)
+                .as_bytes()
+                .chunks(BASE64_WRAP_COLUMNS)
+                .map(|line| format!("{}\n", std::str::from_utf8(line).unwrap()))
+                .collect::<String>();
+            assert!(value.trim_end().contains('\n'), "{value:?}");
+            assert_eq!(parse_url(Some(&value)), EnvUrl::Set(url(URL)));
+        }
+
+        #[test]
+        fn a_blank_url_does_not_parse() {
+            for blank in ["", " ", "\n"] {
+                assert_eq!(Url::parse(blank), None, "{blank:?}");
+            }
+            assert_eq!(Url::parse(" a \n").unwrap().unredacted(), "a");
         }
 
         #[test]
@@ -252,12 +303,22 @@ mod tests {
             assert_eq!(redacted("https://user:pass@host"), "https://host");
             assert_eq!(redacted("host/a?sig=secret"), "host/a");
             assert_eq!(redacted("user:pass@host/a?sig=secret"), "host/a");
+            assert_eq!(redacted("https://user:se?cret@host/x"), "https://host/x");
+            assert_eq!(redacted("https://user:se#cret@host"), "https://host");
+            assert_eq!(redacted("https://host?sig=secret"), "https://host");
+        }
+
+        #[test]
+        fn a_url_prints_redacted() {
+            let url = url("https://user:pass@example.invalid/a?sig=secret");
+            assert_eq!(url.to_string(), "https://example.invalid/a");
+            assert_eq!(format!("{url:?}"), r#"Url("https://example.invalid/a")"#);
         }
 
         #[test]
         fn a_debug_print_does_not_show_the_token() {
             let config = FlashConfig {
-                image_url: EnvUrl::Set("https://user:pass@example.invalid/a?sig=secret".into()),
+                image_url: EnvUrl::Set(url("https://user:pass@example.invalid/a?sig=secret")),
                 ..FlashConfig::new(FlashMode::Mode3)
             };
             let printed = format!("{config:?}");

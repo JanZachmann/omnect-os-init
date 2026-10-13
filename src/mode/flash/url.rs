@@ -16,7 +16,7 @@ use crate::{
     error::FlashError,
     mode::flash::{
         SHA256_LEN, child,
-        config::redacted,
+        config::Url,
         net, partly_written,
         rawio::{self, COPY_BUFFER_SIZE, open_existing_for_write},
         read_small_text, sha256_from_hex, unmount, xz,
@@ -56,11 +56,11 @@ const MAX_SHA256_FILE_LEN: u64 = 4096;
 pub(crate) struct UrlCtx<'a> {
     pub(crate) layout: &'a PartitionLayout,
     pub(crate) rootfs: &'a Path,
-    pub(crate) image_url: &'a str,
-    pub(crate) sha256_url: &'a str,
+    pub(crate) image_url: &'a Url,
+    pub(crate) sha256_url: &'a Url,
 }
 
-fn curl_args(url: &str, target: &Path) -> Vec<OsString> {
+fn curl_args(url: &Url, target: &Path) -> Vec<OsString> {
     let mut args: Vec<OsString> = CURL_FLAGS.iter().map(OsString::from).collect();
     #[cfg(not(feature = "rtc"))]
     args.push(CURL_INSECURE_FLAG.into());
@@ -74,7 +74,7 @@ fn curl_args(url: &str, target: &Path) -> Vec<OsString> {
         CURL_OUTPUT_FLAG.into(),
         target.into(),
         CURL_URL_FLAG.into(),
-        url.into(),
+        url.unredacted().into(),
     ]);
     args
 }
@@ -163,7 +163,7 @@ fn decode_into(mut input: impl Read, output: &mut impl Write, size: u64) -> Resu
 trait UrlOps {
     fn unmount(&mut self, rootfs: &Path, disk: &Path) -> Result<(), FlashError>;
     fn bring_up_network(&mut self) -> Result<(), FlashError>;
-    fn download(&mut self, url: &str, target: &Path) -> Result<(), FlashError>;
+    fn download(&mut self, url: &Url, target: &Path) -> Result<(), FlashError>;
     fn read_sha256_file(&mut self, path: &Path) -> Result<String, FlashError>;
     fn sha256_of(&mut self, path: &Path) -> Result<[u8; SHA256_LEN], FlashError>;
     fn image_size(&mut self, image: &Path) -> Result<u64, FlashError>;
@@ -190,9 +190,9 @@ impl UrlOps for RealUrlOps {
         net::bring_up(net::Ipv4Need::Lease).map(|_| ())
     }
 
-    fn download(&mut self, url: &str, target: &Path) -> Result<(), FlashError> {
+    fn download(&mut self, url: &Url, target: &Path) -> Result<(), FlashError> {
         let failed = |reason: String| FlashError::DownloadFailed {
-            url: redacted(url),
+            url: url.clone(),
             reason,
         };
         if let Some(dir) = target.parent() {
@@ -278,7 +278,7 @@ fn url_with(ctx: &UrlCtx<'_>, ops: &mut dyn UrlOps) -> Result<(), FlashError> {
     log::info!(
         "flash mode 3: flashing {} with an image downloaded from {}",
         disk.display(),
-        redacted(ctx.image_url)
+        ctx.image_url
     );
 
     #[cfg(not(feature = "rtc"))]
@@ -290,7 +290,7 @@ fn url_with(ctx: &UrlCtx<'_>, ops: &mut dyn UrlOps) -> Result<(), FlashError> {
     ops.unmount(ctx.rootfs, disk)?;
     ops.bring_up_network()?;
 
-    log::info!("downloading {}", redacted(ctx.sha256_url));
+    log::info!("downloading {}", ctx.sha256_url);
     ops.download(ctx.sha256_url, &downloads.sha256)?;
     let expected =
         expected_sha256(&ops.read_sha256_file(&downloads.sha256)?).map_err(|reason| {
@@ -299,7 +299,7 @@ fn url_with(ctx: &UrlCtx<'_>, ops: &mut dyn UrlOps) -> Result<(), FlashError> {
                 reason,
             }
         })?;
-    log::info!("downloading {}", redacted(ctx.image_url));
+    log::info!("downloading {}", ctx.image_url);
     ops.download(ctx.image_url, &downloads.image)?;
 
     let actual = ops.sha256_of(&downloads.image)?;
@@ -367,6 +367,10 @@ mod tests {
     const IMAGE: &[u8] = b"a small disk image";
     const DISK_LEN: u64 = 1024;
 
+    fn url(text: &str) -> Url {
+        Url::parse(text).unwrap()
+    }
+
     fn sha256_line(data: &[u8]) -> String {
         format!(
             "{}  /build/omnect.wic.xz\n",
@@ -376,7 +380,7 @@ mod tests {
 
     #[test]
     fn curl_fails_on_http_errors_and_stalls_and_writes_the_target() {
-        let args: Vec<String> = curl_args(IMAGE_URL, Path::new("/tmp/wic.xz"))
+        let args: Vec<String> = curl_args(&url(IMAGE_URL), Path::new("/tmp/wic.xz"))
             .into_iter()
             .map(|arg| arg.into_string().unwrap())
             .collect();
@@ -397,7 +401,7 @@ mod tests {
 
     #[test]
     fn certificates_are_checked_only_with_a_clock() {
-        let args = curl_args(IMAGE_URL, Path::new("/tmp/wic.xz"));
+        let args = curl_args(&url(IMAGE_URL), Path::new("/tmp/wic.xz"));
         let insecure = args.iter().any(|arg| arg == "--insecure");
         assert_eq!(insecure, cfg!(not(feature = "rtc")));
     }
@@ -589,12 +593,8 @@ mod tests {
             self.record("network".to_string())
         }
 
-        fn download(&mut self, url: &str, target: &Path) -> Result<(), FlashError> {
-            self.record(format!(
-                "download {} to {}",
-                redacted(url),
-                target.display()
-            ))
+        fn download(&mut self, url: &Url, target: &Path) -> Result<(), FlashError> {
+            self.record(format!("download {url} to {}", target.display()))
         }
 
         fn read_sha256_file(&mut self, path: &Path) -> Result<String, FlashError> {
@@ -646,11 +646,12 @@ mod tests {
             root_partition: PathBuf::from("/dev/sda2"),
         })
         .unwrap();
+        let (image_url, sha256_url) = (url(IMAGE_URL), url(SHA256_URL));
         let ctx = UrlCtx {
             layout: &layout,
             rootfs: Path::new("/rootfs"),
-            image_url: IMAGE_URL,
-            sha256_url: SHA256_URL,
+            image_url: &image_url,
+            sha256_url: &sha256_url,
         };
         let result = url_with(&ctx, &mut ops);
         (result, ops.calls)
@@ -820,7 +821,7 @@ mod tests {
             step: "download",
             passes: 1,
         });
-        let (result, _) = run_recorded(ops);
+        let _ = run_recorded(ops);
         let lines = crate::logging::take_capture();
         assert!(
             lines.iter().any(|line| line.contains("example.invalid")),
@@ -832,6 +833,24 @@ mod tests {
                 .all(|line| !line.contains("sig=") && !line.contains("pass")),
             "{lines:?}"
         );
-        assert!(!result.unwrap_err().to_string().contains("sig="));
+    }
+
+    #[test]
+    fn a_failed_download_names_the_url_redacted() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = url("file:///nonexistent/omnect.wic.xz?sig=secret");
+        let err = RealUrlOps::default()
+            .download(&missing, &dir.path().join(IMAGE_FILE_NAME))
+            .unwrap_err();
+        let printed = err.to_string();
+        assert!(
+            matches!(err, FlashError::DownloadFailed { .. }),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("file:///nonexistent/omnect.wic.xz"),
+            "{printed}"
+        );
+        assert!(!printed.contains("sig="), "{printed}");
     }
 }

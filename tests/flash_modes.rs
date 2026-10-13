@@ -165,7 +165,7 @@ mod mode_2_detection {
 mod mode_3_detection {
     use omnect_os_init::MockBootEnv;
     use omnect_os_init::bootloader::BootEnvKey;
-    use omnect_os_init::mode::flash::config::{EnvUrl, FlashMode};
+    use omnect_os_init::mode::flash::config::{EnvUrl, FlashMode, Url};
     use omnect_os_init::mode::{BootMode, EnforceFlag};
 
     /// base64 of `https://example.invalid/omnect.wic.xz?sig=secret` plus the
@@ -185,8 +185,9 @@ mod mode_3_detection {
             panic!("key 3 must select a flash mode");
         };
         assert_eq!(config.mode, FlashMode::Mode3);
-        assert_eq!(config.image_url, EnvUrl::Set(URL.into()));
-        assert_eq!(config.sha256_url, EnvUrl::Set(URL.into()));
+        let url = Url::parse(URL).unwrap();
+        assert_eq!(config.image_url, EnvUrl::Set(url.clone()));
+        assert_eq!(config.sha256_url, EnvUrl::Set(url));
         // Clearing is the mode's own first step, so it reaches the run log.
         assert!(env.set_env_calls.is_empty());
     }

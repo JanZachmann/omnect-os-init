@@ -279,9 +279,8 @@ fn run_selected_mode(
         config::FlashMode::Mode3 => url::run_url(&url::UrlCtx {
             layout: ctx.layout,
             rootfs: ctx.rootfs,
-            image_url: env_value(&flash_config.image_url, BootEnvKey::FlashModeUrl)?.as_str(),
-            sha256_url: env_value(&flash_config.sha256_url, BootEnvKey::FlashModeUrlSha256)?
-                .as_str(),
+            image_url: env_value(&flash_config.image_url, BootEnvKey::FlashModeUrl)?,
+            sha256_url: env_value(&flash_config.sha256_url, BootEnvKey::FlashModeUrlSha256)?,
         }),
     }
 }
@@ -763,10 +762,8 @@ mod tests {
                 "{err}"
             );
         }
-        let set = config::EnvUrl::Set("https://example.invalid/wic.xz".into());
-        assert_eq!(
-            env_value(&set, BootEnvKey::FlashModeUrl).unwrap().as_str(),
-            "https://example.invalid/wic.xz"
-        );
+        let url = config::Url::parse("https://example.invalid/wic.xz").unwrap();
+        let set = config::EnvUrl::Set(url.clone());
+        assert_eq!(env_value(&set, BootEnvKey::FlashModeUrl).unwrap(), &url);
     }
 }
