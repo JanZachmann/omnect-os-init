@@ -2,3 +2,5 @@
 
 #[allow(dead_code)]
 mod config;
+#[allow(dead_code)]
+mod moddep;
