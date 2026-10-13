@@ -8,6 +8,8 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 
 #[cfg(feature = "flash-mode-3")]
 const SCHEME_SEPARATOR: &str = "://";
+#[cfg(feature = "flash-mode-3")]
+const HIDDEN: &str = "<hidden>";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlashMode {
@@ -100,11 +102,15 @@ fn redacted(url: &str) -> String {
     let (scheme, rest) = url
         .find(SCHEME_SEPARATOR)
         .map_or(("", url), |at| url.split_at(at + SCHEME_SEPARATOR.len()));
-    // User info goes first: a `?` or `#` in a password starts no query string.
-    let authority_end = rest.find('/').unwrap_or(rest.len());
-    let host_start = rest[..authority_end].rfind('@').map_or(0, |at| at + 1);
-    let rest = &rest[host_start..];
-    let rest = rest.split(['?', '#']).next().unwrap_or(rest);
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = match authority.rsplit_once('@') {
+        // It is unclear where the user info ends, so none of it is shown.
+        Some((info, _)) if info.contains(['?', '#']) => return format!("{scheme}{HIDDEN}"),
+        Some((_, host)) => host,
+        None => authority,
+    };
+    let rest = format!("{host}{path}");
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
     format!("{scheme}{rest}")
 }
 
@@ -303,9 +309,16 @@ mod tests {
             assert_eq!(redacted("https://user:pass@host"), "https://host");
             assert_eq!(redacted("host/a?sig=secret"), "host/a");
             assert_eq!(redacted("user:pass@host/a?sig=secret"), "host/a");
-            assert_eq!(redacted("https://user:se?cret@host/x"), "https://host/x");
-            assert_eq!(redacted("https://user:se#cret@host"), "https://host");
             assert_eq!(redacted("https://host?sig=secret"), "https://host");
+            assert_eq!(redacted("https://host/a@b?sig=secret"), "https://host/a@b");
+            for unclear in [
+                "https://user:se?cret@host/x",
+                "https://user:se#cret@host",
+                "https://host?sig=se@cret",
+                "https://host#se@cret/x",
+            ] {
+                assert_eq!(redacted(unclear), "https://<hidden>", "{unclear}");
+            }
         }
 
         #[test]
