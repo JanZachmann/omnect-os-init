@@ -71,7 +71,7 @@ pub struct Url(String);
 #[cfg(feature = "flash-mode-3")]
 impl Url {
     /// Trimmed; `None` for a blank `url`.
-    pub fn parse(url: &str) -> Option<Self> {
+    pub fn new(url: &str) -> Option<Self> {
         let url = url.trim();
         (!url.is_empty()).then(|| Self(url.to_string()))
     }
@@ -179,7 +179,7 @@ pub(crate) fn parse_url(value: Option<&str>) -> EnvUrl {
         Err(e) => return EnvUrl::Invalid(format!("not base64: {e}")),
     };
     match String::from_utf8(decoded) {
-        Ok(url) => Url::parse(&url).map_or_else(
+        Ok(url) => Url::new(&url).map_or_else(
             || EnvUrl::Invalid("decodes to an empty URL".to_string()),
             EnvUrl::Set,
         ),
@@ -257,7 +257,7 @@ mod tests {
         }
 
         fn url(text: &str) -> Url {
-            Url::parse(text).unwrap()
+            Url::new(text).unwrap()
         }
 
         #[test]
@@ -285,9 +285,9 @@ mod tests {
         #[test]
         fn a_blank_url_does_not_parse() {
             for blank in ["", " ", "\n"] {
-                assert_eq!(Url::parse(blank), None, "{blank:?}");
+                assert_eq!(Url::new(blank), None, "{blank:?}");
             }
-            assert_eq!(Url::parse(" a \n").unwrap().unredacted(), "a");
+            assert_eq!(Url::new(" a \n").unwrap().unredacted(), "a");
         }
 
         #[test]

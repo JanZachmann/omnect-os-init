@@ -251,7 +251,7 @@ impl UrlOps for RealUrlOps {
                 output_tail(&output.stderr, CURL_REASON_LINES)
             )));
         }
-        if let Some(effective) = Url::parse(&String::from_utf8_lossy(&output.stdout)) {
+        if let Some(effective) = Url::new(&String::from_utf8_lossy(&output.stdout)) {
             log::info!("downloaded {effective}");
         }
         Ok(())
@@ -433,7 +433,7 @@ mod tests {
     const IMAGE_RAM: u64 = 64 * MIB;
 
     fn url(text: &str) -> Url {
-        Url::parse(text).unwrap()
+        Url::new(text).unwrap()
     }
 
     fn sha256_line(data: &[u8]) -> String {
@@ -914,18 +914,22 @@ mod tests {
 
     #[test]
     fn a_failed_setup_or_finish_step_stops_mode_3_there() {
-        let steps = [
-            ("unmount", true),
-            ("network", true),
-            ("reread", false),
+        type IsExpected = fn(&FlashError) -> bool;
+        let any: IsExpected = |_| true;
+        let steps: &[(&str, bool, IsExpected)] = &[
+            ("unmount", true, any),
+            ("network", true, any),
+            ("reread", false, |e| {
+                matches!(e, FlashError::StalePartitionTable { .. })
+            }),
             #[cfg(feature = "grub")]
-            ("mount efivarfs", true),
+            ("mount efivarfs", true, any),
             #[cfg(feature = "grub")]
-            ("efibootmgr", true),
+            ("efibootmgr", true, any),
             #[cfg(feature = "grub")]
-            ("write entry dump", true),
+            ("write entry dump", true, any),
         ];
-        for (step, log_is_kept) in steps {
+        for &(step, log_is_kept, is_expected) in steps {
             let mut ops = RecordingUrlOps::new();
             ops.faults.push(Fault { step, passes: 0 });
             let (result, calls) = run_recorded(ops);
@@ -935,17 +939,11 @@ mod tests {
                 "{step} must be the last step, got {calls:?}"
             );
             assert_eq!(keeps_log(&result), log_is_kept, "{step}: {result:?}");
+            assert!(
+                is_expected(result.as_ref().unwrap_err()),
+                "{step}: {result:?}"
+            );
         }
-        let mut ops = RecordingUrlOps::new();
-        ops.faults.push(Fault {
-            step: "reread",
-            passes: 0,
-        });
-        let (result, _) = run_recorded(ops);
-        assert!(
-            matches!(result, Err(FlashError::StalePartitionTable { .. })),
-            "{result:?}"
-        );
     }
 
     #[test]

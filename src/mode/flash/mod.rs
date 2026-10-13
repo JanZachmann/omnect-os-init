@@ -820,7 +820,7 @@ mod tests {
                 "{err}"
             );
         }
-        let url = config::Url::parse("https://example.invalid/wic.xz").unwrap();
+        let url = config::Url::new("https://example.invalid/wic.xz").unwrap();
         let set = config::EnvUrl::Set(url.clone());
         assert_eq!(env_value(&set, BootEnvKey::FlashModeUrl).unwrap(), &url);
     }
