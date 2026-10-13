@@ -22,7 +22,7 @@ Implemented functionality:
 - **Factory reset (modes 1-3)**: Selective-preserve backup → wipe `data`/`etc` (modes 2 and 3 only) → reformat → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
 - **Flash mode 1**: Clones the running disk onto another block device given by the `flash-mode-devpath` bootloader env key, triggered by `flash-mode`; powers off on success so the clone can be moved to its own device (feature `flash-mode-1`, part of the default feature set)
 - **Flash mode 2**: Brings up `eth0` with DHCP and starts `dropbear`; the operator pushes a bmap and a `wic.xz` with `scp`, and the init checks the bmap and flashes the image onto the running disk; a failed attempt asks for both again. Triggered by `flash-mode=2` in the bootloader env or by the flag file `/etc/enforce_flash_mode` (feature `flash-mode-2`). Mode 2 wins over a `factory-reset` set at the same time: the reset does not run and an error is logged, with no further handling
-- **Flash mode 3**: Brings up `eth0` with DHCP, downloads a `wic.xz` and its sha256 file from the base64 URLs in `flash-mode-url` and `flash-mode-url-sha256`, checks the image and flashes it onto the running disk. Triggered by `flash-mode=3` (feature `flash-mode-3`). Like mode 2, it wins over a `factory-reset` set at the same time
+- **Flash mode 3**: Brings up `eth0` with DHCP, downloads a `wic.xz` and its sha256 file from the base64 URLs in `flash-mode-url` and `flash-mode-url-sha256`, checks the image and flashes it onto the running disk. Triggered by `flash-mode=3` (feature `flash-mode-3`). It wins over a `factory-reset` set at the same time
 
 ## Startup Flow
 
@@ -264,7 +264,7 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 | `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream. A broken image is seen only after writing started; the init then asks for bmap and image again, and the disk does not boot until a good one was flashed | Implemented |
 | `flash-mode-3` | Flash a `wic.xz` downloaded from a URL | Implemented |
 | `flash-mode-network` | Shared layer of modes 2 and 3: network, unmount sweep, xz decoding. Pulled in by a mode feature, never selected on its own | Implemented |
-| `rtc` | The machine has a reliable real-time clock. Without it, mode 3 does not check TLS certificates, because their validity depends on the time | Implemented |
+| `rtc` | The machine has a reliable real-time clock, so mode 3 checks TLS certificates | Implemented |
 
 > **Note:** `grub` and `uboot` are mutually exclusive, and so are `gpt` and `dos`.
 > Exactly one of each pair must be set at build time — `build.rs` panics otherwise.

@@ -282,16 +282,15 @@ buffered copy covers all of them, followed by the explicit `sync` the legacy
 scripts get from `dd` returning.
 
 The in-process `bmaptool copy` makes the release binary about 166 KiB larger
-(x86-64, `core,uboot,gpt,flash-mode-1,flash-mode-2,factory-reset`: 656 400 to
-826 152 bytes). In exchange, mode 2 drops `bmaptool`, its Python runtime and
+(x86-64, `core,uboot,gpt,flash-mode-1,flash-mode-2,factory-reset`). In exchange, mode 2 drops `bmaptool`, its Python runtime and
 `xz` from the initramfs. The decoder and the parser run in PID 1 with
 `panic = "abort"`, so a panic on a malformed stream is a kernel panic, where a
 crashed `bmaptool` was a failed attempt. `lzma-rust2` and `quick-xml` have no
 `unsafe` code in the features used, and `lzma-rust2` is pinned to an exact
 version until it reaches 1.0, because each 0.x update can change the decoder.
 
-Mode 3 adds about 23 KiB on top of that (x86-64, the same features plus
-`flash-mode-3`, build constants set: 826 280 to 849 944 bytes), because it
+Mode 3 adds about 28 KiB on top of that (x86-64, the same features plus
+`flash-mode-3`, build constants set), because it
 shares the network setup and the decoder with mode 2. A local build without
 the Yocto build constants is no measure: mode 2 then always stops at its
 missing constants, and the compiler drops the rest of it.
@@ -575,7 +574,7 @@ Child processes get an explicit `PATH`: PID 1 has no login environment, and
 
 1. Detection reads `flash-mode-url` and `flash-mode-url-sha256`, base64-decodes
    both and trims the result: CI encodes them with `echo | base64`, which adds a
-   newline. A value that is unset, not base64, not UTF-8 or empty is carried
+   newline. Line breaks inside a value are ignored, as `base64 -d` does. A value that is unset, not base64, not UTF-8 or empty is carried
    into the mode, like an unusable `flash-mode-devpath` (§3.3). The mode clears
    all three keys first (§2.2), then fails on an unusable URL.
 2. Unmount (§5.1), network up (§5.2).
@@ -606,7 +605,9 @@ Child processes get an explicit `PATH`: PID 1 has no login environment, and
    `reboot`.
 
 Log lines and errors name the URLs without user info, query string and
-fragment, which can hold credentials or an access token.
+fragment, which can hold credentials or an access token. When a `?` or `#`
+comes before the `@`, the whole authority is hidden. A token in a path
+segment, as some CDNs sign the path, is logged in full.
 
 Without `rtc`, the sha256 file comes over the same unchecked connection as the
 image. It then detects a corrupted download, not a changed one; the mode logs

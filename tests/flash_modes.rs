@@ -168,8 +168,7 @@ mod mode_3_detection {
     use omnect_os_init::mode::flash::config::{EnvUrl, FlashMode, Url};
     use omnect_os_init::mode::{BootMode, EnforceFlag};
 
-    /// base64 of `https://example.invalid/omnect.wic.xz?sig=secret` plus the
-    /// newline of `echo | base64`.
+    /// base64 of `URL` and a trailing newline.
     const ENCODED: &str = "aHR0cHM6Ly9leGFtcGxlLmludmFsaWQvb21uZWN0LndpYy54ej9zaWc9c2VjcmV0Cg==";
     const URL: &str = "https://example.invalid/omnect.wic.xz?sig=secret";
 
@@ -188,7 +187,7 @@ mod mode_3_detection {
         let url = Url::parse(URL).unwrap();
         assert_eq!(config.image_url, EnvUrl::Set(url.clone()));
         assert_eq!(config.sha256_url, EnvUrl::Set(url));
-        // Clearing is the mode's own first step, so it reaches the run log.
+        // The success path clears nothing: clearing is the mode's own first step.
         assert!(env.set_env_calls.is_empty());
     }
 
