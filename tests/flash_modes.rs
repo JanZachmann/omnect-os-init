@@ -184,7 +184,7 @@ mod mode_3_detection {
             panic!("key 3 must select a flash mode");
         };
         assert_eq!(config.mode, FlashMode::Mode3);
-        let url = Url::parse(URL).unwrap();
+        let url = Url::new(URL).unwrap();
         assert_eq!(config.image_url, EnvUrl::Set(url.clone()));
         assert_eq!(config.sha256_url, EnvUrl::Set(url));
         // The success path clears nothing: clearing is the mode's own first step.

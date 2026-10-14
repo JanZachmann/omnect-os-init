@@ -22,8 +22,8 @@ const NUMBER_MORE_BIT: u8 = 0x80;
 // upstream function adds up concatenated streams and starts at the current
 // position.
 /// The uncompressed size that the index at the end of `file` records. Only a
-/// file that holds exactly one xz stream is accepted, also without stream
-/// padding after it. Index padding and the CRC32 values are not checked: the
+/// file that holds exactly one xz stream is accepted, and no stream padding
+/// may follow it. Index padding and the CRC32 values are not checked: the
 /// sha256 of the image is checked before.
 pub(crate) fn uncompressed_size<F: Read + Seek>(file: &mut F) -> Result<u64, String> {
     let io = |e: io::Error| format!("reading the xz index: {e}");
