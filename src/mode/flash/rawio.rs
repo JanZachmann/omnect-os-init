@@ -1,16 +1,20 @@
 //! Raw byte-range writes to block devices and files.
 
 use std::fs::{File, OpenOptions};
+#[cfg(any(feature = "flash-mode-1", feature = "flash-mode-2"))]
+use std::io::Write;
 #[cfg(feature = "flash-mode-1")]
 use std::io::{ErrorKind, Read};
-use std::io::{Seek, SeekFrom, Write};
-#[cfg(feature = "flash-mode-2")]
+use std::io::{Seek, SeekFrom};
+#[cfg(feature = "flash-mode-network")]
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
+#[cfg(any(feature = "flash-mode-1", feature = "flash-mode-2"))]
 use crate::config::BuildConstant;
 use crate::error::FlashError;
 
+#[cfg(any(feature = "flash-mode-1", feature = "flash-mode-2"))]
 /// Bytes per KiB. Build-time offsets and sizes are KB-valued; block devices
 /// are addressed in bytes.
 pub const KIB: u64 = 1024;
@@ -19,24 +23,27 @@ pub const KIB: u64 = 1024;
 pub const COPY_BUFFER_SIZE: usize = 1024 * 1024;
 
 // BLKRRPART from <linux/fs.h>.
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 const BLK_IOC_MAGIC: u8 = 0x12;
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 const BLKRRPART_NR: u8 = 95;
 
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 nix::ioctl_none!(blkrrpart, BLK_IOC_MAGIC, BLKRRPART_NR);
 
+#[cfg(any(feature = "flash-mode-1", feature = "flash-mode-2"))]
 #[derive(Debug, PartialEq, Eq)]
 pub struct ByteRange {
     pub offset: u64,
     pub len: u64,
 }
 
+#[cfg(any(feature = "flash-mode-1", feature = "flash-mode-2"))]
 pub(crate) fn chunk_len(left: u64, buf_len: usize) -> usize {
     usize::try_from(left).map_or(buf_len, |left| left.min(buf_len))
 }
 
+#[cfg(any(feature = "flash-mode-1", feature = "flash-mode-2"))]
 pub fn kb_to_bytes(kb: u64, name: BuildConstant) -> Result<u64, FlashError> {
     kb.checked_mul(KIB)
         .ok_or_else(|| FlashError::InvalidBuildConstant {
@@ -162,9 +169,20 @@ pub fn zero_range(dst: &Path, range: &ByteRange) -> Result<(), FlashError> {
     dst_file.sync_all().map_err(io_failed)
 }
 
+#[cfg(feature = "flash-mode-network")]
+pub(crate) fn device_len(disk: &Path) -> Result<u64, FlashError> {
+    File::open(disk)
+        .and_then(|mut file| file.seek(SeekFrom::End(0)))
+        .map_err(|e| FlashError::InvalidDestination {
+            device: disk.to_path_buf(),
+            reason: format!("cannot determine size: {e}"),
+        })
+}
+
 /// Make the kernel re-read the partition table of `disk`. Fails while any
-/// partition of `disk` is mounted.
-#[cfg(feature = "flash-mode-2")]
+/// partition of `disk` is mounted. Call it before anything mounts a partition
+/// of a new image, which may sit at another offset.
+#[cfg(feature = "flash-mode-network")]
 pub fn reread_partition_table(disk: &Path) -> Result<(), FlashError> {
     let io_failed = |source| FlashError::PathIo {
         path: disk.to_path_buf(),
@@ -190,6 +208,7 @@ mod tests {
         f
     }
 
+    #[cfg(any(feature = "flash-mode-1", feature = "flash-mode-2"))]
     #[test]
     fn a_chunk_is_at_most_one_buffer() {
         assert_eq!(chunk_len(3, 8), 3);
@@ -317,7 +336,19 @@ mod tests {
         assert!(!dst.exists());
     }
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
+    #[test]
+    fn device_len_is_the_length_of_a_file_and_refuses_a_missing_path() {
+        let disk = file_with(b"0123456789");
+        assert_eq!(device_len(disk.path()).unwrap(), 10);
+        let missing = disk.path().with_extension("missing");
+        assert!(matches!(
+            device_len(&missing),
+            Err(FlashError::InvalidDestination { device, .. }) if device == missing
+        ));
+    }
+
+    #[cfg(feature = "flash-mode-network")]
     #[test]
     fn reread_partition_table_fails_on_a_regular_file() {
         let disk = file_with(b"");

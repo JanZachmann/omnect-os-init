@@ -8,7 +8,7 @@ pub(crate) mod clone;
 pub mod config;
 #[cfg(feature = "grub")]
 pub(crate) mod efi;
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 pub(crate) mod net;
 #[cfg(feature = "flash-mode")]
 pub(crate) mod rawio;
@@ -18,19 +18,27 @@ pub(crate) mod scp;
 pub(crate) mod sfdisk;
 #[cfg(feature = "flash-mode")]
 pub(crate) mod unmount;
+#[cfg(feature = "flash-mode-3")]
+pub(crate) mod url;
+#[cfg(feature = "flash-mode-network")]
+pub(crate) mod xz;
 
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 use std::ffi::OsStr;
 use std::fs;
+#[cfg(feature = "flash-mode-network")]
+use std::fs::File;
+#[cfg(feature = "flash-mode-network")]
+use std::io::Read;
 use std::path::Path;
 #[cfg(any(feature = "flash-mode-1", feature = "grub"))]
 use std::path::PathBuf;
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 use std::process::Command;
 
 use nix::sys::reboot::{RebootMode, reboot};
 
-#[cfg(feature = "flash-mode-1")]
+#[cfg(any(feature = "flash-mode-1", feature = "flash-mode-3"))]
 use crate::bootloader::BootEnvKey;
 use crate::bootloader::sync_filesystems;
 use crate::error::FlashError;
@@ -41,7 +49,7 @@ use crate::partition::{PartitionLayout, PartitionName};
 
 /// `PATH` for child processes: PID 1 has no login environment, and tools such
 /// as `dhcpcd` run hook scripts that look up their own helpers.
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 const CHILD_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Scratch mount points. They sit outside the rootfs mount, which is unmounted
@@ -61,6 +69,8 @@ pub(crate) mod scratch_mounts {
 const MODE_1_LOG_FILE: &str = "flash-mode-1.log";
 #[cfg(feature = "flash-mode-2")]
 const MODE_2_LOG_FILE: &str = "flash-mode-2.log";
+#[cfg(feature = "flash-mode-3")]
+const MODE_3_LOG_FILE: &str = "flash-mode-3.log";
 
 /// Writes the run log: the data partition, the file name, the captured lines.
 type LogWriter<'a> = &'a mut dyn FnMut(&Path, &str, &[String]) -> Result<(), FlashError>;
@@ -68,7 +78,50 @@ type LogWriter<'a> = &'a mut dyn FnMut(&Path, &str, &[String]) -> Result<(), Fla
 type ModeRunner<'a> =
     &'a mut dyn FnMut(&config::FlashConfig, &BootContext<'_>) -> Result<(), FlashError>;
 
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
+pub(crate) const SHA256_LEN: usize = 32;
+
+#[cfg(feature = "flash-mode-network")]
+pub(crate) fn sha256_from_hex(text: &str) -> Result<[u8; SHA256_LEN], hex::FromHexError> {
+    let mut digest = [0u8; SHA256_LEN];
+    hex::decode_to_slice(text, &mut digest)?;
+    Ok(digest)
+}
+
+/// A file larger than `max_len` comes from a wrong source and would fill RAM.
+#[cfg(feature = "flash-mode-network")]
+pub(crate) fn read_small_text(
+    path: &Path,
+    max_len: u64,
+    invalid: impl Fn(String) -> FlashError,
+) -> Result<String, FlashError> {
+    let mut bytes = Vec::new();
+    File::open(path)
+        .and_then(|file| file.take(max_len + 1).read_to_end(&mut bytes))
+        .map_err(|source| FlashError::PathIo {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > max_len {
+        return Err(invalid(format!("larger than {max_len} bytes")));
+    }
+    String::from_utf8(bytes).map_err(|_| invalid("not UTF-8 text".to_string()))
+}
+
+/// The last `count` non-empty lines of a child's output, joined for an error
+/// reason. A carriage return ends a line, as in progress output.
+#[cfg(any(feature = "flash-mode-1", feature = "flash-mode-3"))]
+pub(crate) fn output_tail(output: &[u8], count: usize) -> String {
+    let text = String::from_utf8_lossy(output);
+    let lines: Vec<&str> = text
+        .split(['\r', '\n'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(count)..].join("; ")
+}
+
+#[cfg(feature = "flash-mode-network")]
 fn child(cmd: &str) -> Command {
     let mut command = Command::new(cmd);
     command.env("PATH", CHILD_PATH);
@@ -77,7 +130,7 @@ fn child(cmd: &str) -> Command {
 
 /// Run `cmd` with inherited stdout and stderr, so the operator sees its
 /// output.
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 pub(crate) fn run_inherited(cmd: &str, args: &[&OsStr]) -> Result<(), String> {
     let status = child(cmd)
         .args(args)
@@ -95,6 +148,16 @@ fn log_file(mode: config::FlashMode) -> &'static str {
         config::FlashMode::Mode1 => MODE_1_LOG_FILE,
         #[cfg(feature = "flash-mode-2")]
         config::FlashMode::Mode2 => MODE_2_LOG_FILE,
+        #[cfg(feature = "flash-mode-3")]
+        config::FlashMode::Mode3 => MODE_3_LOG_FILE,
+    }
+}
+
+#[cfg(feature = "flash-mode-network")]
+pub(crate) fn partly_written(disk: &Path, source: FlashError) -> FlashError {
+    FlashError::DiskPartlyWritten {
+        disk: disk.to_path_buf(),
+        source: Box::new(source),
     }
 }
 
@@ -102,7 +165,7 @@ fn log_file(mode: config::FlashMode) -> &'static str {
 /// partition table the disk no longer has.
 fn keeps_log(outcome: &Result<(), FlashError>) -> bool {
     match outcome {
-        #[cfg(feature = "flash-mode-2")]
+        #[cfg(feature = "flash-mode-network")]
         Err(FlashError::DiskPartlyWritten { .. } | FlashError::StalePartitionTable { .. }) => false,
         _ => true,
     }
@@ -114,6 +177,8 @@ fn terminal_action(mode: config::FlashMode) -> RebootMode {
         config::FlashMode::Mode1 => RebootMode::RB_POWER_OFF,
         #[cfg(feature = "flash-mode-2")]
         config::FlashMode::Mode2 => RebootMode::RB_AUTOBOOT,
+        #[cfg(feature = "flash-mode-3")]
+        config::FlashMode::Mode3 => RebootMode::RB_AUTOBOOT,
     }
 }
 
@@ -149,17 +214,14 @@ pub(crate) fn with_mount<T>(
     result
 }
 
-/// The destination mode 1 was given.
-#[cfg(feature = "flash-mode-1")]
-fn destination(flash_config: &config::FlashConfig) -> Result<&Path, FlashError> {
-    let invalid = |reason: String| FlashError::InvalidEnvValue {
-        key: BootEnvKey::FlashModeDevPath,
-        reason,
-    };
-    match &flash_config.devpath {
-        config::Devpath::Set(path) => Ok(path),
-        config::Devpath::NotSet => Err(invalid("not set".to_string())),
-        config::Devpath::Unreadable(e) => Err(invalid(format!("failed to read env: {e}"))),
+#[cfg(any(feature = "flash-mode-1", feature = "flash-mode-3"))]
+fn env_value<T>(value: &config::EnvValue<T>, key: BootEnvKey) -> Result<&T, FlashError> {
+    let invalid = |reason: String| FlashError::InvalidEnvValue { key, reason };
+    match value {
+        config::EnvValue::Set(value) => Ok(value),
+        config::EnvValue::NotSet => Err(invalid("not set".to_string())),
+        config::EnvValue::Invalid(reason) => Err(invalid(reason.clone())),
+        config::EnvValue::Unreadable(e) => Err(invalid(format!("failed to read env: {e}"))),
     }
 }
 
@@ -217,7 +279,7 @@ fn run_selected_mode(
     match flash_config.mode {
         #[cfg(feature = "flash-mode-1")]
         config::FlashMode::Mode1 => clone::run_clone(&clone::CloneCtx {
-            destination: destination(flash_config)?,
+            destination: env_value(&flash_config.devpath, BootEnvKey::FlashModeDevPath)?,
             layout: ctx.layout,
             rootfs: ctx.rootfs,
         }),
@@ -225,6 +287,13 @@ fn run_selected_mode(
         config::FlashMode::Mode2 => scp::run_scp(&scp::ScpCtx {
             layout: ctx.layout,
             rootfs: ctx.rootfs,
+        }),
+        #[cfg(feature = "flash-mode-3")]
+        config::FlashMode::Mode3 => url::run_url(&url::UrlCtx {
+            layout: ctx.layout,
+            rootfs: ctx.rootfs,
+            image_url: env_value(&flash_config.image_url, BootEnvKey::FlashModeUrl)?,
+            sha256_url: env_value(&flash_config.sha256_url, BootEnvKey::FlashModeUrlSha256)?,
         }),
     }
 }
@@ -267,7 +336,7 @@ fn run_and_persist(
 ///
 /// The `Ok` path does not return: it ends in the mode's terminal action. Mode 1
 /// powers off, because it leaves a clone on a second disk that an operator has
-/// to move. Mode 2 reboots into the new image.
+/// to move. Modes 2 and 3 reboot into the new image.
 pub(crate) fn run(
     mut ctx: BootContext<'_>,
     flash_config: config::FlashConfig,
@@ -288,10 +357,13 @@ mod tests {
     use super::*;
     #[cfg(feature = "flash-mode-1")]
     use crate::bootloader::{BootEnv, MockBootEnv};
-    #[cfg(not(any(feature = "flash-mode-1", feature = "grub")))]
+    #[cfg(all(
+        feature = "flash-mode-network",
+        not(any(feature = "flash-mode-1", feature = "grub"))
+    ))]
     use std::path::PathBuf;
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[test]
     fn children_get_the_explicit_path() {
         let command = child("/bin/true");
@@ -302,7 +374,7 @@ mod tests {
         assert_eq!(path, Some(OsStr::new(CHILD_PATH)));
     }
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[test]
     fn a_failing_child_is_reported_with_its_status() {
         let reason = run_inherited("/bin/false", &[]).unwrap_err();
@@ -320,7 +392,7 @@ mod tests {
         clear_flash_triggers(&mut mock);
         assert_eq!(
             mock.set_env_calls,
-            vec![BootEnvKey::FlashMode, BootEnvKey::FlashModeDevPath],
+            all_flash_triggers(),
             "the selector must be cleared first, so a crash mid-flash cannot re-enter"
         );
         assert_eq!(mock.get_env(BootEnvKey::FlashMode).unwrap(), None);
@@ -347,10 +419,7 @@ mod tests {
             BootEnvState::Available(Box::new(mock)),
             OdsStatus::default(),
         );
-        let flash_config = config::FlashConfig {
-            mode: config::FlashMode::Mode1,
-            devpath: config::Devpath::NotSet,
-        };
+        let flash_config = config::FlashConfig::new(config::FlashMode::Mode1);
 
         // Fails before any device is touched.
         let err =
@@ -382,7 +451,7 @@ mod tests {
         );
         assert_eq!(
             cleared,
-            vec![BootEnvKey::FlashMode, BootEnvKey::FlashModeDevPath],
+            all_flash_triggers(),
             "a failed run must not leave a trigger that re-enters on the next boot"
         );
     }
@@ -466,27 +535,50 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "flash-mode-2")]
-    fn mode_2_cleared() -> Vec<crate::bootloader::BootEnvKey> {
+    fn all_flash_triggers() -> Vec<crate::bootloader::BootEnvKey> {
         use crate::bootloader::BootEnvKey;
         [
             BootEnvKey::FlashMode,
             #[cfg(feature = "flash-mode-1")]
             BootEnvKey::FlashModeDevPath,
+            #[cfg(feature = "flash-mode-3")]
+            BootEnvKey::FlashModeUrl,
+            #[cfg(feature = "flash-mode-3")]
+            BootEnvKey::FlashModeUrlSha256,
         ]
         .to_vec()
     }
 
-    #[cfg(feature = "flash-mode-2")]
-    fn run_mode_2(
+    #[cfg(feature = "flash-mode-network")]
+    fn network_modes() -> Vec<config::FlashMode> {
+        [
+            #[cfg(feature = "flash-mode-2")]
+            config::FlashMode::Mode2,
+            #[cfg(feature = "flash-mode-3")]
+            config::FlashMode::Mode3,
+        ]
+        .to_vec()
+    }
+
+    /// Runs `mode` with every trigger set; returns the outcome, the cleared
+    /// keys, and the triggers still set afterwards.
+    #[cfg(feature = "flash-mode-network")]
+    fn run_network_mode(
+        mode: config::FlashMode,
         result: fn() -> Result<(), FlashError>,
         write: LogWriter<'_>,
-    ) -> (crate::Result<()>, Vec<crate::bootloader::BootEnvKey>) {
+    ) -> (
+        crate::Result<()>,
+        Vec<crate::bootloader::BootEnvKey>,
+        Vec<crate::bootloader::BootEnvKey>,
+    ) {
         use crate::bootloader::{BootEnvState, MockBootEnv};
         use crate::config::Config;
         use crate::runtime::OdsStatus;
 
-        let mock = MockBootEnv::new();
+        let mock = all_flash_triggers()
+            .into_iter()
+            .fold(MockBootEnv::new(), |mock, key| mock.with_env(key, "set"));
         let cleared = mock.shared_set_env_calls();
         let cleared_at_start = cleared.clone();
         let config = Config::default();
@@ -500,11 +592,11 @@ mod tests {
         );
         let outcome = run_and_persist(
             &mut ctx,
-            &crate::mode::mode_2_config(),
+            &config::FlashConfig::new(mode),
             &mut |_, _| {
                 assert_eq!(
                     *cleared_at_start.lock().unwrap(),
-                    mode_2_cleared(),
+                    all_flash_triggers(),
                     "the selector must be cleared before the mode runs"
                 );
                 result()
@@ -512,13 +604,18 @@ mod tests {
             write,
         )
         .map_err(Into::into);
+        let bl = ctx.boot_env.available_mut().unwrap();
+        let still_set = all_flash_triggers()
+            .into_iter()
+            .filter(|key| bl.get_env(*key).unwrap().is_some())
+            .collect();
         let cleared = cleared.lock().unwrap().clone();
-        (outcome, cleared)
+        (outcome, cleared, still_set)
     }
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[test]
-    fn a_written_disk_gets_no_mode_2_log_after_a_failure() {
+    fn a_written_disk_gets_no_run_log_after_a_failure() {
         let _guard = crate::logging::capture::SERIALIZE
             .lock()
             .unwrap_or_else(|p| p.into_inner());
@@ -538,64 +635,88 @@ mod tests {
                 })
             },
         ];
-        for result in results {
-            let mut writes = 0;
-            let (outcome, cleared) = run_mode_2(result, &mut |_, _, _| {
-                writes += 1;
-                Ok(())
-            });
-            assert!(outcome.is_err());
-            assert_eq!(writes, 0, "the data partition must not be mounted");
-            assert_eq!(cleared, mode_2_cleared(), "the triggers must be cleared");
+        for mode in network_modes() {
+            for result in results {
+                let mut writes = 0;
+                let (outcome, cleared, still_set) =
+                    run_network_mode(mode, result, &mut |_, _, _| {
+                        writes += 1;
+                        Ok(())
+                    });
+                assert!(outcome.is_err());
+                assert_eq!(
+                    writes, 0,
+                    "{mode:?}: the data partition must not be mounted"
+                );
+                assert_eq!(cleared, all_flash_triggers(), "{mode:?}");
+                assert!(still_set.is_empty(), "{mode:?}: {still_set:?}");
+            }
         }
     }
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[test]
-    fn a_mode_2_run_that_fails_before_the_disk_is_written_keeps_its_log() {
+    fn a_run_that_fails_before_the_disk_is_written_keeps_its_log() {
         let _guard = crate::logging::capture::SERIALIZE
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         crate::logging::capture::install_test_logger();
 
-        let mut writes = 0;
-        let (outcome, _) = run_mode_2(
-            || Err(FlashError::NetworkFailed("no lease".to_string())),
-            &mut |_, _, _| {
-                writes += 1;
-                Ok(())
-            },
-        );
-        assert!(outcome.is_err());
-        assert_eq!(writes, 1);
+        for mode in network_modes() {
+            let mut written: Vec<(String, Vec<String>)> = Vec::new();
+            let (outcome, _, still_set) = run_network_mode(
+                mode,
+                || Err(FlashError::NetworkFailed("no lease".to_string())),
+                &mut |_, file, lines| {
+                    written.push((file.to_string(), lines.to_vec()));
+                    Ok(())
+                },
+            );
+            assert!(outcome.is_err());
+            assert!(still_set.is_empty(), "{mode:?}: {still_set:?}");
+            let [(file, lines)] = written.as_slice() else {
+                panic!("{mode:?}: the run log must be written once, got {written:?}");
+            };
+            assert_eq!(file, log_file(mode));
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.starts_with("[ERROR] flash mode failed:")
+                        && line.contains("no lease")),
+                "{mode:?}: {lines:?}"
+            );
+        }
     }
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[test]
-    fn a_successful_mode_2_run_writes_its_log_to_the_data_partition() {
+    fn a_successful_run_writes_its_log_to_the_data_partition() {
         let _guard = crate::logging::capture::SERIALIZE
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         crate::logging::capture::install_test_logger();
 
-        let mut written: Vec<(std::path::PathBuf, String, Vec<String>)> = Vec::new();
-        let (outcome, cleared) = run_mode_2(|| Ok(()), &mut |partition, file, lines| {
-            written.push((partition.to_path_buf(), file.to_string(), lines.to_vec()));
-            Ok(())
-        });
-        assert!(outcome.is_ok());
-        assert_eq!(cleared, mode_2_cleared());
-        let [(partition, file, lines)] = written.as_slice() else {
-            panic!("the run log must be written once, got {written:?}");
-        };
-        assert_eq!(Some(partition), source_layout().get(PartitionName::Data));
-        assert_eq!(file, "flash-mode-2.log");
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("flash mode finished")),
-            "got {lines:?}"
-        );
+        for mode in network_modes() {
+            let mut written: Vec<(std::path::PathBuf, String, Vec<String>)> = Vec::new();
+            let (outcome, cleared, _) =
+                run_network_mode(mode, || Ok(()), &mut |partition, file, lines| {
+                    written.push((partition.to_path_buf(), file.to_string(), lines.to_vec()));
+                    Ok(())
+                });
+            assert!(outcome.is_ok());
+            assert_eq!(cleared, all_flash_triggers());
+            let [(partition, file, lines)] = written.as_slice() else {
+                panic!("{mode:?}: the run log must be written once, got {written:?}");
+            };
+            assert_eq!(Some(partition), source_layout().get(PartitionName::Data));
+            assert_eq!(file, log_file(mode));
+            assert!(
+                lines
+                    .iter()
+                    .any(|line| line.contains("flash mode finished")),
+                "{mode:?}: {lines:?}"
+            );
+        }
     }
 
     #[test]
@@ -610,20 +731,97 @@ mod tests {
             terminal_action(config::FlashMode::Mode2),
             RebootMode::RB_AUTOBOOT
         );
+        #[cfg(feature = "flash-mode-3")]
+        assert_eq!(
+            terminal_action(config::FlashMode::Mode3),
+            RebootMode::RB_AUTOBOOT
+        );
     }
 
     #[cfg(feature = "flash-mode-1")]
     #[test]
     fn a_missing_destination_is_reported_with_its_reason() {
-        let flash_config = config::FlashConfig {
-            mode: config::FlashMode::Mode1,
-            devpath: config::Devpath::NotSet,
-        };
-        let err = destination(&flash_config).unwrap_err();
+        let flash_config = config::FlashConfig::new(config::FlashMode::Mode1);
+        let err = env_value(&flash_config.devpath, BootEnvKey::FlashModeDevPath).unwrap_err();
         assert!(
             matches!(&err, FlashError::InvalidEnvValue { key, reason }
                 if *key == BootEnvKey::FlashModeDevPath && reason == "not set"),
             "the absent destination must be named by its env key and reason, got: {err}"
         );
+    }
+
+    #[cfg(feature = "flash-mode-3")]
+    #[test]
+    fn mode_3_writes_its_run_log_under_the_name_operators_look_for() {
+        assert_eq!(log_file(config::FlashMode::Mode3), "flash-mode-3.log");
+    }
+
+    #[cfg(feature = "flash-mode-3")]
+    #[test]
+    fn an_unusable_mode_3_url_fails_before_any_work_and_clears_the_triggers() {
+        use crate::bootloader::{BootEnvState, MockBootEnv};
+        use crate::config::Config;
+        use crate::runtime::OdsStatus;
+
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mock = MockBootEnv::new()
+            .with_env(BootEnvKey::FlashMode, "3")
+            .with_env(BootEnvKey::FlashModeUrl, "not base64!!");
+        let cleared = mock.shared_set_env_calls();
+        let config = Config::default();
+        let layout = source_layout();
+        let mut ctx = BootContext::new(
+            &config,
+            &layout,
+            Path::new("/nonexistent/rootfs"),
+            BootEnvState::Available(Box::new(mock)),
+            OdsStatus::default(),
+        );
+        let flash_config = config::FlashConfig {
+            image_url: config::EnvUrl::Invalid("not base64".to_string()),
+            ..config::FlashConfig::new(config::FlashMode::Mode3)
+        };
+
+        let err = run_and_persist(
+            &mut ctx,
+            &flash_config,
+            &mut run_selected_mode,
+            &mut |_, _, _| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, FlashError::InvalidEnvValue { key, .. } if *key == BootEnvKey::FlashModeUrl),
+            "{err}"
+        );
+        assert_eq!(*cleared.lock().unwrap(), all_flash_triggers());
+    }
+
+    #[cfg(feature = "flash-mode-3")]
+    #[test]
+    fn each_unusable_url_names_its_key_and_reason() {
+        let cases = [
+            (config::EnvUrl::NotSet, "not set"),
+            (
+                config::EnvUrl::Invalid("not base64".to_string()),
+                "not base64",
+            ),
+            (
+                config::EnvUrl::Unreadable("fw_printenv failed".to_string()),
+                "failed to read env: fw_printenv failed",
+            ),
+        ];
+        for (url, expected) in cases {
+            let err = env_value(&url, BootEnvKey::FlashModeUrlSha256).unwrap_err();
+            assert!(
+                matches!(&err, FlashError::InvalidEnvValue { key, reason }
+                    if *key == BootEnvKey::FlashModeUrlSha256 && reason == expected),
+                "{err}"
+            );
+        }
+        let url = config::Url::new("https://example.invalid/wic.xz").unwrap();
+        let set = config::EnvUrl::Set(url.clone());
+        assert_eq!(env_value(&set, BootEnvKey::FlashModeUrl).unwrap(), &url);
     }
 }

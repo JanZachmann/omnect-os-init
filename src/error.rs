@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::filesystem::FsckExitCode;
+#[cfg(feature = "flash-mode-3")]
+use crate::mode::flash::config::Url;
 use crate::recovery::RecoveryClass;
 
 /// Result type alias for the initramfs
@@ -374,14 +376,14 @@ pub enum FlashError {
     #[error("EFI handling failed: {0}")]
     EfiFailed(String),
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[error("{} may be partly written: {source}", disk.display())]
     DiskPartlyWritten {
         disk: PathBuf,
         source: Box<FlashError>,
     },
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[error("the kernel may still use the old partition table of {}: {source}", disk.display())]
     StalePartitionTable {
         disk: PathBuf,
@@ -392,9 +394,17 @@ pub enum FlashError {
     #[error("bmap {} is unusable: {reason}", path.display())]
     InvalidBmap { path: PathBuf, reason: String },
 
-    #[cfg(feature = "flash-mode-2")]
+    #[cfg(feature = "flash-mode-network")]
     #[error("Network setup failed: {0}")]
     NetworkFailed(String),
+
+    #[cfg(feature = "flash-mode-3")]
+    #[error("Download of {url} failed: {reason}")]
+    DownloadFailed { url: Url, reason: String },
+
+    #[cfg(feature = "flash-mode-3")]
+    #[error("Image {} is unusable: {reason}", path.display())]
+    InvalidImage { path: PathBuf, reason: String },
 
     #[error("{}: {source}", path.display())]
     PathIo {

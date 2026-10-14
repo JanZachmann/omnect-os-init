@@ -21,7 +21,7 @@ use crate::mode::flash::bmap::{self, Bmap, Destination, Source};
 use crate::mode::flash::rawio::{self, ByteRange, kb_to_bytes};
 #[cfg(feature = "grub")]
 use crate::mode::flash::{efi, layout_partition};
-use crate::mode::flash::{net, unmount};
+use crate::mode::flash::{net, partly_written, unmount};
 use crate::partition::PartitionLayout;
 #[cfg(feature = "grub")]
 use crate::partition::PartitionName;
@@ -222,7 +222,7 @@ impl ScpOps for RealScpOps {
     }
 
     fn bring_up_network(&mut self) -> Result<Ipv4Addr, FlashError> {
-        net::bring_up()
+        net::bring_up(net::Ipv4Need::AnyAddress)
     }
 
     fn start_dropbear(&mut self) -> Result<(), FlashError> {
@@ -246,12 +246,7 @@ impl ScpOps for RealScpOps {
     }
 
     fn device_len(&mut self, disk: &Path) -> Result<u64, FlashError> {
-        File::open(disk)
-            .and_then(|mut file| file.seek(SeekFrom::End(0)))
-            .map_err(|e| FlashError::InvalidDestination {
-                device: disk.to_path_buf(),
-                reason: format!("cannot determine size: {e}"),
-            })
+        rawio::device_len(disk)
     }
 
     fn bmap_copy(
@@ -364,8 +359,6 @@ fn scp_with(
         }
     }
 
-    // The new image may move partitions. Everything after this point mounts
-    // them, so the kernel must drop the table from before the flash first.
     ops.reread_table(disk)
         .map_err(|source| FlashError::StalePartitionTable {
             disk: disk.to_path_buf(),
@@ -378,13 +371,6 @@ fn scp_with(
     log::info!("flash mode 2 finished");
     ops.sync();
     Ok(())
-}
-
-fn partly_written(disk: &Path, source: FlashError) -> FlashError {
-    FlashError::DiskPartlyWritten {
-        disk: disk.to_path_buf(),
-        source: Box::new(source),
-    }
 }
 
 /// One upload and flash.

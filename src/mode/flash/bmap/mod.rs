@@ -6,16 +6,15 @@
 mod copy;
 mod parse;
 
-use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
-use crate::error::FlashError;
-use crate::mode::flash::rawio::ByteRange;
+use crate::{
+    error::FlashError,
+    mode::flash::{SHA256_LEN, rawio::ByteRange, read_small_text},
+};
 
 pub(crate) use copy::copy;
 
-const SHA256_LEN: usize = 32;
 /// Far above the size of a real bmap, which is a few KiB.
 const MAX_BMAP_LEN: u64 = 1024 * 1024;
 
@@ -102,28 +101,15 @@ pub(crate) fn read(path: &Path) -> Result<Bmap, FlashError> {
         path: path.to_path_buf(),
         reason,
     };
-    let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|file| file.take(MAX_BMAP_LEN + 1).read_to_end(&mut bytes))
-        .map_err(|source| FlashError::PathIo {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    if bytes.len() as u64 > MAX_BMAP_LEN {
-        return Err(invalid(format!("larger than {MAX_BMAP_LEN} bytes")));
-    }
-    let text = String::from_utf8(bytes).map_err(|e| invalid(e.to_string()))?;
+    let text = read_small_text(path, MAX_BMAP_LEN, invalid)?;
     Bmap::parse(&text).map_err(invalid)
 }
 
 #[cfg(test)]
 mod test_support {
-    use std::io::Write;
-
-    use lzma_rust2::{XzOptions, XzWriter};
     use sha2::{Digest, Sha256};
 
-    use crate::mode::flash::bmap::SHA256_LEN;
+    use crate::mode::flash::SHA256_LEN;
 
     pub(super) const BLOCK_SIZE: u64 = 4096;
 
@@ -184,11 +170,7 @@ mod test_support {
         image
     }
 
-    pub(super) fn xz(data: &[u8]) -> Vec<u8> {
-        let mut writer = XzWriter::new(Vec::new(), XzOptions::with_preset(1)).unwrap();
-        writer.write_all(data).unwrap();
-        writer.finish().unwrap()
-    }
+    pub(super) use crate::mode::flash::xz::test_support::xz;
 
     pub(super) const FIXTURE_BMAP: &str = include_str!("../testdata/wic.bmap");
     pub(super) const FIXTURE_XZ: &[u8] = include_bytes!("../testdata/wic.xz");

@@ -46,8 +46,10 @@ src/
 │       ├── mod.rs           # Dispatch, terminal action, log capture and persistence
 │       ├── config.rs        # Environment read, validation -> FlashConfig
 │       ├── efi.rs           # efibootmgr handling (feature = grub)
-│       ├── net.rs           # eth0 up, dhcpcd, dropbear (feature = flash-mode-2)
+│       ├── net.rs           # eth0 up, dhcpcd; dropbear for mode 2 (feature = flash-mode-network)
 │       ├── scp.rs           # Mode 2 orchestration: scp upload, flash, retry (feature = flash-mode-2)
+│       ├── url.rs           # Mode 3 orchestration: download, check, flash (feature = flash-mode-3)
+│       ├── xz/              # xz decoder; index size reader for mode 3 (feature = flash-mode-network)
 │       ├── bmap/            # In-process bmap flash (feature = flash-mode-2)
 │       │   ├── mod.rs       # Bmap type, read, unmapped gaps
 │       │   ├── parse.rs     # bmap XML parsing and checks
@@ -118,6 +120,8 @@ src/
   cargo test --no-default-features --features core,uboot,gpt,flash-mode-2-direct,test-utils
   cargo test --no-default-features --features core,grub,gpt,flash-mode-2-direct,test-utils
   cargo test --features uboot,gpt,flash-mode-1,flash-mode-2,factory-reset,test-utils
+  cargo test --no-default-features --features core,uboot,gpt,flash-mode-3,test-utils
+  cargo test --features grub,gpt,flash-mode-1,flash-mode-2,flash-mode-3,factory-reset,test-utils
   ```
   `flash-mode` alone, without a mode feature, is not a supported configuration
   and no combination here or in the README covers it.
@@ -138,6 +142,9 @@ src/
 | `flash-mode` | Shared flash layer: trigger detection, dispatch, log capture. Never selected directly — each mode feature pulls it in |
 | `flash-mode-1` | Clone the running disk onto another block device. Part of the default feature set |
 | `flash-mode-2` | Flash a `wic.xz` pushed in over `scp`; build constants and tools in the README |
+| `flash-mode-3` | Flash a `wic.xz` downloaded from a URL; tools in the README |
+| `flash-mode-network` | Shared layer of modes 2 and 3. Never selected directly |
+| `rtc` | The machine has a reliable clock, so mode 3 checks TLS certificates |
 | `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass. The disk head is zeroed before the image arrives, so if no image is pushed the disk no longer boots |
 | `test-utils` | Expose `MockBootEnv` for integration tests — never enabled in production builds |
 
@@ -180,14 +187,12 @@ Data partition resize (feature = `resize-data`) is handled as an init setup step
 `BootMode::detect()`, is skipped for a flash mode, and handles both the live-bootloader
 (guard check) and degraded-boot (no guard, resize runs every boot) cases.
 
-`Flash(FlashConfig)` is implemented for mode 1 (feature `flash-mode`, pulled in by
-`flash-mode-1`): it clones the running disk onto another block device and powers off
-on success. A queued factory reset together with a flash mode is refused as an error;
-both triggers are cleared before the refusal is raised.
-
-The following are planned:
-- Flash modes 2 and 3 — network push and HTTP/HTTPS download onto the running disk,
-  sharing `Flash(FlashConfig)` with mode 1
+`Flash(FlashConfig)` covers three modes (feature `flash-mode`, pulled in by each
+mode feature). Mode 1 clones the running disk onto another block device and powers
+off on success; a queued factory reset together with mode 1 is refused as an error,
+and both triggers are cleared before the refusal is raised. Modes 2 (`scp` push) and
+3 (URL download) flash the running disk and reboot; each wins over a queued factory
+reset.
 
 When implementing a new variant:
 1. Add the variant to `BootMode` and update `BootMode::detect()` to read the relevant bootloader env key. If the key is absent or the bootloader is unavailable, `detect()` must return `Normal` (degraded boot). A key that is present but unusable belongs to its own mode, which clears it and reports the failure — see `FactoryResetTrigger`.

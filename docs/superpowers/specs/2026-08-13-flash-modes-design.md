@@ -71,8 +71,9 @@ U-Boot writeable-variable whitelist: `flash-mode:dw` and
 
 ### 2.2 Clear-trigger-first invariant
 
-Every mode clears `flash-mode` before doing any work. Mode 3 additionally clears
-each URL key immediately after reading it. A crash or power loss mid-flash then
+Every mode clears `flash-mode` before doing any work, together with every other
+flash key the build has: `flash-mode-devpath` with mode 1, the two URL keys
+with mode 3. A crash or power loss mid-flash then
 leads to a normal boot attempt, never to an endless re-entry into flash mode.
 This matches the factory-reset precedent.
 
@@ -139,16 +140,20 @@ src/mode/flash/
   clone.rs      mode 1 orchestration                                     flash-mode-1
   sfdisk.rs     partition-table dump parsing and rewriting      (pure)   flash-mode-1
   rawio.rs      in-process replacement for every `dd` call               flash-mode, per item
-  unmount.rs    rootfs unmount, /proc/mounts sweep                       flash-mode
-  net.rs        interface up, dhcpcd, dropbear                           flash-mode-2/3
-  bmap/         bmap parser and in-process flasher                       flash-mode-2/3
+  unmount.rs    rootfs unmount; /proc/mounts sweep                       flash-mode; sweep flash-mode-network
+  net.rs        interface up, dhcpcd; dropbear                           flash-mode-network; dropbear flash-mode-2
+  xz/           xz decoder; xz index size reader                         flash-mode-network; reader flash-mode-3
+  bmap/         bmap parser and in-process flasher                       flash-mode-2
   scp.rs        mode 2 orchestration                                     flash-mode-2
   url.rs        mode 3 orchestration                                     flash-mode-3
 ```
 
 The right column is the gating feature (§3.6). In `rawio.rs` each item is gated
 on the modes that use it: `copy_range` on `flash-mode-1`, `zero_range` on
-`flash-mode-2`, the shared constants on `flash-mode`. The device-number helpers
+`flash-mode-2`, the KB and byte-range helpers on `flash-mode-1` or
+`flash-mode-2`, `device_len` and the partition-table re-read on
+`flash-mode-network`, `COPY_BUFFER_SIZE` and `open_existing_for_write` on
+`flash-mode`. The device-number helpers
 (`block_devnum`, `whole_disk_devnum`) are in `partition/device.rs`, gated on
 `flash-mode`, and shared by the mode 1 refusal and the §5.1 sweep.
 
@@ -230,13 +235,11 @@ path.
 | `e2image` | `/usr/sbin/e2image` | `e2fsprogs` | 1 |
 | `mkfs.ext4` | `/usr/sbin/mkfs.ext4` | `e2fsprogs-mke2fs` | 1 |
 | `tune2fs` | `/usr/sbin/tune2fs` | `e2fsprogs-tune2fs` | 1 |
-| `bmaptool` | `/usr/bin/bmaptool` | `bmaptool` | 3 |
 | `curl` | `/usr/bin/curl` | `curl` | 3 |
 | `dhcpcd` | `/usr/sbin/dhcpcd` | `dhcpcd` | 2, 3 |
 | `dropbear` | `/usr/sbin/dropbear` | `dropbear` | 2 |
 | `efibootmgr` | `/usr/sbin/efibootmgr` | `efibootmgr` | 1, 2, 3, EFI machines only |
 | `ip` | `/usr/sbin/ip` | busybox applet | 2, 3 |
-| `xz` | `/usr/bin/xz` | `xz`, run by `bmaptool` | 3 |
 
 `efibootmgr` is absent from the verified image, which has no `efi` in
 `MACHINE_FEATURES` — consistent with the recipe gating and with §6 applying only
@@ -251,11 +254,12 @@ The remaining tools stay external because no pure-Rust equivalent exists at a
 dependency weight an initramfs can carry: `sfdisk` (partition tables),
 `e2image`, `mkfs.ext4` and `tune2fs` (ext4), `efibootmgr` (EFI variables), `curl`, `dhcpcd` and `dropbear`.
 
-Eight operations the legacy scripts shell out for are done in-process instead.
+Eleven operations the legacy scripts shell out for are done in-process instead.
 Five use `nix`, which is already a dependency; `getifaddrs` needs its `net`
 feature, the others are enabled already. `uuidgen` needs the new `uuid` crate;
 `dd` needs nothing; `bmaptool copy` needs `hex`, `lzma-rust2`, `quick-xml` and
-`sha2`:
+`sha2`; the three mode 3 operations reuse `lzma-rust2` and `sha2` and add
+`base64`:
 
 | Legacy | In-process |
 |---|---|
@@ -267,6 +271,9 @@ feature, the others are enabled already. `uuidgen` needs the new `uuid` crate;
 | `sync` | `nix::unistd::sync` |
 | `reboot -f` / `poweroff -f` | `nix::sys::reboot::reboot` with `RB_AUTOBOOT` / `RB_POWER_OFF` |
 | `bmaptool copy` (mode 2) | `bmap/`: bmap parsed with `quick-xml` and `hex`, ranges checked with `sha2`, `xz` decoded with `lzma-rust2` (§5.4) |
+| `bmaptool copy --nobmap` (mode 3) | `xz` decoded with `lzma-rust2`; the size is read from the xz index first (§5.3) |
+| `sha256sum -c` (mode 3) | `sha2` |
+| `base64 --decode` (mode 3) | `base64` |
 
 Every `dd` call in the three modes is a plain read and write at a byte offset —
 the bootloader area copy, the `boot`, `factory` and `cert` partition copies, the
@@ -275,13 +282,18 @@ buffered copy covers all of them, followed by the explicit `sync` the legacy
 scripts get from `dd` returning.
 
 The in-process `bmaptool copy` makes the release binary about 166 KiB larger
-(x86-64, `core,uboot,gpt,flash-mode-1,flash-mode-2,factory-reset`: 656 400 to
-826 152 bytes). In exchange, mode 2 drops `bmaptool`, its Python runtime and
+(x86-64, `core,uboot,gpt,flash-mode-1,flash-mode-2,factory-reset`). In exchange, mode 2 drops `bmaptool`, its Python runtime and
 `xz` from the initramfs. The decoder and the parser run in PID 1 with
 `panic = "abort"`, so a panic on a malformed stream is a kernel panic, where a
 crashed `bmaptool` was a failed attempt. `lzma-rust2` and `quick-xml` have no
 `unsafe` code in the features used, and `lzma-rust2` is pinned to an exact
 version until it reaches 1.0, because each 0.x update can change the decoder.
+
+Mode 3 adds about 28 KiB on top of that (x86-64, the same features plus
+`flash-mode-3`, build constants set), because it
+shares the network setup and the decoder with mode 2. A local build without
+the Yocto build constants is no measure: mode 2 then always stops at its
+missing constants, and the compiler drops the rest of it.
 
 The reboot call follows the existing pattern in `handle_fatal_error`: it returns
 `Result<Infallible>`, so the `Ok` arm is uninhabited and only the error path is
@@ -358,8 +370,8 @@ leaving the triggers set would mean every power cycle hits the same refusal and
 the device never boots again. With both cleared, a power cycle boots normally
 and the operator re-queues whichever action they meant.
 
-Mode 2 and a factory reset set at once runs mode 2 and logs an error that a
-factory reset was also set; the reset does not run. Asking for both is an
+Mode 2 or 3 and a factory reset set at once runs the flash mode and logs an
+error that a factory reset was also set; the reset does not run. Asking for both is an
 operator mistake, so there is no further handling: the `factory-reset` key is
 not cleared, and a `factory-reset` that cannot be read does not stop mode 2.
 
@@ -371,9 +383,11 @@ Detection follows the legacy order `86-factory-reset`, `87-flash_mode_1`,
 | `flash-mode` `1`, with or without the flag | Mode 1 |
 | flag, `flash-mode` `2`, `3`, unknown, blank or unset | Mode 2 |
 | `flash-mode` `2`, no flag | Mode 2 |
+| `flash-mode` `3`, no flag | Mode 3 |
 | `flash-mode` `1`, plus a set `factory-reset` | both cleared, then refused |
 | `flash-mode` `1`, `factory-reset` unreadable | Normal |
 | flag or `flash-mode` `2`, plus a set or unreadable `factory-reset` | Mode 2; a set `factory-reset` is logged as an error |
+| `flash-mode` `3`, no flag, plus a set or unreadable `factory-reset` | Mode 3; a set `factory-reset` is logged as an error |
 | flag, boot env unavailable or `flash-mode` unreadable | Mode 2 |
 
 The flag rows with an unreadable environment follow legacy, which checks the
@@ -411,22 +425,27 @@ in images built without the `factory-reset` feature.
 ### 3.6 `Cargo.toml`
 
 ```toml
-flash-mode = ["core"]                    # shared flash layer; not selected directly
-flash-mode-1 = ["flash-mode"]            # disk cloning; part of the default feature set
-flash-mode-2 = ["flash-mode"]            # scp push over the network
-flash-mode-2-direct = ["flash-mode-2"]   # mode 2 without the verify pass
-flash-mode-3 = ["flash-mode"]            # URL download
+flash-mode = ["core"]                         # shared flash layer; not selected directly
+flash-mode-1 = ["flash-mode"]                 # disk cloning; part of the default feature set
+flash-mode-2 = ["flash-mode-network"]         # scp push over the network
+flash-mode-2-direct = ["flash-mode-2"]        # mode 2 without the verify pass
+flash-mode-3 = ["flash-mode-network"]         # URL download
+flash-mode-network = ["flash-mode"]           # shared layer of modes 2 and 3; not selected directly
+rtc = ["core"]                                # the machine has a reliable real-time clock
 ```
 
 `flash-mode` gates the shared layer — the selector env key, `BootMode::Flash`,
 `config.rs`, `efi.rs`, and the dispatch branch. It is never enabled directly;
-each mode feature pulls it in. `flash-mode-2` and `flash-mode-3` additionally
-gate `net.rs` and `bmap/`.
+each mode feature pulls it in. `flash-mode-network` gates what modes 2 and 3
+share: `net.rs`, the unmount sweep, the partition-table re-read and `xz/`.
+`flash-mode-2` gates `bmap/` and `scp.rs`, `flash-mode-3` gates `url.rs` and the
+xz index reader. The recipe maps `MACHINE_FEATURES` `rtc` onto `rtc` (§5.3).
 
 `flash-mode-1` pulls in one new dependency,
 `uuid = { version = "1.11", default-features = false }`. The bytes come from
 `/dev/urandom`, so a failing random source is an error and not a panic in PID 1.
-`flash-mode-2` pulls in `hex`, `lzma-rust2`, `quick-xml` and `sha2` (§2.8).
+`flash-mode-network` pulls in `hex`, `lzma-rust2` and `sha2`, `flash-mode-2`
+adds `quick-xml` and `flash-mode-3` adds `base64` (§2.8).
 
 `default = ["core", "flash-mode-1"]`, mirroring the legacy recipe, which installs
 `flash-mode-1` unconditionally and gates 2 and 3 on `DISTRO_FEATURES`. This also
@@ -542,6 +561,9 @@ target disk, by sweeping `/proc/mounts`.
 Restricted to `eth0`, as in legacy. Retry `ip link set eth0 up` until it
 succeeds — the interface may be probed late, e.g. a USB NIC — then start
 `dhcpcd eth0` and wait for an IPv4 address. Both waits are bounded (§7). Mode 2
+accepts the IPv4LL address `dhcpcd` sets without a DHCP server, so a peer on
+the same link can reach it. Mode 3 waits for a DHCP lease, because an IPv4LL
+address has no default route and no DNS server. Mode 2
 additionally creates and mounts `devpts` at `/dev/pts`, creates `/etc/dropbear`
 and starts `dropbear -R`, generating the host key at runtime.
 
@@ -550,17 +572,46 @@ Child processes get an explicit `PATH`: PID 1 has no login environment, and
 
 ### 5.3 Mode 3 — pull from URL
 
-1. Clear `flash-mode`. Read and immediately clear `flash-mode-url`, then
-   `flash-mode-url-sha256`. Base64-decode both; reject empty values.
+1. Detection reads `flash-mode-url` and `flash-mode-url-sha256`, base64-decodes
+   both and trims the result: CI encodes them with `echo | base64`, which adds a
+   newline. Line breaks inside a value are ignored, as `base64 -d` does. A value that is unset, not base64, not UTF-8 or empty is carried
+   into the mode, like an unusable `flash-mode-devpath` (§3.3). The mode clears
+   all three keys first (§2.2), then fails on an unusable URL.
 2. Unmount (§5.1), network up (§5.2).
-3. Download the sha256 file, then the image, with
-   `curl --no-progress-meter -Lo`. Add `-k` when `MACHINE_FEATURES` does not
-   contain `rtc`: without a reliable clock, certificate validity cannot be
-   checked.
-4. Verify the image against the downloaded sha256.
-5. `bmaptool copy --nobmap <image> /dev/omnect/rootblk`.
-6. Re-read the partition table (§8.3), EFI handling (§6), `sync`, log (§8),
+3. Download the sha256 file, then the image, into `/tmp/flash-mode-3` in
+   initramfs RAM, with `curl --fail --no-progress-meter --location --globoff`,
+   a 30 s connect timeout and an abort when the transfer stays below 1 byte/s
+   for 60 s. The URL is passed with `--url`, so a URL that starts with `-` is
+   still a URL. Add `--insecure` when the build has no `rtc` feature: without a
+   reliable clock, certificate validity cannot be checked. The recipe maps
+   `MACHINE_FEATURES` `rtc` onto the feature, so the choice is made at build
+   time. An `https://` URL gets `--proto-redir =https`, so a redirect cannot
+   drop the TLS check. `--max-filesize` limits the sha256 file to 4 KiB and the
+   image to the free RAM (`MemAvailable`) minus 128 MiB, which stays free for
+   the xz decoder and the rest of the initramfs; curl 8.4 and later also
+   stops a transfer without a known size at that limit. The last lines of
+   curl's stderr go into the error, and the URL after all redirects is logged.
+4. Hash the image with `sha2` in `COPY_BUFFER_SIZE` chunks and compare it with
+   the first field of the sha256 file. A sha256 file larger than 4 KiB or not
+   UTF-8 is refused as `InvalidImage`: it comes from a wrong URL.
+5. Read the uncompressed size from the xz index and refuse an empty image or
+   one larger than the disk. The reader accepts exactly one xz stream; it is own code until
+   `lzma-rust2` reports the size itself.
+6. Decode the image with `lzma-rust2` onto `/dev/omnect/rootblk` and write every
+   byte, also the zero blocks, as `bmaptool copy --nobmap` did. The write stops
+   before a byte past the indexed size, and a stream that decodes to another
+   size is an error. A failure from here on is `DiskPartlyWritten` (§8.3).
+7. Re-read the partition table (§8.3), EFI handling (§6), `sync`, log (§8),
    `reboot`.
+
+Log lines and errors name the URLs without user info, query string and
+fragment, which can hold credentials or an access token. When a `?` or `#`
+comes before the `@`, the whole authority is hidden. A token in a path
+segment, as some CDNs sign the path, is logged in full.
+
+Without `rtc`, the sha256 file comes over the same unchecked connection as the
+image. It then detects a corrupted download, not a changed one; the mode logs
+a warning that says so. Legacy has the same limitation.
 
 Legacy mode 3 computes a `dest_blk` and a partition suffix from `rootA` and never
 uses them; not ported.
@@ -674,6 +725,8 @@ timeout the mode fails into the normal fatal-error path (§8).
 | Interface up | unbounded | 60 s | machine-driven, should be immediate |
 | IPv4 address after `dhcpcd` returns | unbounded | 120 s | `dhcpcd` returns after its own 30 s timeout and keeps trying in the background; without a DHCP server it assigns an IPv4LL address |
 | Mode 2 `wic.bmap` arrival | unbounded | unbounded | waits for a person to start the `scp` (§10.8) |
+| Mode 3 `curl` connect | unbounded | 30 s | machine-driven |
+| Mode 3 `curl` transfer | unbounded | abort below 1 byte/s for 60 s | a slow but moving download is not cut off; a server that sends a few bytes per second holds the device, which is accepted for a development-only mode |
 
 The values are proposals — reviewers should say if any is wrong for their
 machines. Each becomes a named constant.
@@ -719,14 +772,15 @@ See §10.4.
 | Network setup or wait timeout | Fatal |
 | Download failure or checksum mismatch | Fatal |
 | Mode 2: bmap check, verify pass, flash pass or head zeroing failure | Log error → ask for bmap and image again (§5.4) |
-| Mode 3: `bmaptool` failure | Fatal |
+| Mode 3: unusable URL, empty image, image larger than the disk, or a write failure | Fatal |
 | Partition-table re-read failure after the flash (§8.3) | Fatal, no log. The image is on the disk, but the EFI step and the log mount must not use the old table |
 | EFI handling failure | Fatal. The machine keeps its old entries if the create failed, and the new entry plus any not yet deleted if a delete failed |
 | Log persistence failure | Log warn → continue |
 
 "Fatal" means the mode aborts into §8.1's failure path. For mode 1 the source
-disk is untouched, so a power cycle boots normally. For mode 3 the disk is
-left half-written, which is unavoidable for a whole-disk flash. Mode 2 ends
+disk is untouched, so a power cycle boots normally. For mode 3 the same holds
+up to the write; a failed write leaves the disk half-written, which is
+unavoidable for a whole-disk flash. Mode 2 ends
 fatally only after the flash, when the re-read or the EFI step fails, or when
 the new FIFO for the next attempt cannot be created; the disk is half-written
 in the last case only if an earlier attempt wrote it.
@@ -766,7 +820,8 @@ runs. Persistence depends on whether a safe target exists:
   the log mount. A failed re-read is `FlashError::StalePartitionTable` and also
   leaves no log. Every other outcome, success or a failure before the disk is
   written or after the re-read, writes the log best-effort to the data
-  partition. The file is `flash-mode-2.log` for mode 2.
+  partition. The file is `flash-mode-2.log` for mode 2 and `flash-mode-3.log`
+  for mode 3.
 
 See §10.5.
 
@@ -813,6 +868,15 @@ Behaviour changes, as opposed to bug fixes:
   head after the flash instead of the whole head before it, and asks for bmap
   and image again after a failed attempt instead of stopping (§5.4, §10.1);
 - `dd` is replaced by in-process file I/O (§2.8);
+- mode 3 decodes and writes the image in-process instead of with `bmaptool`,
+  and refuses an empty image or one larger than the disk before the first
+  write (§5.3);
+- mode 3 runs `curl` with `--fail`, so an HTTP error page is not saved as the
+  image, and with the timeouts of §7;
+- mode 3 logs the URLs without user info, query string and fragment; legacy
+  echoed them in full (§5.3);
+- mode 3 waits for a DHCP lease and does not start with an IPv4LL address
+  (§5.2);
 - the EFI loader is passed to `efibootmgr` as `\EFI\BOOT\bootx64.efi`. The
   legacy script's unquoted `\\\\EFI\\\\BOOT` reached it as
   `\\EFI\\BOOT\\bootx64.efi`. Whether the firmware treats both the same is
@@ -991,9 +1055,11 @@ only smoke-tested. Real end-to-end coverage stays in Concourse CI on hardware.
 | `FlashConfig` parse: valid `1`/`2`/`3` | unit | `src/mode/flash/config.rs` |
 | `FlashConfig` parse: unknown value, empty value | unit | `src/mode/flash/config.rs` |
 | Mode 1: missing or empty `flash-mode-devpath` rejected | unit | `src/mode/flash/config.rs` |
-| Mode 3: base64 decode, invalid base64 rejected, empty URL rejected | unit | `src/mode/flash/config.rs` |
+| Mode 3: base64 decode, newline trimmed, invalid base64, non-UTF-8 and empty URL rejected | unit | `src/mode/flash/config.rs` |
 | Destination role → partition index, GPT and DOS | unit | `src/mode/flash/clone.rs` |
-| `curl` options selected from `MACHINE_FEATURES` `rtc` | unit | `src/mode/flash/url.rs` |
+| `curl` options, `--insecure` only without the `rtc` feature | unit | `src/mode/flash/url.rs` |
+| Mode 3 step order; checksum, empty image, size, download, write and re-read failures; no query string in the log | unit | `src/mode/flash/url.rs` |
+| xz index size: single and multi-block, concatenated streams, cut and foreign files refused | unit | `src/mode/flash/xz/index.rs` |
 | scp instruction text includes the acquired IP | unit | `src/mode/flash/scp.rs` |
 | Detection: mode 1 and factory reset set → both cleared, then refused | unit | `src/mode/mod.rs` |
 | Detection: every row of the §3.3 trigger table | integration | `tests/flash_modes.rs` |
@@ -1025,7 +1091,7 @@ Implemented separately, listed here so nothing is lost:
   `omnect_user.bbclass` for both `groupadd -g` and `useradd -u`, so the class
   and the init recipe, which does not inherit the class, share one value;
 - map `DISTRO_FEATURES` `flash-mode-2` and `flash-mode-3` onto the corresponding
-  Cargo features;
+  Cargo features, and `MACHINE_FEATURES` `rtc` onto the `rtc` feature;
 - gate mode 1 the same way: map `DISTRO_FEATURES` `flash-mode-1` onto the Cargo
   feature and drop `flash-mode-1` from `default`, so a machine that wants disk
   cloning has to ask for it. This changes what ships, so it is recipe work rather
@@ -1035,8 +1101,10 @@ Implemented separately, listed here so nothing is lost:
   same distro features as the legacy image, and keep the `omnect_user` class
   inherited for mode 2. The Rust image does not install them while the modes
   are not ported;
-- mode 2 needs neither `bmaptool` nor `xz` in the Rust initramfs (§5.4); only
-  mode 3 still installs them;
+- neither mode needs `bmaptool` or `xz` in the Rust initramfs (§5.3, §5.4).
+  Mode 3 needs `dhcpcd`, `base-passwd` for the `dhcpcd` system user, `curl`
+  and `ca-certificates`. libcurl recommends the CA bundle, so it is installed
+  on every machine; `curl` checks against it only with `rtc`;
 - when mode 2 or 3 is ported, remove the "does not implement flash mode N yet"
   note from that mode's section in the meta-omnect `README.md`, and check its
   console output example and behaviour notes against the port

@@ -1,26 +1,26 @@
 //! Unmounting filesystems before a disk is imaged.
 
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 use std::cmp::Reverse;
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 use std::fs;
 use std::path::Path;
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 use std::path::PathBuf;
 
 use crate::bootloader::sync_filesystems;
 use crate::error::FlashError;
 use crate::filesystem::{is_path_mounted, mount_points, umount};
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 use crate::partition::device::{SYS_DEV_BLOCK, block_devnum, whole_disk_devnum};
 
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 const PROC_MOUNTS: &str = "/proc/mounts";
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 const DEV_DIR: &str = "/dev";
 
 /// `/proc/mounts` writes these bytes as a backslash and three octal digits.
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 const MOUNTS_ESCAPES: [(&str, char); 4] = [
     ("\\040", ' '),
     ("\\011", '\t'),
@@ -42,7 +42,7 @@ pub(crate) fn unmount_rootfs(rootfs: &Path) -> Result<(), FlashError> {
 }
 
 /// Unmount the rootfs, then every other mount backed by `disk`.
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 pub(crate) fn unmount_target_disk(rootfs: &Path, disk: &Path) -> Result<(), FlashError> {
     unmount_rootfs(rootfs)?;
 
@@ -77,7 +77,7 @@ pub(crate) fn unmount_target_disk(rootfs: &Path, disk: &Path) -> Result<(), Flas
 
 /// The mount points whose source sits on `disk`, deepest first so a nested
 /// mount goes before its parent.
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 fn mounts_backed_by(
     proc_mounts: &str,
     disk: u64,
@@ -96,7 +96,7 @@ fn mounts_backed_by(
     mount_points
 }
 
-#[cfg(feature = "flash-mode-2")]
+#[cfg(feature = "flash-mode-network")]
 fn decode_mounts_field(field: &str) -> String {
     MOUNTS_ESCAPES
         .iter()
@@ -105,7 +105,7 @@ fn decode_mounts_field(field: &str) -> String {
         })
 }
 
-#[cfg(all(test, feature = "flash-mode-2"))]
+#[cfg(all(test, feature = "flash-mode-network"))]
 mod tests {
     use super::*;
 
