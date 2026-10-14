@@ -136,6 +136,7 @@ src/
 | `uboot` | U-Boot bootloader support (mutually exclusive with `grub`) |
 | `gpt` | GPT partition table (primary partitions 1-7; mutually exclusive with `dos`) |
 | `dos` | DOS/MBR partition table (extended at slot 4, logical 5-8; mutually exclusive with `gpt`) |
+| `early-modules` | Load the modules listed in `/etc/omnect/early-modules.d/*.conf` of the rootfs before `switch_root` |
 | `persistent-var-log` | Persistent `/var/log` mount |
 | `release-image` | Release behaviour: loop on fatal error; continue booting in degraded mode |
 | `resize-data` | Expand data partition + filesystem to fill disk on first boot |

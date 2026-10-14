@@ -41,6 +41,13 @@ pub(super) fn read_config_dir(dir: &Path) -> Vec<ModuleEntry> {
         };
         for (name, params) in text.lines().filter_map(parse_line) {
             let name = normalize_name(name);
+            let params = match CString::new(params) {
+                Ok(params) => params,
+                Err(e) => {
+                    warn!("early modules: {name}: bad parameters: {e}");
+                    continue;
+                }
+            };
             if !seen.insert(name.clone()) {
                 warn!(
                     "early modules: {name} listed again in {}, line ignored",
@@ -48,10 +55,7 @@ pub(super) fn read_config_dir(dir: &Path) -> Vec<ModuleEntry> {
                 );
                 continue;
             }
-            match CString::new(params) {
-                Ok(params) => entries.push(ModuleEntry { name, params }),
-                Err(e) => warn!("early modules: {name}: bad parameters: {e}"),
-            }
+            entries.push(ModuleEntry { name, params });
         }
     }
     entries
@@ -135,6 +139,39 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write(dir.path(), "a.conf", "imx_sdma p=1\nimx-sdma p=2\n");
         assert_eq!(read_config_dir(dir.path()), vec![entry("imx_sdma", "p=1")]);
+    }
+
+    #[test]
+    fn duplicate_in_a_later_file_is_ignored() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "20-b.conf", "mod-a p=2\nmod_b\n");
+        write(dir.path(), "10-a.conf", "mod_a p=1\n");
+        assert_eq!(
+            read_config_dir(dir.path()),
+            vec![entry("mod_a", "p=1"), entry("mod_b", "")]
+        );
+    }
+
+    #[test]
+    fn line_with_nul_in_parameters_is_skipped() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "a.conf", "mod_a p=\0x\nmod_a p=2\n");
+        assert_eq!(read_config_dir(dir.path()), vec![entry("mod_a", "p=2")]);
+    }
+
+    #[test]
+    fn unreadable_file_does_not_stop_the_others() {
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("a.conf")).unwrap();
+        write(dir.path(), "b.conf", "mod_b\n");
+        assert_eq!(read_config_dir(dir.path()), vec![entry("mod_b", "")]);
+    }
+
+    #[test]
+    fn config_path_that_is_a_file_lists_nothing() {
+        let dir = TempDir::new().unwrap();
+        write(dir.path(), "early-modules.d", "mod_a\n");
+        assert!(read_config_dir(&dir.path().join("early-modules.d")).is_empty());
     }
 
     #[test]

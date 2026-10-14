@@ -185,8 +185,9 @@ returned as an error, and none changes the ODS status.
 | `finit_module` fails otherwise | `warn`, skip the module |
 | rootfs mount failed | the step does not run |
 
-When a listed module did not load, the step ends with one `warn` line that
-names all of them.
+When a listed module did not load, the step ends with one `error` line that
+names all of them. A test that checks the journal for errors then sees the
+failure, although udev may load the module later.
 
 A release image must never stop in the fatal-error loop because of this step,
 so no path returns an error.

@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use super::config::normalize_name;
+use crate::early_modules::config::normalize_name;
 
 const COMPRESSION_SUFFIXES: [&str; 3] = [".xz", ".zst", ".gz"];
 
@@ -33,12 +33,14 @@ pub(super) fn is_compressed(path: &Path) -> bool {
     split_compression(path).is_some_and(|(file, compressed)| compressed && file.ends_with(".ko"))
 }
 
-pub(super) fn parse_modules_dep(text: &str) -> HashMap<String, ModEntry> {
+/// Each line holds the full dependency list, so only the lines of the listed
+/// modules are kept.
+pub(super) fn parse_modules_dep(text: &str, listed: &HashSet<&str>) -> HashMap<String, ModEntry> {
     text.lines()
         .filter_map(|line| {
             let (path, deps) = line.split_once(':')?;
             let path = PathBuf::from(path.trim());
-            let name = module_name(&path)?;
+            let name = module_name(&path).filter(|n| listed.contains(n.as_str()))?;
             let deps = deps.split_whitespace().map(PathBuf::from).collect();
             Some((name, ModEntry { path, deps }))
         })
@@ -92,6 +94,7 @@ mod tests {
         let map = parse_modules_dep(
             "kernel/a/top.ko.xz: kernel/b/mid.ko.xz kernel/c/low-level.ko.xz\n\
              kernel/c/low-level.ko.xz:\n",
+            &HashSet::from(["top", "low_level"]),
         );
         let top = &map["top"];
         assert_eq!(top.path, PathBuf::from("kernel/a/top.ko.xz"));
@@ -103,6 +106,25 @@ mod tests {
             ]
         );
         assert!(map["low_level"].deps.is_empty());
+    }
+
+    #[test]
+    fn skips_dep_lines_without_a_module() {
+        let map = parse_modules_dep(
+            "no colon\nkernel/a/notes.txt:\nkernel/a/ok.ko:\n",
+            &HashSet::from(["notes", "ok"]),
+        );
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["ok"]);
+    }
+
+    #[test]
+    fn keeps_only_listed_lines() {
+        let map = parse_modules_dep(
+            "kernel/a/top.ko: kernel/b/low.ko\nkernel/b/low.ko:\n",
+            &HashSet::from(["top"]),
+        );
+        assert_eq!(map.keys().collect::<Vec<_>>(), ["top"]);
+        assert_eq!(map["top"].deps, [PathBuf::from("kernel/b/low.ko")]);
     }
 
     #[test]

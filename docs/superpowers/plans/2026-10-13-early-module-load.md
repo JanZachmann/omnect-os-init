@@ -51,7 +51,7 @@ omnect-os-init (branch `feat/early-modules` from `origin/feat/flash-mode-3`):
 - Modify `project-context.md` — module tree entry, test command.
 - Create `docs/superpowers/plans/2026-10-13-early-module-load.md` — copy of this plan (repo convention).
 
-meta-omnect (worktree `~/projects/meta-omnect/.claude/worktrees/readme-wipe-modes`, branch `initramfs-integration`, PR #697):
+meta-omnect (branch `initramfs-integration`, PR #697):
 
 - Modify `recipes-omnect/omnect-os-init/omnect-os-init.inc` — feature append for `mx8mm-nxp-bsp`; SRCREV in `omnect-os-init_0.1.0.bb` if it pins one.
 - Create `recipes-omnect/omnect-base-files/omnect-base-files/etc/omnect/early-modules.d/imx-sdma.conf`.
@@ -855,7 +855,7 @@ Before `open_boot_env`, outside the `skip_init_setup` block, so it runs in every
 
 ### Task 5: meta-omnect integration (PR #697, branch `initramfs-integration`)
 
-Work in `~/projects/meta-omnect/.claude/worktrees/readme-wipe-modes` (already on `initramfs-integration`). The legacy `90-imx_sdma` script is not touched: the CI test initramfs stays on the legacy scripts.
+Work on the meta-omnect branch `initramfs-integration`. The legacy `90-imx_sdma` script is not touched: the CI test initramfs stays on the legacy scripts.
 
 **Files:**
 - Modify: `recipes-omnect/omnect-os-init/omnect-os-init.inc`
@@ -912,7 +912,7 @@ SRC_URI:append:pn-linux-raspberrypi = " file://module-decompress.cfg"
 
 Automated (each task): the Global Constraints gate.
 
-Manual on hardware — **ask the user before any test run on a device** (memory rule "ask before dut2"; flash with `configure_image_cli.sh --flash --device tauri`, not bmaptool):
+Manual on hardware — **ask the user before any test run on a device**:
 
 - Tauri-L image: `dmesg` shows `imx-sdma … loaded firmware` and the TPM on `spi0.1` before systemd starts; `cat /sys/module/firmware_class/parameters/path` shows `/rootfs/lib/firmware`.
 - Same image with `imx-sdma.ko*` removed from the rootfs: boots normally, logs `early modules: not loaded: imx_sdma`.

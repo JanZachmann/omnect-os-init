@@ -11,18 +11,23 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use log::{info, warn};
+use log::{error, info, warn};
 use nix::{errno::Errno, kmod::ModuleInitFlags};
 
-use config::ModuleEntry;
-use moddep::{ModEntry, is_compressed, module_name, parse_modules_builtin, parse_modules_dep};
+use crate::early_modules::{
+    config::ModuleEntry,
+    moddep::{ModEntry, is_compressed, module_name, parse_modules_builtin, parse_modules_dep},
+};
 
 const CONFIG_DIR: &str = "etc/omnect/early-modules.d";
 const MODULES_DIR: &str = "lib/modules";
+const MODULES_DEP: &str = "modules.dep";
+const MODULES_BUILTIN: &str = "modules.builtin";
 const FIRMWARE_DIR: &str = "lib/firmware";
 const OSRELEASE: &str = "/proc/sys/kernel/osrelease";
 const FIRMWARE_PATH_PARAM: &str = "/sys/module/firmware_class/parameters/path";
 const SYS_MODULE: &str = "/sys/module";
+const INITSTATE: &str = "initstate";
 
 /// From `include/uapi/linux/module.h`; nix has no constant for it.
 const MODULE_INIT_COMPRESSED_FILE: c_uint = 4;
@@ -86,13 +91,14 @@ fn load_with(paths: &SysPaths, loader: &mut impl ModuleLoader) -> Vec<String> {
         None => failed.extend(entries.iter().map(|e| e.name.clone())),
     }
     if !failed.is_empty() {
-        warn!("early modules: not loaded: {}", failed.join(", "));
+        error!("early modules: not loaded: {}", failed.join(", "));
     }
     failed
 }
 
 struct Session<'a, L> {
     loader: &'a mut L,
+    rootfs: &'a Path,
     sys_module: &'a Path,
     modules_dir: PathBuf,
     builtin: HashSet<String>,
@@ -108,8 +114,9 @@ impl<'a, L: ModuleLoader> Session<'a, L> {
     ) -> Option<(Self, HashMap<String, ModEntry>)> {
         let release = read(paths.osrelease)?;
         let modules_dir = paths.rootfs.join(MODULES_DIR).join(release.trim());
-        let deps = parse_modules_dep(&read(&modules_dir.join("modules.dep"))?);
-        let builtin = parse_modules_builtin(&read(&modules_dir.join("modules.builtin"))?);
+        let listed = entries.iter().map(|e| e.name.as_str()).collect();
+        let deps = parse_modules_dep(&read(&modules_dir.join(MODULES_DEP))?, &listed);
+        let builtin = parse_modules_builtin(&read(&modules_dir.join(MODULES_BUILTIN))?);
 
         // Not restored: after switch_root the path does not exist, so the
         // firmware loader skips it and uses its default paths.
@@ -124,6 +131,7 @@ impl<'a, L: ModuleLoader> Session<'a, L> {
 
         let session = Self {
             loader,
+            rootfs: paths.rootfs,
             sys_module: paths.sys_module,
             modules_dir,
             builtin,
@@ -157,22 +165,26 @@ impl<'a, L: ModuleLoader> Session<'a, L> {
         self.load_one(name, &entry.path)
     }
 
-    fn load_one(&mut self, name: &str, rel_path: &Path) -> bool {
+    fn load_one(&mut self, name: &str, dep_path: &Path) -> bool {
         if self.failed.contains(name) {
             return false;
         }
         if self.is_present(name) {
             return true;
         }
-        let ok = self.finit(name, rel_path);
+        let ok = self.finit(name, dep_path);
         if !ok {
             self.failed.insert(name.to_string());
         }
         ok
     }
 
-    fn finit(&mut self, name: &str, rel_path: &Path) -> bool {
-        let path = self.modules_dir.join(rel_path);
+    fn finit(&mut self, name: &str, dep_path: &Path) -> bool {
+        // As in kmod, an absolute path in modules.dep starts at the root.
+        let path = match dep_path.strip_prefix("/") {
+            Ok(from_root) => self.rootfs.join(from_root),
+            Err(_) => self.modules_dir.join(dep_path),
+        };
         let file = match File::open(&path) {
             Ok(file) => file,
             Err(e) => {
@@ -181,7 +193,7 @@ impl<'a, L: ModuleLoader> Session<'a, L> {
             }
         };
         let params = self.params.get(name).copied().unwrap_or(c"");
-        let flags = if is_compressed(rel_path) {
+        let flags = if is_compressed(dep_path) {
             ModuleInitFlags::from_bits_retain(MODULE_INIT_COMPRESSED_FILE)
         } else {
             ModuleInitFlags::empty()
@@ -204,7 +216,7 @@ impl<'a, L: ModuleLoader> Session<'a, L> {
 
     fn is_present(&self, name: &str) -> bool {
         let present =
-            self.builtin.contains(name) || self.sys_module.join(name).join("initstate").exists();
+            self.builtin.contains(name) || self.sys_module.join(name).join(INITSTATE).exists();
         if present {
             info!("early modules: {name} built in or already loaded");
         }
@@ -221,8 +233,6 @@ fn read(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::errno::Errno;
-    use std::{collections::HashMap, fs, path::PathBuf};
     use tempfile::TempDir;
 
     const RELEASE: &str = "6.6.23";
@@ -252,10 +262,13 @@ mod tests {
             fs::write(conf_dir.join("test.conf"), conf).unwrap();
             let mod_dir = rootfs.join(MODULES_DIR).join(RELEASE);
             fs::create_dir_all(&mod_dir).unwrap();
-            fs::write(mod_dir.join("modules.dep"), dep).unwrap();
-            fs::write(mod_dir.join("modules.builtin"), builtin).unwrap();
+            fs::write(mod_dir.join(MODULES_DEP), dep).unwrap();
+            fs::write(mod_dir.join(MODULES_BUILTIN), builtin).unwrap();
             for path in dep.split_whitespace().map(|p| p.trim_end_matches(':')) {
-                let file = mod_dir.join(path);
+                let file = match path.strip_prefix('/') {
+                    Some(from_root) => rootfs.join(from_root),
+                    None => mod_dir.join(path),
+                };
                 fs::create_dir_all(file.parent().unwrap()).unwrap();
                 fs::write(file, b"").unwrap();
             }
@@ -299,13 +312,16 @@ mod tests {
     fn mark_loaded(sys_module: &Path, name: &str) {
         let dir = sys_module.join(name);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("initstate"), "live\n").unwrap();
+        fs::write(dir.join(INITSTATE), "live\n").unwrap();
     }
 
-    /// On success it creates `initstate` in sysfs, as the kernel does.
+    /// On success it creates `initstate` in sysfs, as the kernel does. Each
+    /// call records the firmware path the kernel would search at that time.
     struct MockLoader {
         sys_module: PathBuf,
+        fw_param: PathBuf,
         calls: Vec<(String, String, ModuleInitFlags)>,
+        fw_paths: Vec<String>,
         fail: HashMap<&'static str, Errno>,
     }
 
@@ -313,7 +329,9 @@ mod tests {
         fn new(fx: &Fixture) -> Self {
             Self {
                 sys_module: fx.sys_module.clone(),
+                fw_param: fx.fw_param.clone(),
                 calls: Vec::new(),
+                fw_paths: Vec::new(),
                 fail: HashMap::new(),
             }
         }
@@ -336,6 +354,8 @@ mod tests {
                 params.to_str().unwrap().to_string(),
                 flags,
             ));
+            self.fw_paths
+                .push(fs::read_to_string(&self.fw_param).unwrap());
             if let Some(e) = self.fail.get(name) {
                 return Err(*e);
             }
@@ -353,13 +373,14 @@ mod tests {
     }
 
     #[test]
-    fn writes_rootfs_firmware_path() {
-        let fx = Fixture::new("plain\n", DEP, "");
-        load_with(&fx.paths(), &mut MockLoader::new(&fx));
-        assert_eq!(
-            fx.fw_param(),
-            fx.rootfs.join(FIRMWARE_DIR).to_str().unwrap()
-        );
+    fn writes_rootfs_firmware_path_before_the_first_load() {
+        let fx = Fixture::new("top\n", DEP, "");
+        let mut l = MockLoader::new(&fx);
+        load_with(&fx.paths(), &mut l);
+        let fw_dir = fx.rootfs.join(FIRMWARE_DIR);
+        let fw_dir = fw_dir.to_str().unwrap();
+        assert_eq!(l.fw_paths, [fw_dir; 3]);
+        assert_eq!(fx.fw_param(), fw_dir);
     }
 
     #[test]
@@ -379,6 +400,24 @@ mod tests {
         let mut l = MockLoader::new(&fx);
         assert!(load_with(&fx.paths(), &mut l).is_empty());
         assert_eq!(l.names(), ["top"]);
+    }
+
+    #[test]
+    fn listed_builtin_or_loaded_module_needs_no_modules_dep_line() {
+        let fx = Fixture::new("inside\nlive\n", DEP, "kernel/x/inside.ko\n");
+        fx.mark_loaded("live");
+        let mut l = MockLoader::new(&fx);
+        assert!(load_with(&fx.paths(), &mut l).is_empty());
+        assert!(l.calls.is_empty());
+    }
+
+    #[test]
+    fn failed_listed_module_is_reported() {
+        let fx = Fixture::new("plain\n", DEP, "");
+        let mut l = MockLoader::new(&fx);
+        l.fail.insert("plain", Errno::ENOEXEC);
+        assert_eq!(load_with(&fx.paths(), &mut l), ["plain"]);
+        assert_eq!(l.names(), ["plain"]);
     }
 
     #[test]
@@ -449,7 +488,7 @@ mod tests {
     #[test]
     fn missing_modules_dep_skips_all_and_leaves_path() {
         let fx = Fixture::new("plain\n", DEP, "");
-        fs::remove_file(fx.module_file("modules.dep")).unwrap();
+        fs::remove_file(fx.module_file(MODULES_DEP)).unwrap();
         let mut l = MockLoader::new(&fx);
         assert_eq!(load_with(&fx.paths(), &mut l), ["plain"]);
         assert!(l.calls.is_empty());
@@ -459,7 +498,7 @@ mod tests {
     #[test]
     fn missing_modules_builtin_skips_all() {
         let fx = Fixture::new("plain\n", DEP, "");
-        fs::remove_file(fx.module_file("modules.builtin")).unwrap();
+        fs::remove_file(fx.module_file(MODULES_BUILTIN)).unwrap();
         let mut l = MockLoader::new(&fx);
         assert_eq!(load_with(&fx.paths(), &mut l), ["plain"]);
         assert!(l.calls.is_empty());
@@ -482,6 +521,14 @@ mod tests {
         let mut l = MockLoader::new(&fx);
         assert_eq!(load_with(&fx.paths(), &mut l), ["top"]);
         assert!(l.calls.is_empty());
+    }
+
+    #[test]
+    fn absolute_dep_path_starts_at_rootfs() {
+        let fx = Fixture::new("top\n", "/opt/mods/top.ko: /opt/mods/low.ko\n", "");
+        let mut l = MockLoader::new(&fx);
+        assert!(load_with(&fx.paths(), &mut l).is_empty());
+        assert_eq!(l.names(), ["low", "top"]);
     }
 
     #[test]
