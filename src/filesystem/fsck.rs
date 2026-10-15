@@ -3,8 +3,10 @@
 //! Runs fsck on partitions before mounting and handles exit codes appropriately.
 
 use std::fmt;
+use std::ops::BitOr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
 use crate::error::FilesystemError;
 use crate::filesystem::{FsType, Result};
@@ -22,6 +24,12 @@ const FSCK_AUTO_REPAIR_FLAG: &str = "-y";
 /// Filesystem type flag: tells the wrapper which backend to dispatch to (fsck.ext4 / fsck.fat).
 /// We pass the type explicitly because the caller already knows it.
 const FSCK_TYPE_FLAG: &str = "-t";
+
+/// Forces a full check even when the filesystem is marked clean.
+const FSCK_FORCE_FLAG: &str = "-f";
+
+/// e2fsck prints this when it replays the ext4 journal.
+const JOURNAL_REPLAY_MARKER: &str = "recovering journal";
 
 /// Type-safe wrapper for fsck(8) exit codes.
 ///
@@ -109,6 +117,14 @@ impl FsckExitCode {
     }
 }
 
+impl BitOr for FsckExitCode {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
 impl From<i32> for FsckExitCode {
     fn from(code: i32) -> Self {
         Self(code)
@@ -187,19 +203,31 @@ impl FsckResult {
 
 /// Run fsck on a device.
 ///
+/// On ext4, a run that only replayed the journal stops at "clean" and misses
+/// damage the replay left behind. Such a run is followed by a forced full
+/// check; the exit codes of both runs are combined.
+///
 /// # Returns
 /// * `Ok(FsckResult)` - Result of the check (including exit code 1: errors corrected, safe to mount)
 /// * `Err(FilesystemError::FsckRequiresReboot)` - If fsck requests a reboot (exit code 2 only)
 /// * `Err(FilesystemError::FsckFailed)` - If check failed with uncorrectable errors
 pub fn check_filesystem(device: &Path, fstype: FsType) -> Result<FsckResult> {
-    log::info!("Running fsck on {}", device.display());
-
     // Disable kernel message rate limiting during fsck — RAII guard restores on all exit paths.
     disable_kmsg_ratelimit();
     let _ratelimit_guard = KmsgRatelimitGuard;
 
-    let output = Command::new(FSCK_CMD)
-        .args([FSCK_AUTO_REPAIR_FLAG, FSCK_TYPE_FLAG, fstype.as_str()])
+    check_filesystem_with(device, fstype, |force| run_fsck(device, fstype, force))
+}
+
+fn run_fsck(device: &Path, fstype: FsType, force: bool) -> Result<(FsckExitCode, String)> {
+    let mut cmd = Command::new(FSCK_CMD);
+    // The journal replay is detected by text, which must not be translated.
+    cmd.env("LC_ALL", "C").arg(FSCK_AUTO_REPAIR_FLAG);
+    if force {
+        cmd.arg(FSCK_FORCE_FLAG);
+    }
+    let output = cmd
+        .args([FSCK_TYPE_FLAG, fstype.as_str()])
         .arg(device)
         .output()
         .map_err(|e| FilesystemError::FsckFailed {
@@ -208,11 +236,61 @@ pub fn check_filesystem(device: &Path, fstype: FsType) -> Result<FsckResult> {
             output: format!("failed to execute {FSCK_CMD}: {e}"),
         })?;
 
-    let exit_code = FsckExitCode::from(output.status.code());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined_output = format!("{stdout}{stderr}");
+    Ok((
+        FsckExitCode::from(output.status.code()),
+        format!("{stdout}{stderr}"),
+    ))
+}
 
+fn needs_full_check(fstype: FsType, output: &str) -> bool {
+    fstype == FsType::Ext4 && output.contains(JOURNAL_REPLAY_MARKER)
+}
+
+fn check_filesystem_with(
+    device: &Path,
+    fstype: FsType,
+    mut run: impl FnMut(bool) -> Result<(FsckExitCode, String)>,
+) -> Result<FsckResult> {
+    log::info!("Running fsck on {}", device.display());
+
+    let (mut exit_code, mut output) = run(false)?;
+
+    if needs_full_check(fstype, &output) {
+        log::info!(
+            "journal replayed on {}, running full check",
+            device.display()
+        );
+        let start = Instant::now();
+        match run(true) {
+            Ok((code, full_output)) => {
+                exit_code = exit_code | code;
+                output.push_str(&full_output);
+            }
+            Err(FilesystemError::FsckFailed {
+                code, output: err, ..
+            }) => {
+                output.push_str(&err);
+                return Err(FilesystemError::FsckFailed {
+                    device: device.to_path_buf(),
+                    code: exit_code | code,
+                    output,
+                });
+            }
+            Err(e) => return Err(e),
+        }
+        log::info!(
+            "full check on {} took {:.1?}",
+            device.display(),
+            start.elapsed()
+        );
+    }
+
+    evaluate(device, exit_code, output)
+}
+
+fn evaluate(device: &Path, exit_code: FsckExitCode, output: String) -> Result<FsckResult> {
     if exit_code.is_clean() {
         log::debug!("fsck: {} is clean", device.display());
     } else if exit_code == FsckExitCode::CORRECTED {
@@ -231,7 +309,7 @@ pub fn check_filesystem(device: &Path, fstype: FsType) -> Result<FsckResult> {
             "fsck failed on {} with {}: {}",
             device.display(),
             exit_code,
-            combined_output.lines().next().unwrap_or("(no output)")
+            output.lines().next().unwrap_or("(no output)")
         );
     }
 
@@ -239,7 +317,7 @@ pub fn check_filesystem(device: &Path, fstype: FsType) -> Result<FsckResult> {
         return Err(FilesystemError::FsckRequiresReboot {
             device: device.to_path_buf(),
             code: exit_code,
-            output: combined_output,
+            output,
         });
     }
 
@@ -247,14 +325,14 @@ pub fn check_filesystem(device: &Path, fstype: FsType) -> Result<FsckResult> {
         return Err(FilesystemError::FsckFailed {
             device: device.to_path_buf(),
             code: exit_code,
-            output: combined_output,
+            output,
         });
     }
 
     Ok(FsckResult {
         device: device.to_path_buf(),
         exit_code,
-        output: combined_output,
+        output,
     })
 }
 
@@ -422,6 +500,153 @@ mod tests {
             output: String::new(),
         };
         assert!(!clean.has_uncorrected_errors());
+    }
+
+    // `/sbin/fsck -y -t ext4` on an image with a damaged directory block
+    // and the needs_recovery flag set (e2fsprogs 1.47.0).
+    const REPLAY_OUTPUT: &str = "fsck from util-linux 2.39.3
+e2fsck 1.47.0 (5-Feb-2023)
+cert: recovering journal
+cert: clean, 12/10240 files, 1679/10240 blocks
+";
+
+    // Same image, second run with `-f`.
+    const FULL_CHECK_OUTPUT: &str = "fsck from util-linux 2.39.3
+e2fsck 1.47.0 (5-Feb-2023)
+Pass 1: Checking inodes, blocks, and sizes
+Pass 2: Checking directory structure
+Directory inode 12, block #0: directory passes checks but fails checksum.
+Fix? yes
+
+Pass 3: Checking directory connectivity
+Pass 4: Checking reference counts
+Pass 5: Checking group summary information
+
+cert: ***** FILE SYSTEM WAS MODIFIED *****
+cert: 12/10240 files (8.3% non-contiguous), 1679/10240 blocks
+";
+
+    const CLEAN_OUTPUT: &str = "fsck from util-linux 2.39.3
+e2fsck 1.47.0 (5-Feb-2023)
+cert: clean, 12/10240 files, 1679/10240 blocks
+";
+
+    /// Runs `check_filesystem_with` with canned results, one per call, and
+    /// returns the result plus the `force` argument of every call.
+    fn run_canned(
+        fstype: FsType,
+        results: Vec<Result<(FsckExitCode, String)>>,
+    ) -> (Result<FsckResult>, Vec<bool>) {
+        let mut results = results.into_iter();
+        let mut calls = Vec::new();
+        let result = check_filesystem_with(Path::new("/dev/omnect/cert"), fstype, |force| {
+            calls.push(force);
+            results.next().expect("unexpected fsck call")
+        });
+        (result, calls)
+    }
+
+    fn ok(code: i32, output: &str) -> Result<(FsckExitCode, String)> {
+        Ok((FsckExitCode::from(code), output.to_string()))
+    }
+
+    #[test]
+    fn test_needs_full_check() {
+        assert!(needs_full_check(FsType::Ext4, REPLAY_OUTPUT));
+        assert!(!needs_full_check(FsType::Ext4, CLEAN_OUTPUT));
+        assert!(!needs_full_check(FsType::Ext4, FULL_CHECK_OUTPUT));
+        assert!(!needs_full_check(FsType::Vfat, REPLAY_OUTPUT));
+    }
+
+    #[test]
+    fn test_no_replay_runs_once() {
+        let (result, calls) = run_canned(FsType::Ext4, vec![ok(0, CLEAN_OUTPUT)]);
+        assert_eq!(calls, [false]);
+        let result = result.unwrap();
+        assert!(result.exit_code.is_clean());
+        assert_eq!(result.output, CLEAN_OUTPUT);
+    }
+
+    #[test]
+    fn test_vfat_runs_once() {
+        let (result, calls) = run_canned(FsType::Vfat, vec![ok(0, REPLAY_OUTPUT)]);
+        assert_eq!(calls, [false]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_replay_runs_full_check() {
+        let (result, calls) = run_canned(
+            FsType::Ext4,
+            vec![ok(0, REPLAY_OUTPUT), ok(1, FULL_CHECK_OUTPUT)],
+        );
+        assert_eq!(calls, [false, true]);
+        let result = result.unwrap();
+        assert_eq!(result.exit_code, FsckExitCode::CORRECTED);
+        assert_eq!(result.output, format!("{REPLAY_OUTPUT}{FULL_CHECK_OUTPUT}"));
+    }
+
+    #[test]
+    fn test_codes_of_both_runs_combined() {
+        let (result, _) = run_canned(
+            FsType::Ext4,
+            vec![ok(1, REPLAY_OUTPUT), ok(0, CLEAN_OUTPUT)],
+        );
+        assert_eq!(result.unwrap().exit_code, FsckExitCode::CORRECTED);
+    }
+
+    #[test]
+    fn test_full_check_reboot_required() {
+        let (result, _) = run_canned(FsType::Ext4, vec![ok(0, REPLAY_OUTPUT), ok(2, "second")]);
+        match result {
+            Err(FilesystemError::FsckRequiresReboot { code, output, .. }) => {
+                assert_eq!(code, FsckExitCode::REBOOT_REQUIRED);
+                assert_eq!(output, format!("{REPLAY_OUTPUT}second"));
+            }
+            other => panic!("expected FsckRequiresReboot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_full_check_uncorrected() {
+        let (result, _) = run_canned(FsType::Ext4, vec![ok(0, REPLAY_OUTPUT), ok(4, "second")]);
+        match result {
+            Err(FilesystemError::FsckFailed { code, output, .. }) => {
+                assert_eq!(code, FsckExitCode::ERRORS_UNCORRECTED);
+                assert_eq!(output, format!("{REPLAY_OUTPUT}second"));
+            }
+            other => panic!("expected FsckFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_full_check_spawn_failure_keeps_first_output() {
+        let spawn_error = Err(FilesystemError::FsckFailed {
+            device: PathBuf::from("/dev/omnect/cert"),
+            code: FsckExitCode::UNKNOWN,
+            output: "failed to execute".to_string(),
+        });
+        let (result, _) = run_canned(FsType::Ext4, vec![ok(0, REPLAY_OUTPUT), spawn_error]);
+        match result {
+            Err(FilesystemError::FsckFailed { code, output, .. }) => {
+                assert_eq!(code, FsckExitCode::UNKNOWN);
+                assert_eq!(output, format!("{REPLAY_OUTPUT}failed to execute"));
+            }
+            other => panic!("expected FsckFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_fsck_exit_code_bitor() {
+        assert_eq!(
+            FsckExitCode::CORRECTED | FsckExitCode::REBOOT_REQUIRED,
+            FsckExitCode::from(3i32)
+        );
+        assert_eq!(FsckExitCode::OK | FsckExitCode::OK, FsckExitCode::OK);
+        assert_eq!(
+            FsckExitCode::OK | FsckExitCode::UNKNOWN,
+            FsckExitCode::UNKNOWN
+        );
     }
 
     #[test]
