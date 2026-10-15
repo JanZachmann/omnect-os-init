@@ -5,7 +5,7 @@ mod moddep;
 
 use std::{
     collections::{HashMap, HashSet},
-    ffi::{CStr, c_uint},
+    ffi::CStr,
     fs::{self, File},
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
@@ -29,8 +29,9 @@ const FIRMWARE_PATH_PARAM: &str = "/sys/module/firmware_class/parameters/path";
 const SYS_MODULE: &str = "/sys/module";
 const INITSTATE: &str = "initstate";
 
-/// From `include/uapi/linux/module.h`; nix has no constant for it.
-const MODULE_INIT_COMPRESSED_FILE: c_uint = 4;
+/// `MODULE_INIT_COMPRESSED_FILE` from `include/uapi/linux/module.h`; nix has
+/// no constant for it.
+const COMPRESSED_FILE: ModuleInitFlags = ModuleInitFlags::from_bits_retain(4);
 
 trait ModuleLoader {
     fn load(
@@ -74,46 +75,54 @@ pub fn load(rootfs: &Path) {
 }
 
 /// Returns the listed modules that did not load.
-fn load_with(paths: &SysPaths, loader: &mut impl ModuleLoader) -> Vec<String> {
+fn load_with(paths: &SysPaths, loader: &mut dyn ModuleLoader) -> Vec<String> {
     let entries = config::read_config_dir(&paths.rootfs.join(CONFIG_DIR));
     if entries.is_empty() {
         return Vec::new();
     }
-    let mut failed = Vec::new();
-    match Session::prepare(paths, &entries, loader) {
-        Some((mut session, deps)) => {
-            for entry in &entries {
-                if !session.load_listed(&deps, &entry.name) {
-                    failed.push(entry.name.clone());
-                }
-            }
+    let failed: Vec<String> = match Resolved::prepare(paths, &entries) {
+        Some(resolved) => {
+            let mut session = Session {
+                resolved: &resolved,
+                loader,
+                outcome: HashMap::new(),
+            };
+            entries
+                .iter()
+                .filter(|e| !session.load_listed(&e.name))
+                .map(|e| e.name.clone())
+                .collect()
         }
-        None => failed.extend(entries.iter().map(|e| e.name.clone())),
-    }
+        None => entries
+            .iter()
+            .filter(|e| !is_loaded(paths.sys_module, &e.name))
+            .map(|e| e.name.clone())
+            .collect(),
+    };
     if !failed.is_empty() {
         error!("early modules: not loaded: {}", failed.join(", "));
     }
     failed
 }
 
-struct Session<'a, L> {
-    loader: &'a mut L,
+struct Resolved<'a> {
     rootfs: &'a Path,
     sys_module: &'a Path,
     modules_dir: PathBuf,
     builtin: HashSet<String>,
+    deps: HashMap<String, ModEntry>,
     params: HashMap<&'a str, &'a CStr>,
-    failed: HashSet<String>,
 }
 
-impl<'a, L: ModuleLoader> Session<'a, L> {
-    fn prepare(
-        paths: &'a SysPaths,
-        entries: &'a [ModuleEntry],
-        loader: &'a mut L,
-    ) -> Option<(Self, HashMap<String, ModEntry>)> {
+impl<'a> Resolved<'a> {
+    fn prepare(paths: &SysPaths<'a>, entries: &'a [ModuleEntry]) -> Option<Self> {
         let release = read(paths.osrelease)?;
-        let modules_dir = paths.rootfs.join(MODULES_DIR).join(release.trim());
+        let release = release.trim();
+        if release.is_empty() {
+            warn!("early modules: {} is empty", paths.osrelease.display());
+            return None;
+        }
+        let modules_dir = paths.rootfs.join(MODULES_DIR).join(release);
         let listed = entries.iter().map(|e| e.name.as_str()).collect();
         let deps = parse_modules_dep(&read(&modules_dir.join(MODULES_DEP))?, &listed);
         let builtin = parse_modules_builtin(&read(&modules_dir.join(MODULES_BUILTIN))?);
@@ -125,30 +134,49 @@ impl<'a, L: ModuleLoader> Session<'a, L> {
             paths.firmware_path_param,
             firmware_dir.as_os_str().as_bytes(),
         ) {
-            warn!("early modules: cannot set firmware path: {e}");
+            warn!(
+                "early modules: cannot write {} to {}: {e}",
+                firmware_dir.display(),
+                paths.firmware_path_param.display()
+            );
             return None;
         }
 
-        let session = Self {
-            loader,
+        Some(Self {
             rootfs: paths.rootfs,
             sys_module: paths.sys_module,
             modules_dir,
             builtin,
+            deps,
             params: entries
                 .iter()
                 .map(|e| (e.name.as_str(), e.params.as_c_str()))
                 .collect(),
-            failed: HashSet::new(),
-        };
-        Some((session, deps))
+        })
     }
+}
 
-    fn load_listed(&mut self, deps: &HashMap<String, ModEntry>, name: &str) -> bool {
+struct Session<'a> {
+    resolved: &'a Resolved<'a>,
+    loader: &'a mut dyn ModuleLoader,
+    /// Whether each module seen so far is present.
+    outcome: HashMap<String, bool>,
+}
+
+impl Session<'_> {
+    fn load_listed(&mut self, name: &str) -> bool {
+        if let Some(&ok) = self.outcome.get(name) {
+            if !ok {
+                warn!("early modules: {name} not retried, it failed as a dependency");
+            }
+            return ok;
+        }
         if self.is_present(name) {
+            self.outcome.insert(name.to_string(), true);
             return true;
         }
-        let Some(entry) = deps.get(name) else {
+        let resolved = self.resolved;
+        let Some(entry) = resolved.deps.get(name) else {
             warn!("early modules: {name} not in modules.dep");
             return false;
         };
@@ -166,24 +194,20 @@ impl<'a, L: ModuleLoader> Session<'a, L> {
     }
 
     fn load_one(&mut self, name: &str, dep_path: &Path) -> bool {
-        if self.failed.contains(name) {
-            return false;
+        if let Some(&ok) = self.outcome.get(name) {
+            return ok;
         }
-        if self.is_present(name) {
-            return true;
-        }
-        let ok = self.finit(name, dep_path);
-        if !ok {
-            self.failed.insert(name.to_string());
-        }
+        let ok = self.is_present(name) || self.finit(name, dep_path);
+        self.outcome.insert(name.to_string(), ok);
         ok
     }
 
     fn finit(&mut self, name: &str, dep_path: &Path) -> bool {
-        // As in kmod, an absolute path in modules.dep starts at the root.
+        // An absolute path in modules.dep is taken relative to the rootfs, as
+        // kmod takes it relative to its root.
         let path = match dep_path.strip_prefix("/") {
-            Ok(from_root) => self.rootfs.join(from_root),
-            Err(_) => self.modules_dir.join(dep_path),
+            Ok(from_root) => self.resolved.rootfs.join(from_root),
+            Err(_) => self.resolved.modules_dir.join(dep_path),
         };
         let file = match File::open(&path) {
             Ok(file) => file,
@@ -192,9 +216,10 @@ impl<'a, L: ModuleLoader> Session<'a, L> {
                 return false;
             }
         };
-        let params = self.params.get(name).copied().unwrap_or(c"");
-        let flags = if is_compressed(dep_path) {
-            ModuleInitFlags::from_bits_retain(MODULE_INIT_COMPRESSED_FILE)
+        let params = self.resolved.params.get(name).copied().unwrap_or(c"");
+        let compressed = is_compressed(dep_path);
+        let flags = if compressed {
+            COMPRESSED_FILE
         } else {
             ModuleInitFlags::empty()
         };
@@ -208,20 +233,36 @@ impl<'a, L: ModuleLoader> Session<'a, L> {
                 true
             }
             Err(e) => {
-                warn!("early modules: loading {name} failed: {e}");
+                let kind = if compressed {
+                    "compressed"
+                } else {
+                    "uncompressed"
+                };
+                warn!(
+                    "early modules: loading {name} failed: {e} ({}, {kind})",
+                    path.display()
+                );
                 false
             }
         }
     }
 
     fn is_present(&self, name: &str) -> bool {
-        let present =
-            self.builtin.contains(name) || self.sys_module.join(name).join(INITSTATE).exists();
-        if present {
+        let resolved = self.resolved;
+        if !resolved.builtin.contains(name) && !is_loaded(resolved.sys_module, name) {
+            return false;
+        }
+        if resolved.params.get(name).is_some_and(|p| !p.is_empty()) {
+            warn!("early modules: {name} built in or already loaded, parameters ignored");
+        } else {
             info!("early modules: {name} built in or already loaded");
         }
-        present
+        true
     }
+}
+
+fn is_loaded(sys_module: &Path, name: &str) -> bool {
+    sys_module.join(name).join(INITSTATE).exists()
 }
 
 fn read(path: &Path) -> Option<String> {
@@ -242,7 +283,8 @@ mod tests {
                        kernel/b/mid.ko.xz: kernel/c/low.ko.xz\n\
                        kernel/c/low.ko.xz:\n\
                        kernel/d/plain.ko:\n\
-                       kernel/e/other.ko.xz: kernel/c/low.ko.xz\n";
+                       kernel/e/other.ko.xz: kernel/c/low.ko.xz\n\
+                       kernel/dma/imx-sdma.ko.xz:\n";
 
     struct Fixture {
         _tmp: TempDir,
@@ -464,8 +506,40 @@ mod tests {
         let fx = Fixture::new("plain\nlow\n", DEP, "");
         let mut l = MockLoader::new(&fx);
         load_with(&fx.paths(), &mut l);
-        assert_eq!(l.calls[0].2, ModuleInitFlags::empty());
-        assert_eq!(l.calls[1].2.bits(), MODULE_INIT_COMPRESSED_FILE);
+        let flags: HashMap<_, _> = l.calls.iter().map(|(n, _, f)| (n.as_str(), *f)).collect();
+        assert_eq!(flags["plain"], ModuleInitFlags::empty());
+        assert_eq!(flags["low"], COMPRESSED_FILE);
+    }
+
+    #[test]
+    fn dash_in_file_name_matches_underscore_in_config() {
+        let fx = Fixture::new("imx_sdma p=1\n", DEP, "");
+        let mut l = MockLoader::new(&fx);
+        assert!(load_with(&fx.paths(), &mut l).is_empty());
+        let params: Vec<_> = l
+            .calls
+            .iter()
+            .map(|(n, p, _)| (n.as_str(), p.as_str()))
+            .collect();
+        assert_eq!(params, [("imx_sdma", "p=1")]);
+    }
+
+    #[test]
+    fn loaded_module_with_dash_in_file_name_is_skipped() {
+        let fx = Fixture::new("imx_sdma\n", DEP, "");
+        fx.mark_loaded("imx_sdma");
+        let mut l = MockLoader::new(&fx);
+        assert!(load_with(&fx.paths(), &mut l).is_empty());
+        assert!(l.calls.is_empty());
+    }
+
+    #[test]
+    fn listed_module_that_failed_as_dependency_is_not_retried() {
+        let fx = Fixture::new("top\nlow\n", DEP, "");
+        let mut l = MockLoader::new(&fx);
+        l.fail.insert("low", Errno::ENOEXEC);
+        assert_eq!(load_with(&fx.paths(), &mut l), ["top", "low"]);
+        assert_eq!(l.names(), ["low"]);
     }
 
     #[test]
@@ -496,6 +570,15 @@ mod tests {
     }
 
     #[test]
+    fn failed_prepare_reports_only_modules_not_loaded() {
+        let fx = Fixture::new("plain\nlive\n", DEP, "");
+        fs::remove_file(fx.module_file(MODULES_DEP)).unwrap();
+        fx.mark_loaded("live");
+        let mut l = MockLoader::new(&fx);
+        assert_eq!(load_with(&fx.paths(), &mut l), ["plain"]);
+    }
+
+    #[test]
     fn missing_modules_builtin_skips_all() {
         let fx = Fixture::new("plain\n", DEP, "");
         fs::remove_file(fx.module_file(MODULES_BUILTIN)).unwrap();
@@ -509,6 +592,16 @@ mod tests {
     fn missing_osrelease_skips_all() {
         let fx = Fixture::new("plain\n", DEP, "");
         fs::remove_file(&fx.osrelease).unwrap();
+        let mut l = MockLoader::new(&fx);
+        assert_eq!(load_with(&fx.paths(), &mut l), ["plain"]);
+        assert!(l.calls.is_empty());
+        assert_eq!(fx.fw_param(), FW_PARAM_DEFAULT);
+    }
+
+    #[test]
+    fn empty_osrelease_skips_all() {
+        let fx = Fixture::new("plain\n", DEP, "");
+        fs::write(&fx.osrelease, "\n").unwrap();
         let mut l = MockLoader::new(&fx);
         assert_eq!(load_with(&fx.paths(), &mut l), ["plain"]);
         assert!(l.calls.is_empty());
@@ -538,5 +631,68 @@ mod tests {
         let mut l = MockLoader::new(&fx);
         assert_eq!(load_with(&fx.paths(), &mut l), ["plain"]);
         assert!(l.calls.is_empty());
+    }
+
+    fn capture_log(run: impl FnOnce()) -> Vec<String> {
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::logging::capture::install_test_logger();
+        crate::logging::capture::start_capture();
+        run();
+        crate::logging::capture::take_capture()
+    }
+
+    fn assert_logged(lines: &[String], line: &str) {
+        assert!(lines.iter().any(|l| l == line), "{line:?} not in {lines:?}");
+    }
+
+    #[test]
+    fn logs_each_reason_and_one_error_line() {
+        let fx = Fixture::new("nosuch\nplain\ntop\n", DEP, "");
+        let plain = fx.module_file("kernel/d/plain.ko");
+        fs::remove_file(&plain).unwrap();
+        let mut l = MockLoader::new(&fx);
+        l.fail.insert("mid", Errno::EINVAL);
+        let lines = capture_log(|| {
+            load_with(&fx.paths(), &mut l);
+        });
+        let mid = fx.module_file("kernel/b/mid.ko.xz");
+        assert_logged(&lines, "[WARN] early modules: nosuch not in modules.dep");
+        assert_logged(
+            &lines,
+            &format!(
+                "[WARN] early modules: cannot open {}: No such file or directory (os error 2)",
+                plain.display()
+            ),
+        );
+        assert_logged(
+            &lines,
+            &format!(
+                "[WARN] early modules: loading mid failed: EINVAL: Invalid argument ({}, compressed)",
+                mid.display()
+            ),
+        );
+        assert_logged(
+            &lines,
+            "[WARN] early modules: top skipped, dependency mid not loaded",
+        );
+        assert_logged(
+            &lines,
+            "[ERROR] early modules: not loaded: nosuch, plain, top",
+        );
+    }
+
+    #[test]
+    fn logs_ignored_parameters_of_a_builtin_module() {
+        let fx = Fixture::new("inside_p p=1\n", DEP, "kernel/x/inside_p.ko\n");
+        let mut l = MockLoader::new(&fx);
+        let lines = capture_log(|| {
+            load_with(&fx.paths(), &mut l);
+        });
+        assert_logged(
+            &lines,
+            "[WARN] early modules: inside_p built in or already loaded, parameters ignored",
+        );
     }
 }

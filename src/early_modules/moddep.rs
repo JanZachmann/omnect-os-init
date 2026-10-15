@@ -10,8 +10,10 @@ use crate::early_modules::config::normalize_name;
 const COMPRESSION_SUFFIXES: [&str; 3] = [".xz", ".zst", ".gz"];
 
 pub(super) struct ModEntry {
-    pub path: PathBuf,
-    pub deps: Vec<PathBuf>,
+    pub(super) path: PathBuf,
+    /// All transitive dependencies, as depmod writes them; the last one loads
+    /// first.
+    pub(super) deps: Vec<PathBuf>,
 }
 
 fn split_compression(path: &Path) -> Option<(&str, bool)> {
@@ -26,15 +28,17 @@ fn split_compression(path: &Path) -> Option<(&str, bool)> {
 
 pub(super) fn module_name(path: &Path) -> Option<String> {
     let (file, _) = split_compression(path)?;
-    file.strip_suffix(".ko").map(normalize_name)
+    file.strip_suffix(".ko")
+        .filter(|n| !n.is_empty())
+        .map(normalize_name)
 }
 
 pub(super) fn is_compressed(path: &Path) -> bool {
     split_compression(path).is_some_and(|(file, compressed)| compressed && file.ends_with(".ko"))
 }
 
-/// Each line holds the full dependency list, so only the lines of the listed
-/// modules are kept.
+/// depmod writes all transitive dependencies on each line, so only the lines of
+/// the listed modules are kept.
 pub(super) fn parse_modules_dep(text: &str, listed: &HashSet<&str>) -> HashMap<String, ModEntry> {
     text.lines()
         .filter_map(|line| {
@@ -78,6 +82,7 @@ mod tests {
             Some("foo")
         );
         assert_eq!(module_name(Path::new("kernel/a/foo.txt")), None);
+        assert_eq!(module_name(Path::new("kernel/a/.ko.xz")), None);
     }
 
     #[test]

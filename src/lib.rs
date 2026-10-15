@@ -155,11 +155,6 @@ pub fn run_init() -> Result<()> {
     // must persist any fsck diagnostic held in ods_status before the error propagates.
     let core_result = mount_core_partitions(&layout, rootfs, &mut ods_status);
 
-    #[cfg(feature = "early-modules")]
-    if core_result.is_ok() {
-        early_modules::load(rootfs);
-    }
-
     // Best-effort: open the bootloader environment. The image type determines how
     // to proceed when it is unavailable — see classify_boot_env.
     //
@@ -186,15 +181,16 @@ pub fn run_init() -> Result<()> {
     // could see a different answer than the one that is dispatched below.
     let mode = BootMode::detect(bootloader_env.available_mut())?;
 
+    #[cfg(feature = "flash-mode")]
+    let is_flash = matches!(mode, BootMode::Flash(_));
+    #[cfg(not(feature = "flash-mode"))]
+    let is_flash = false;
+
     // A flash mode clones the whole disk, so init_setup's work on the running
     // disk is not carried over, and an extra-bootargs reboot would only delay
-    // the flash.
-    #[cfg(feature = "flash-mode")]
-    let skip_init_setup = matches!(mode, BootMode::Flash(_));
-    #[cfg(not(feature = "flash-mode"))]
-    let skip_init_setup = false;
-
-    if !skip_init_setup {
+    // the flash. A flash mode needs no early module either, and it unmounts the
+    // rootfs, which a firmware read started by a module may still use.
+    if !is_flash {
         let ctx = init_setup::InitSetupCtx {
             layout: &layout,
             boot_env: &mut bootloader_env,
@@ -203,6 +199,12 @@ pub fn run_init() -> Result<()> {
             update_pending: read_update_pending(),
         };
         init_setup::run(ctx)?;
+
+        // After the fsck results are saved to the boot env, so a module that
+        // crashes the kernel cannot lose them, and after a possible
+        // extra-bootargs reboot.
+        #[cfg(feature = "early-modules")]
+        early_modules::load(rootfs);
     }
 
     let ctx = BootContext::new(&config, &layout, rootfs, bootloader_env, ods_status);

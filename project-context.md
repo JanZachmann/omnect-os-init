@@ -124,6 +124,11 @@ src/
   cargo test --no-default-features --features core,uboot,gpt,flash-mode-3,test-utils
   cargo test --features grub,gpt,flash-mode-1,flash-mode-2,flash-mode-3,factory-reset,test-utils
   ```
+  `early-modules` combinations:
+  ```
+  cargo test --features grub,gpt,early-modules,test-utils
+  cargo test --features uboot,gpt,early-modules,test-utils
+  ```
   `flash-mode` alone, without a mode feature, is not a supported configuration
   and no combination here or in the README covers it.
 - **Audit:** `cargo audit`

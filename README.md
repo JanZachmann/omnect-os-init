@@ -50,9 +50,7 @@ flowchart TD
     LAYOUT -->|OK| CORE["mount_core_partitions()\nrootfs + boot + fsck"]
     LAYOUT -->|Fail| FEB
 
-    CORE -->|"OK + early-modules"| EMOD["early_modules::load()\nbest effort, never fails"]
-    CORE -->|"Fail or no early-modules"| BENV["open_boot_env()"]
-    EMOD --> BENV
+    CORE --> BENV["open_boot_env()"]
 
     BENV --> CLASSIFY{"classify_boot_env"}
     CLASSIFY -->|"OK → Available"| APPLY["apply_boot_env_decision()\ncore_result × env decision\npersist_fsck_results — always"]
@@ -73,9 +71,10 @@ flowchart TD
     FLASH -->|Fatal| FEB
 
     ISETUP -->|"FsckRequiresReboot\nExtraBootArgsUpdated"| FEB
-    ISETUP -->|"ResizeData error\nContinueDegraded — warn"| DISPATCH{"dispatch mode"}
+    ISETUP -->|"ResizeData error\nContinueDegraded — warn"| EMOD["early_modules::load()\nfeature = early-modules\nbest effort, never fails"]
     ISETUP -->|"Fatal (non-resize)"| FEB
-    ISETUP -->|OK| DISPATCH
+    ISETUP -->|OK| EMOD
+    EMOD --> DISPATCH{"dispatch mode"}
 
     DISPATCH -->|Normal| MREM["mount_remaining_partitions()\ndata · factory · cert + fsck\npersist_fsck_results — always"]
     DISPATCH -->|"FactoryReset(trigger)\nfeature = factory-reset"| FCLEAR
@@ -291,7 +290,8 @@ build does not fail without them, but the mode refuses to run.
 A driver that probes in the initramfs finds another module, for example a DMA
 engine, only when that module is already loaded. udev loads modules only after
 `switch_root`. With the `early-modules` feature, the init loads the modules
-listed in the rootfs right after the rootfs is mounted.
+listed in the rootfs after `init_setup`, before the other partitions are
+mounted. A flash mode loads none.
 
 To add a module, install a `.conf` file into `/etc/omnect/early-modules.d/` in
 the rootfs and build the init with `early-modules`:
@@ -317,8 +317,7 @@ The step:
    rootfs;
 2. sets `/sys/module/firmware_class/parameters/path` to `/rootfs/lib/firmware`,
    so a firmware request during the load finds the file in the rootfs. The
-   path is not restored: after `switch_root` it does not exist, and the kernel
-   uses its default paths;
+   path is not restored;
 3. for each listed module, in file and line order: skips it when it is built
    in or already loaded; else loads its dependencies from `modules.dep` and
    then the module itself with `finit_module`. A dependency that has its own
@@ -330,6 +329,11 @@ Needs:
   firmware in the rootfs.
 - `CONFIG_MODULE_DECOMPRESS` in the kernel for a compressed module
   (`.ko.xz`, `.ko.zst`, `.ko.gz`).
+- `CONFIG_FW_LOADER=y`. With `=m`, the `firmware_class` parameter file does
+  not exist in the initramfs, and no module is loaded.
+- A `/lib` link in the rootfs must be relative (`lib -> usr/lib`). An absolute
+  link resolves into the initramfs, so `modules.dep` and the firmware are not
+  found.
 
 Not supported: the init reads only `modules.dep` and `modules.builtin`. So
 `modprobe.d` (`options`, `alias`, `softdep`, `blacklist`) and
@@ -340,7 +344,7 @@ The step is best effort. It never stops the boot and does not change the
 status reported to omnect-device-service. Each problem is logged as a warning
 with its reason. When a listed module did not load, the step ends with one
 error line `early modules: not loaded: <names>`. udev may still load the
-module later, but the drivers that probed before then did not get it.
+module later, but a driver that probed before then ran without it.
 
 With `CONFIG_FW_LOADER_USER_HELPER_FALLBACK=y`, a firmware file missing in the
 rootfs can block the load for the sysfs fallback timeout (60 s by default).

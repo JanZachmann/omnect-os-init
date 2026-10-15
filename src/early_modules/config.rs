@@ -6,8 +6,8 @@ use log::warn;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ModuleEntry {
-    pub name: String,
-    pub params: CString,
+    pub(super) name: String,
+    pub(super) params: CString,
 }
 
 /// `modprobe` treats `-` and `_` in module names as equal.
@@ -18,7 +18,11 @@ pub(super) fn normalize_name(name: &str) -> String {
 pub(super) fn read_config_dir(dir: &Path) -> Vec<ModuleEntry> {
     let mut files: Vec<_> = match fs::read_dir(dir) {
         Ok(entries) => entries
-            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter_map(|e| {
+                e.inspect_err(|e| warn!("early modules: cannot list {}: {e}", dir.display()))
+                    .ok()
+            })
+            .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|ext| ext == "conf"))
             .collect(),
         Err(e) if e.kind() == ErrorKind::NotFound => return Vec::new(),
@@ -44,7 +48,10 @@ pub(super) fn read_config_dir(dir: &Path) -> Vec<ModuleEntry> {
             let params = match CString::new(params) {
                 Ok(params) => params,
                 Err(e) => {
-                    warn!("early modules: {name}: bad parameters: {e}");
+                    warn!(
+                        "early modules: {name} in {}: bad parameters: {e}",
+                        file.display()
+                    );
                     continue;
                 }
             };
@@ -100,6 +107,20 @@ mod tests {
                 entry("imx_sdma", ""),
                 entry("example_mod", "debug=1 mode=fast")
             ]
+        );
+    }
+
+    #[test]
+    fn parses_whitespace_variants() {
+        let dir = TempDir::new().unwrap();
+        write(
+            dir.path(),
+            "a.conf",
+            "   \n\t# comment\nmod_a    p=1  q=2\n",
+        );
+        assert_eq!(
+            read_config_dir(dir.path()),
+            vec![entry("mod_a", "p=1  q=2")]
         );
     }
 
@@ -163,6 +184,7 @@ mod tests {
     fn unreadable_file_does_not_stop_the_others() {
         let dir = TempDir::new().unwrap();
         std::os::unix::fs::symlink(dir.path().join("missing"), dir.path().join("a.conf")).unwrap();
+        std::fs::create_dir(dir.path().join("c.conf")).unwrap();
         write(dir.path(), "b.conf", "mod_b\n");
         assert_eq!(read_config_dir(dir.path()), vec![entry("mod_b", "")]);
     }
@@ -179,7 +201,6 @@ mod tests {
         let dir = TempDir::new().unwrap();
         write(dir.path(), "a.conf.bak", "mod_a\n");
         write(dir.path(), ".a.conf.swp", "mod_b\n");
-        std::fs::create_dir(dir.path().join("sub.conf")).unwrap();
         assert!(read_config_dir(dir.path()).is_empty());
     }
 

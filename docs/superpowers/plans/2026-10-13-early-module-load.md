@@ -2,6 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Correction (2026-10-15):** the code and the spec differ from this plan in these points, and they are the reference:
+> - The step ends with one `error` line, not `warn`.
+> - `parse_modules_dep` takes the set of listed modules and keeps only their lines.
+> - The loader has no `Session` with cloned `deps`. An immutable `Resolved` holds the inputs, and the load state is separate.
+> - The step runs after `init_setup::run` and not in a flash mode, not right after `mount_core_partitions`.
+> - `param_set_copystring` in the kernel does not strip a trailing newline. The code writes none.
+
 **Goal:** Load the kernel modules listed in `<rootfs>/etc/omnect/early-modules.d/*.conf` (with dependencies and firmware) before `switch_root`, behind the Cargo feature `early-modules`, and enable it for `mx8mm-nxp-bsp` (`imx_sdma`) in meta-omnect.
 
 **Architecture:** New module `src/early_modules/` with three files: config parser, `modules.dep`/`modules.builtin` parser, and the loader. The loader writes `<rootfs>/lib/firmware` to `firmware_class.path` and calls `finit_module` on the rootfs files through a small trait, so tests never load a module. `run_init` calls `early_modules::load(rootfs)` right after `mount_core_partitions` succeeds. The step never returns an error.
