@@ -18,6 +18,8 @@ use crate::{
 pub mod bootloader;
 pub mod config;
 pub mod early_init;
+#[cfg(feature = "early-modules")]
+pub mod early_modules;
 pub mod error;
 pub mod filesystem;
 pub mod init_setup;
@@ -179,15 +181,16 @@ pub fn run_init() -> Result<()> {
     // could see a different answer than the one that is dispatched below.
     let mode = BootMode::detect(bootloader_env.available_mut())?;
 
+    #[cfg(feature = "flash-mode")]
+    let is_flash = matches!(mode, BootMode::Flash(_));
+    #[cfg(not(feature = "flash-mode"))]
+    let is_flash = false;
+
     // A flash mode clones the whole disk, so init_setup's work on the running
     // disk is not carried over, and an extra-bootargs reboot would only delay
-    // the flash.
-    #[cfg(feature = "flash-mode")]
-    let skip_init_setup = matches!(mode, BootMode::Flash(_));
-    #[cfg(not(feature = "flash-mode"))]
-    let skip_init_setup = false;
-
-    if !skip_init_setup {
+    // the flash. A flash mode needs no early module either, and it unmounts the
+    // rootfs, which a firmware read started by a module may still use.
+    if !is_flash {
         let ctx = init_setup::InitSetupCtx {
             layout: &layout,
             boot_env: &mut bootloader_env,
@@ -196,6 +199,12 @@ pub fn run_init() -> Result<()> {
             update_pending: read_update_pending(),
         };
         init_setup::run(ctx)?;
+
+        // After the fsck results are saved to the boot env, so a module that
+        // crashes the kernel cannot lose them, and after a possible
+        // extra-bootargs reboot.
+        #[cfg(feature = "early-modules")]
+        early_modules::load(rootfs);
     }
 
     let ctx = BootContext::new(&config, &layout, rootfs, bootloader_env, ods_status);

@@ -34,6 +34,7 @@ uuid = { version = "1.11", default-features = false, optional = true }
 default = ["core", "flash-mode-1"]
 core = []
 dos = ["core"]            # DOS/MBR partition table (extended container at slot 4, logical partitions 5-8)
+early-modules = ["core", "nix/kmod"] # Load the modules listed in the rootfs before switch_root
 factory-reset = ["core"]
 flash-mode = ["core"]     # Shared flash layer; pulled in by a mode, never selected on its own
 flash-mode-1 = ["flash-mode", "dep:uuid"]  # Clone the running disk onto another block device

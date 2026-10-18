@@ -1,8 +1,8 @@
 # Design: Load Kernel Modules Early in the Initramfs
 
 **Date:** 2026-09-25
-**Status:** Draft, for review
-**Scope:** omnect-os-init — a new early step after the rootfs mount that loads
+**Status:** Implemented
+**Scope:** omnect-os-init — a new early step before `switch_root` that loads
 the modules listed in a config file in the rootfs, one Cargo feature.
 meta-omnect sets the feature and ships the first config file (`imx_sdma` on
 i.MX8MM).
@@ -93,8 +93,17 @@ example_mod debug=1 mode=fast
 
 ## 5. Load sequence
 
-A new step, `early_modules::load(rootfs)`, runs in `run_init` right after
-`mount_core_partitions` has mounted the rootfs, and before anything else.
+A new step, `early_modules::load(rootfs)`, runs in `run_init` after
+`init_setup::run`, before the boot mode runs and mounts the other partitions.
+
+- It runs after the fsck results are saved to the boot env, so a module whose
+  `init()` crashes the kernel cannot lose them. Then the rootfs mount is also
+  known to have succeeded.
+- It runs after a possible extra-bootargs reboot, so it does not load modules
+  only to reboot.
+- It does not run in a flash mode. A flash run needs no driver from the
+  rootfs, and it unmounts the rootfs, which an asynchronous firmware read
+  (section 7) may still use.
 
 1. Read and parse the config files. No module listed: stop here and leave
    `firmware_class.path` alone.
@@ -183,10 +192,13 @@ returned as an error, and none changes the ODS status.
 | `finit_module` fails with `EEXIST` | `info` (loaded in the meantime) |
 | compressed module, kernel without `CONFIG_MODULE_DECOMPRESS` | `finit_module` fails; `warn`, skip the module |
 | `finit_module` fails otherwise | `warn`, skip the module |
+| every listed module is built in, already loaded, or unknown | `firmware_class.path` is set, nothing is loaded |
 | rootfs mount failed | the step does not run |
+| flash mode | the step does not run |
 
-When a listed module did not load, the step ends with one `warn` line that
-names all of them.
+When a listed module did not load, the step ends with one `error` line that
+names all of them. A test that checks the journal for errors then sees the
+failure, although udev may load the module later.
 
 A release image must never stop in the fatal-error loop because of this step,
 so no path returns an error.
@@ -205,6 +217,9 @@ defined:
 
 - omnect-os-init: Cargo feature `early-modules = ["core"]`, off by default;
   `nix` gets the `kmod` feature.
+- Kernel: `CONFIG_FW_LOADER=y`. With `=m` the `firmware_class` parameter file
+  does not exist in the initramfs, and the step loads nothing.
+- Rootfs: a `/lib` link must be relative (section 6).
 - meta-omnect, Rust initramfs recipe:
   `CARGO_FEATURES:append:mx8mm-nxp-bsp = ",early-modules"`. This is the
   override the legacy recipe used, and it is active on the phytec i.MX8MM
@@ -255,7 +270,7 @@ On hardware (phyGATE Tauri-L):
 | Module load | `modprobe` from a bind-mounted `/lib/modules` | `finit_module` on the rootfs file, dependencies from `modules.dep` |
 | Firmware | bind-mounted `/lib/firmware`, left mounted | `firmware_class.path` set to the rootfs |
 | Errors | ignored | logged, never fatal |
-| Position | after the rootfs mount | after the rootfs mount |
+| Position | after the rootfs mount | after `init_setup`, not in a flash mode |
 
 ## 13. Alternatives considered
 

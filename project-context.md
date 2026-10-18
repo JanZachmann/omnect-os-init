@@ -14,6 +14,7 @@ src/
 ├── lib.rs                   # Library exports + run_init() + apply_boot_env_decision()
 ├── error.rs                 # Error type hierarchy
 ├── early_init.rs            # Mount /dev, /proc, /sys, /run before logging
+├── early_modules/           # Load modules listed in the rootfs before switch_root (feature = early-modules)
 ├── recovery.rs              # RecoveryClass -> Action policy (pure; main.rs executes it)
 ├── bootloader/
 │   ├── mod.rs               # BootEnv trait, BootEnvState, classify_boot_env()
@@ -123,6 +124,11 @@ src/
   cargo test --no-default-features --features core,uboot,gpt,flash-mode-3,test-utils
   cargo test --features grub,gpt,flash-mode-1,flash-mode-2,flash-mode-3,factory-reset,test-utils
   ```
+  `early-modules` combinations:
+  ```
+  cargo test --features grub,gpt,early-modules,test-utils
+  cargo test --features uboot,gpt,early-modules,test-utils
+  ```
   `flash-mode` alone, without a mode feature, is not a supported configuration
   and no combination here or in the README covers it.
 - **Audit:** `cargo audit`
@@ -135,6 +141,7 @@ src/
 | `uboot` | U-Boot bootloader support (mutually exclusive with `grub`) |
 | `gpt` | GPT partition table (primary partitions 1-7; mutually exclusive with `dos`) |
 | `dos` | DOS/MBR partition table (extended at slot 4, logical 5-8; mutually exclusive with `gpt`) |
+| `early-modules` | Load the modules listed in `/etc/omnect/early-modules.d/*.conf` of the rootfs before `switch_root` |
 | `persistent-var-log` | Persistent `/var/log` mount |
 | `release-image` | Release behaviour: loop on fatal error; continue booting in degraded mode |
 | `resize-data` | Expand data partition + filesystem to fill disk on first boot |
