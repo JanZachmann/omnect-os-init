@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 
+use lzma_rust2::xz_uncompressed_size;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -281,8 +282,8 @@ impl UrlOps for RealUrlOps {
             path: image.to_path_buf(),
             reason,
         };
-        let mut file = File::open(image).map_err(|e| invalid(e.to_string()))?;
-        xz::uncompressed_size(&mut file).map_err(invalid)
+        let file = File::open(image).map_err(|e| invalid(format!("opening: {e}")))?;
+        xz_uncompressed_size(file).map_err(|e| invalid(format!("not a valid xz file: {e}")))
     }
 
     fn device_len(&mut self, disk: &Path) -> Result<u64, FlashError> {
@@ -422,7 +423,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        mode::flash::{keeps_log, xz::test_support::xz},
+        mode::flash::{
+            keeps_log,
+            xz::test_support::{xz, xz_with},
+        },
         partition::RootDevice,
     };
 
@@ -580,6 +584,28 @@ mod tests {
         let written = fs::read(&disk).unwrap();
         assert_eq!(written[..IMAGE.len()], *IMAGE);
         assert!(written[IMAGE.len()..].iter().all(|&b| b == 0xff));
+    }
+
+    #[test]
+    fn concatenated_streams_are_written_in_full() {
+        let first: &[u8] = b"first stream";
+        let second: &[u8] = b"second stream";
+        let padding = [0u8; 4];
+        let file = [&xz(first)[..], &padding, &xz(second), &padding].concat();
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join(IMAGE_FILE_NAME);
+        let disk = dir.path().join("sdz");
+        fs::write(&image, &file).unwrap();
+        fs::write(&disk, vec![0xff; usize::try_from(DISK_LEN).unwrap()]).unwrap();
+
+        // The size read and the decoder must agree, or the write fails late.
+        let size = RealUrlOps::default().image_size(&image).unwrap();
+        write_image(&image, &disk, size).unwrap();
+
+        let expected = [first, second].concat();
+        let written = fs::read(&disk).unwrap();
+        assert_eq!(written[..expected.len()], expected[..]);
+        assert!(written[expected.len()..].iter().all(|&b| b == 0xff));
     }
 
     #[test]
@@ -995,6 +1021,46 @@ mod tests {
         assert!(!printed.contains("sig="), "{printed}");
         // curl's own message, so the operator need not map its exit code.
         assert!(printed.contains("curl: (37)"), "{printed}");
+    }
+
+    fn real_image_size(file: &[u8]) -> Result<u64, FlashError> {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join(IMAGE_FILE_NAME);
+        fs::write(&image, file).unwrap();
+        RealUrlOps::default().image_size(&image)
+    }
+
+    #[test]
+    fn the_image_size_is_read_from_the_xz_index() {
+        let data: Vec<u8> = (0..3 * 4096 + 17).map(|i| (i % 251) as u8).collect();
+        let len = data.len() as u64;
+        let several_blocks = xz_with(&data, std::num::NonZeroU64::new(1000));
+        assert_eq!(real_image_size(&xz(&data)).unwrap(), len);
+        assert_eq!(real_image_size(&several_blocks).unwrap(), len);
+        // The decoder accepts concatenated streams, so their sizes add up.
+        let two_streams = [xz(&data), xz(&data)].concat();
+        assert_eq!(real_image_size(&two_streams).unwrap(), 2 * len);
+    }
+
+    #[test]
+    fn a_file_that_is_not_xz_has_no_image_size() {
+        let mut cut = xz(IMAGE);
+        cut.pop();
+        let trailing = [xz(IMAGE), b"garbage!".to_vec()].concat();
+        for (file, upstream_reason) in [
+            (Vec::new(), "too small"),
+            (IMAGE.to_vec(), "too small"),
+            (cut, "footer"),
+            (trailing, "footer"),
+            (vec![0x5a; 64], "footer"),
+        ] {
+            let err = real_image_size(&file).unwrap_err();
+            assert!(
+                matches!(&err, FlashError::InvalidImage { reason, .. }
+                    if reason.starts_with("not a valid xz file") && reason.contains(upstream_reason)),
+                "{err}"
+            );
+        }
     }
 
     #[test]

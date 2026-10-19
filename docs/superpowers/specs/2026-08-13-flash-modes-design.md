@@ -142,7 +142,7 @@ src/mode/flash/
   rawio.rs      in-process replacement for every `dd` call               flash-mode, per item
   unmount.rs    rootfs unmount; /proc/mounts sweep                       flash-mode; sweep flash-mode-network
   net.rs        interface up, dhcpcd; dropbear                           flash-mode-network; dropbear flash-mode-2
-  xz/           xz decoder; xz index size reader                         flash-mode-network; reader flash-mode-3
+  xz/           xz decoder                                               flash-mode-network
   bmap/         bmap parser and in-process flasher                       flash-mode-2
   scp.rs        mode 2 orchestration                                     flash-mode-2
   url.rs        mode 3 orchestration                                     flash-mode-3
@@ -286,8 +286,7 @@ The in-process `bmaptool copy` makes the release binary about 166 KiB larger
 `xz` from the initramfs. The decoder and the parser run in PID 1 with
 `panic = "abort"`, so a panic on a malformed stream is a kernel panic, where a
 crashed `bmaptool` was a failed attempt. `lzma-rust2` and `quick-xml` have no
-`unsafe` code in the features used, and `lzma-rust2` is pinned to an exact
-version until it reaches 1.0, because each 0.x update can change the decoder.
+`unsafe` code in the features used.
 
 Mode 3 adds about 28 KiB on top of that (x86-64, the same features plus
 `flash-mode-3`, build constants set), because it
@@ -438,8 +437,8 @@ rtc = ["core"]                                # the machine has a reliable real-
 `config.rs`, `efi.rs`, and the dispatch branch. It is never enabled directly;
 each mode feature pulls it in. `flash-mode-network` gates what modes 2 and 3
 share: `net.rs`, the unmount sweep, the partition-table re-read and `xz/`.
-`flash-mode-2` gates `bmap/` and `scp.rs`, `flash-mode-3` gates `url.rs` and the
-xz index reader. The recipe maps `MACHINE_FEATURES` `rtc` onto `rtc` (§5.3).
+`flash-mode-2` gates `bmap/` and `scp.rs`, `flash-mode-3` gates `url.rs`. The
+recipe maps `MACHINE_FEATURES` `rtc` onto `rtc` (§5.3).
 
 `flash-mode-1` pulls in one new dependency,
 `uuid = { version = "1.11", default-features = false }`. The bytes come from
@@ -595,8 +594,8 @@ Child processes get an explicit `PATH`: PID 1 has no login environment, and
    the first field of the sha256 file. A sha256 file larger than 4 KiB or not
    UTF-8 is refused as `InvalidImage`: it comes from a wrong URL.
 5. Read the uncompressed size from the xz index and refuse an empty image or
-   one larger than the disk. The reader accepts exactly one xz stream; it is own code until
-   `lzma-rust2` reports the size itself.
+   one larger than the disk. `lzma-rust2` reads it; concatenated streams add up,
+   as the decoder writes them all.
 6. Decode the image with `lzma-rust2` onto `/dev/omnect/rootblk` and write every
    byte, also the zero blocks, as `bmaptool copy --nobmap` did. The write stops
    before a byte past the indexed size, and a stream that decodes to another
@@ -1059,7 +1058,8 @@ only smoke-tested. Real end-to-end coverage stays in Concourse CI on hardware.
 | Destination role → partition index, GPT and DOS | unit | `src/mode/flash/clone.rs` |
 | `curl` options, `--insecure` only without the `rtc` feature | unit | `src/mode/flash/url.rs` |
 | Mode 3 step order; checksum, empty image, size, download, write and re-read failures; no query string in the log | unit | `src/mode/flash/url.rs` |
-| xz index size: single and multi-block, concatenated streams, cut and foreign files refused | unit | `src/mode/flash/xz/index.rs` |
+| xz index size: single and multi-block, concatenated streams; cut, trailing data and foreign files refused | unit | `src/mode/flash/url.rs` |
+| Concatenated streams with padding are written in full, at the size read from the index | unit | `src/mode/flash/url.rs` |
 | scp instruction text includes the acquired IP | unit | `src/mode/flash/scp.rs` |
 | Detection: mode 1 and factory reset set → both cleared, then refused | unit | `src/mode/mod.rs` |
 | Detection: every row of the §3.3 trigger table | integration | `tests/flash_modes.rs` |

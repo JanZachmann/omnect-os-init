@@ -20,7 +20,7 @@ src/
 │   ├── mod.rs               # BootEnv trait, BootEnvState, classify_boot_env()
 │   ├── grub.rs              # GRUB implementation (grub-editenv)
 │   ├── uboot.rs             # U-Boot implementation (fw_printenv/fw_setenv)
-│   └── types.rs             # BootloaderType enum
+│   └── types.rs             # fsck output encoding for the bootloader env
 ├── config/
 │   └── mod.rs               # /proc/cmdline parser; build-time constants via build.rs
 ├── filesystem/
@@ -50,7 +50,7 @@ src/
 │       ├── net.rs           # eth0 up, dhcpcd; dropbear for mode 2 (feature = flash-mode-network)
 │       ├── scp.rs           # Mode 2 orchestration: scp upload, flash, retry (feature = flash-mode-2)
 │       ├── url.rs           # Mode 3 orchestration: download, check, flash (feature = flash-mode-3)
-│       ├── xz/              # xz decoder; index size reader for mode 3 (feature = flash-mode-network)
+│       ├── xz/              # xz decoder (feature = flash-mode-network)
 │       ├── bmap/            # In-process bmap flash (feature = flash-mode-2)
 │       │   ├── mod.rs       # Bmap type, read, unmapped gaps
 │       │   ├── parse.rs     # bmap XML parsing and checks

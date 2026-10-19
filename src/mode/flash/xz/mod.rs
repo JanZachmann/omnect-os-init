@@ -1,20 +1,14 @@
 //! xz decoding for the flash modes that receive a `wic.xz` over the network.
 
-#[cfg(feature = "flash-mode-3")]
-mod index;
-
 use std::io::{self, ErrorKind, Read};
 
 use lzma_rust2::{XzReader, lzma2_get_memory_usage};
 
-/// The largest dictionary of the xz presets (`-9`). The decoder allocates the
-/// dictionary that each block header asks for, so a larger one is rejected
-/// before it can push the device out of memory.
+/// The largest dictionary of the xz presets (`-9`). The decoder window grows up
+/// to the dictionary each block header asks for, so a larger one is rejected
+/// before decoding starts.
 const MAX_XZ_DICT_SIZE: u32 = 64 * MIB;
 const MIB: u32 = 1024 * 1024;
-
-#[cfg(feature = "flash-mode-3")]
-pub(crate) use crate::mode::flash::xz::index::uncompressed_size;
 
 pub(crate) fn decoder<R: Read>(compressed: R) -> XzReader<FullReads<R>> {
     XzReader::new_mem_limit(
