@@ -333,6 +333,12 @@ answered with yes. `boot` is checked on every boot; `factory`, `cert`, `etc`
 and `data` on every boot except in a flash mode. The rootfs partitions are not
 checked.
 
+When fsck replayed the journal of an ext4 partition and exited with 0, it runs
+a second time with `fsck -y -f`, because the replay can leave damage that only
+a full check finds. The exit code of the second run is the result; the output
+holds both runs. This full check runs after every unclean shutdown and takes
+longer on large partitions.
+
 - Exit code 0 or 1 (no errors, or errors corrected): the boot continues.
 - Exit code with the "reboot required" bit (2): the system reboots.
 - Other errors: logged; the boot continues.
