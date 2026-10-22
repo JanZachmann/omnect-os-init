@@ -144,10 +144,10 @@ The bmap file is checked before the image is asked for: its checksum, its
 format version, its block ranges, and that the image fits the disk.
 
 By default the init unpacks the blocks the bmap file lists into RAM, checks
-them against the bmap file, and only then writes the disk. An image build can select direct
-flashing instead, for devices with too little RAM: the disk is then written
-straight from the `scp` stream, and a broken image is seen only after the disk
-was partly written.
+them against the bmap file, and only then writes the disk. An image build can
+select direct flashing instead, for devices with too little RAM: the disk is
+then written straight from the `scp` stream, and a broken image is seen only
+after the disk was partly written.
 
 If one attempt fails (bad bmap file, broken or cut-off image, image too large,
 write error), the init logs the reason and asks for both files again. Keep
@@ -161,7 +161,9 @@ disk was partly written or its partition table could not be read again.
 An image build can also add the file `/etc/enforce_flash_mode` to the
 initramfs. Then every boot starts flash mode 2. Only `flash-mode` `1`
 overrides it. On a release image this also works when the bootloader
-environment cannot be read.
+environment cannot be read. The init checks the file only after it has found
+its disk and mounted the rootfs and the boot partition, so the file does not
+help to flash a blank or broken disk.
 
 ### Flash mode 3
 
@@ -200,14 +202,16 @@ The TLS certificate of an HTTPS URL is checked only on machines with a
 reliable real-time clock (cargo feature `rtc`). Without it, the sha256 file
 only detects a corrupted download, not a changed one.
 
-The system reboots after a successful flash. The log is not written when the write to
-the disk failed or the partition table could not be read again.
+The system reboots after a successful flash. The log is not written when the
+write to the disk failed or the partition table could not be read again.
 
 ### Flash mode and factory reset together
 
 - Flash mode 1 and `factory-reset`: refused (see [flash mode 1](#flash-mode-1)).
 - Flash mode 2 or 3 and `factory-reset`: the flash mode runs. The factory reset
-  does not run and is logged as an error.
+  does not run on this boot and is logged as an error. Its variable is not
+  deleted. A successful flash writes the bootloader environment of the new
+  image; after a failed flash, the factory reset runs on the next boot.
 
 ## Factory reset
 
@@ -248,8 +252,9 @@ A failed reset never stops the boot; the result is reported in the
 - A failed restore of one path does not stop the restore of the others.
 - If `etc` or `data` cannot be mounted after the filesystems were re-created,
   the reason is also stored in the bootloader environment variable
-  `omnect_factory_reset_last_error` (`<partition>:<reason>`), because the
-  following boot may halt on the same partition.
+  `omnect_factory_reset_last_error` (`<partition>:<reason>`, the reason cut to
+  128 bytes), because the following boot may halt on the same partition. The
+  init never deletes this variable, so it can be left from an older reset.
 
 ### Preserve topics
 
@@ -280,15 +285,17 @@ key holds an array of paths. The topic `applications` adds the paths of every
 The result is the object `factory_reset` in the [status file](#status-file):
 
 ```sh
-jq '.factory_reset' /run/omnect-device-service/omnect-os-initramfs.json
+sudo jq '.factory_reset' /run/omnect-device-service/omnect-os-initramfs.json
 ```
+
+Success, for `"preserve": ["applications"]` and the `factory-reset.d` file
+above:
 
 ```json
 {
   "status": 0,
   "paths": [
     "/etc/omnect/factory-reset.d/",
-    "/etc/restore_file",
     "/home/omnect/.bash_history",
     "/home/root/.bash_history"
   ],
@@ -349,8 +356,9 @@ If a check was not clean, its result is kept until the
 - U-Boot: in the bootloader environment variable `omnect_fsck_<partition>`
   (gzip and base64);
 - GRUB: `boot` in `omnect_fsck_boot`, the other partitions in files
-  `fsck.<partition>` on the boot partition. Output that is too large is
-  replaced by a short note.
+  `fsck.<partition>` on the boot partition. For `boot`, output that is too
+  large is replaced by a short note, and a result that asks for a reboot is
+  not kept.
 
 Nothing is kept when the bootloader environment cannot be read. The full
 output is also written to `/mnt/data/var/log/fsck/<partition>.log` when the
@@ -358,10 +366,11 @@ data partition is mounted and fsck printed output.
 
 ## Update validation
 
-After an A/B update the bootloader sets flags in its environment. The init
-turns them into files in `/run/omnect-device-service/` for
-omnect-device-service, which does the validation. This is skipped when the
-bootloader environment cannot be read. See the
+During an A/B update, the update agent and the bootloader set flags in the
+bootloader environment. The init turns them into files in
+`/run/omnect-device-service/` for omnect-device-service, which does the
+validation. This is skipped when the bootloader environment cannot be read.
+See the
 [omnect-device-service docs](https://github.com/omnect/omnect-device-service/blob/main/src/twin/firmware_update/update_validation.md).
 
 | Bootloader variable             | File                            | Variable deleted |
@@ -375,8 +384,9 @@ Both validate flags set at once is a fatal error.
 ## Status file
 
 The init writes `/run/omnect-device-service/omnect-os-initramfs.json` for
-omnect-device-service. Only `first_boot` is always present; the other keys
-appear when there is something to report.
+omnect-device-service. Only root and the omnect-device-service user can read
+it. `first_boot` is always present; the other keys appear only when there is
+something to report.
 
 ```json
 {
@@ -392,7 +402,7 @@ appear when there is something to report.
 
 | Key              | Present when                                   | Content |
 | ---------------- | ---------------------------------------------- | ------- |
-| `first_boot`     | always                                         | `true` on the first boot after flashing |
+| `first_boot`     | always                                         | `true` on the first boot after flashing, and on later boots while the data resize or the [extra boot arguments](#extra-boot-arguments) sync fails |
 | `fsck`           | a [filesystem check](#filesystem-check) was not clean | one object per partition: `code` (fsck exit code), `output` |
 | `factory_reset`  | a [factory reset](#factory-reset-result) was requested | see there |
 | `degraded_boot`  | a release image booted without a usable bootloader environment | `reason` |

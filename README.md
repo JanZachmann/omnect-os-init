@@ -134,7 +134,7 @@ flowchart TD
 |--------|---------|---------|
 | ✅ | `switch_root` — systemd takes over | Normal completion |
 | ⏻ | Power off | Flash mode 1 finished; the clone can be moved to its own device |
-| 🔁 | Reboot | Flash mode 2 or 3 finished; `FsckRequiresReboot` (unconditional); or any fatal error while `omnect_validate_update` is set — triggers bootloader OTA rollback |
+| 🔁 | Reboot | Flash mode 2 or 3 finished; `FsckRequiresReboot` (unconditional); `ExtraBootArgsUpdated` (first boot, new extra boot arguments); or any fatal error while `omnect_validate_update` is set — triggers bootloader OTA rollback |
 | 🔴 | Halt (kmsg loop, infinite) | Fatal error · release image · no OTA in flight |
 | 🐚 | Debug shell (bash → sh fallback, respawning) | Fatal error · debug image · no OTA in flight |
 
@@ -310,12 +310,12 @@ files the called tools need.
 | `gzip`, `gunzip` | `core` (fsck output in the bootloader env) | `busybox` |
 | `base64`, `cp` | `core` | `coreutils` |
 | `bash` | debug shell | `bash` |
-| `sh` | emergency shell, fallback of the debug shell, login shell for `scp` | `busybox` |
+| `sh` | emergency shell, fallback of the debug shell, login shell for `scp` | `bash`; `busybox` without `bash` |
 | `grub-editenv` | `grub` | `grub-editenv` |
 | `fw_printenv`, `fw_setenv` | `uboot` | `libubootenv-bin` |
 | `/etc/fw_env.config` | `uboot` | `libubootenv` |
 | `mkfs.ext4`, `tune2fs` | `factory-reset`, `flash-mode-1` | `e2fsprogs-mke2fs`, `e2fsprogs-tune2fs` |
-| `sync` | `factory-reset`, `resize-data` | `busybox` |
+| `sync` | `factory-reset`, `resize-data` | `coreutils` |
 | `sgdisk`, `parted`, `resize2fs` | `resize-data` | `gptfdisk`, `parted`, `e2fsprogs-resize2fs` |
 | `sfdisk` | `flash-mode-1` | `util-linux-sfdisk` |
 | `e2image` | `flash-mode-1` | `e2fsprogs` |
