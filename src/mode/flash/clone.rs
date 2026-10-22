@@ -59,6 +59,12 @@ const UBOOT_ENV_SOURCE: &str = "/etc/omnect/uboot-env.bin";
 
 #[cfg(feature = "gpt")]
 const URANDOM_PATH: &str = "/dev/urandom";
+
+/// oe-core installs dosfstools to `/usr/sbin`.
+#[cfg(feature = "grub")]
+const FATLABEL_CMD: &str = "/usr/sbin/fatlabel";
+#[cfg(feature = "grub")]
+const FATLABEL_NEW_VOLUME_ID_ARGS: [&str; 2] = ["-i", "-r"];
 #[cfg(feature = "gpt")]
 const UUID_BYTES: usize = 16;
 
@@ -376,6 +382,8 @@ trait CloneOps {
     #[cfg(feature = "gpt")]
     fn set_part_uuid(&mut self, device: &Path, num: u32, uuid: &str) -> Result<(), FlashError>;
     #[cfg(feature = "grub")]
+    fn new_volume_id(&mut self, boot_partition: &Path) -> Result<(), FlashError>;
+    #[cfg(feature = "grub")]
     fn write_grubenv(&mut self, boot_partition: &Path) -> Result<(), FlashError>;
     #[cfg(feature = "grub")]
     fn efi(&mut self) -> &mut dyn efi::EfiOps;
@@ -465,6 +473,27 @@ impl CloneOps for RealCloneOps {
     #[cfg(feature = "gpt")]
     fn set_part_uuid(&mut self, device: &Path, num: u32, uuid: &str) -> Result<(), FlashError> {
         sfdisk::set_part_uuid(device, num, uuid)
+    }
+
+    #[cfg(feature = "grub")]
+    fn new_volume_id(&mut self, boot_partition: &Path) -> Result<(), FlashError> {
+        let uuid_failed = |reason: String| FlashError::UuidFailed {
+            device: boot_partition.to_path_buf(),
+            reason,
+        };
+        let output = Command::new(FATLABEL_CMD)
+            .args(FATLABEL_NEW_VOLUME_ID_ARGS)
+            .arg(boot_partition)
+            .output()
+            .map_err(|e| uuid_failed(format!("failed to run {FATLABEL_CMD}: {e}")))?;
+        if !output.status.success() {
+            return Err(uuid_failed(format!(
+                "{FATLABEL_CMD} failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "grub")]
@@ -586,6 +615,10 @@ fn clone_with(
     #[cfg(feature = "grub")]
     {
         let boot_partition = destination_partition(destination, PARTITION_NUM_BOOT);
+        // GRUB passes the boot filesystem UUID to the init, which finds its
+        // disk by it, so the clone must not share it with the source.
+        log::info!("assigning {} a new volume ID", boot_partition.display());
+        ops.new_volume_id(&boot_partition)?;
         ops.write_grubenv(&boot_partition)?;
         efi::handle(ops.efi(), destination, &boot_partition)?;
     }
@@ -1008,6 +1041,11 @@ mod tests {
         }
 
         #[cfg(feature = "grub")]
+        fn new_volume_id(&mut self, boot_partition: &Path) -> Result<(), FlashError> {
+            self.record(format!("new volume id on {}", boot_partition.display()))
+        }
+
+        #[cfg(feature = "grub")]
         fn write_grubenv(&mut self, boot_partition: &Path) -> Result<(), FlashError> {
             self.record(format!("write grubenv to {}", boot_partition.display()))
         }
@@ -1102,6 +1140,7 @@ mod tests {
         );
         #[cfg(feature = "grub")]
         expected.extend([
+            "new volume id on /dev/sdb1".to_string(),
             "write grubenv to /dev/sdb1".to_string(),
             "mount efivarfs".to_string(),
             "efibootmgr".to_string(),
@@ -1130,5 +1169,15 @@ mod tests {
         ops.fail_on = Some("verify");
         assert!(run_recorded(&mut ops, &constants).is_err());
         assert!(ops.calls.last().unwrap().starts_with("verify"));
+    }
+
+    #[cfg(feature = "grub")]
+    #[test]
+    fn a_failed_volume_id_stops_the_clone_before_the_efi_entry_is_created() {
+        let constants = required_constants(&raw_constants()).unwrap();
+        let mut ops = RecordingCloneOps::new();
+        ops.fail_on = Some("new volume id");
+        assert!(run_recorded(&mut ops, &constants).is_err());
+        assert!(ops.calls.last().unwrap().starts_with("new volume id"));
     }
 }
