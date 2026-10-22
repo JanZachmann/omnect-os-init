@@ -115,7 +115,7 @@ fn apply_boot_env_decision(
 ) -> Result<BootEnvState> {
     match decision {
         BootEnvDecision::Continue(mut env) => {
-            // Must precede core_result? — otherwise a FsckRequiresReboot error
+            // Must precede core_result? — otherwise an error in core_result
             // propagates before the diagnostic is written to the boot env.
             persist_fsck_results(ods_status, env.available_mut(), rootfs);
             core_result?;
@@ -158,8 +158,8 @@ pub fn run_init() -> Result<()> {
     // Best-effort: open the bootloader environment. The image type determines how
     // to proceed when it is unavailable — see classify_boot_env.
     //
-    // Note: if mount_core_partitions returned FsckRequiresReboot, the boot partition
-    // may not be mounted (GRUB), causing open_boot_env() to fail.
+    // Note: if mount_core_partitions failed, the boot partition may not be
+    // mounted (GRUB), causing open_boot_env() to fail.
     // apply_boot_env_decision always propagates core_result before DegradedBoot.
     let is_release = cfg!(feature = "release-image");
     let decision = classify_boot_env(open_boot_env(), is_release);

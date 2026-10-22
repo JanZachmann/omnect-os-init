@@ -271,7 +271,7 @@ fn evaluate(
 ) -> Result<FsckResult> {
     // fsck.fat has no reboot exit code: 2 is a usage error, and it exits with
     // 6 when it cannot open the device.
-    let reboot_required = fstype != FsType::Vfat && exit_code.is_reboot_required();
+    let reboot_required = fstype == FsType::Ext4 && exit_code.is_reboot_required();
 
     if exit_code.is_clean() {
         log::debug!("fsck: {} is clean", device.display());
@@ -290,7 +290,7 @@ fn evaluate(
         log::error!(
             "fsck failed on {} with {}: {}",
             device.display(),
-            exit_code,
+            describe(exit_code, fstype),
             output.lines().next().unwrap_or("(no output)")
         );
     }
@@ -318,6 +318,16 @@ fn evaluate(
     })
 }
 
+/// `FsckExitCode` decodes the fsck(8) bitmask, which only e2fsck follows;
+/// other exit codes are printed as numbers.
+fn describe(exit_code: FsckExitCode, fstype: FsType) -> String {
+    if fstype == FsType::Ext4 {
+        exit_code.to_string()
+    } else {
+        format!("exit code {}", exit_code.bits())
+    }
+}
+
 /// Run fsck on a device, tolerating non-critical errors.
 ///
 /// Returns `Ok` even if fsck fails, unless a reboot is required.
@@ -334,7 +344,7 @@ pub fn check_filesystem_lenient(device: &Path, fstype: FsType) -> Result<FsckRes
             log::warn!(
                 "fsck on {} had errors ({}), continuing anyway",
                 device.display(),
-                code
+                describe(code, fstype)
             );
             Ok(FsckResult {
                 device,
@@ -636,6 +646,16 @@ cert: 12/10240 files (8.3% non-contiguous), 1679/10240 blocks
                 other => panic!("code {code}: expected FsckFailed, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn test_describe_decodes_only_ext4_codes() {
+        let code = FsckExitCode::from(6);
+        assert_eq!(
+            describe(code, FsType::Ext4),
+            "reboot required, uncorrected errors"
+        );
+        assert_eq!(describe(code, FsType::Vfat), "exit code 6");
     }
 
     #[test]

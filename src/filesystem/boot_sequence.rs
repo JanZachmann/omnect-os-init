@@ -80,12 +80,9 @@ pub fn fsck_and_record(
 ///
 /// # Errors
 ///
-/// Returns `FilesystemError::FsckRequiresReboot` if the boot partition fsck
-/// determines a clean reboot is needed before the filesystem can be safely used.
-/// In that case `ods_status` already holds the fsck diagnostic (recorded by
-/// `fsck_and_record`). The caller must persist `ods_status` to the bootloader
-/// environment before propagating this error, or the diagnostic is lost on
-/// the subsequent reboot.
+/// When a mount fails, `ods_status` already holds the boot partition's fsck
+/// result. The caller must persist `ods_status` to the bootloader environment
+/// before propagating the error, or the result is lost on the next boot.
 pub fn mount_core_partitions(
     layout: &PartitionLayout,
     rootfs: &Path,

@@ -211,20 +211,9 @@ impl BootEnv for GrubBootEnv {
         let encoded = encode_fsck_output(code.bits(), output);
 
         match FsckChannel::for_partition(partition) {
-            FsckChannel::Env => {
-                // When the boot partition's own fsck requests a reboot, writing to
-                // grubenv is unreliable — the filesystem is in an inconsistent state.
-                // Skip; a clean check runs on next boot.
-                if code.is_reboot_required() {
-                    log::warn!(
-                        "Skipping grubenv write for boot partition (fsck exit code {code} — reboot required)"
-                    );
-                    return Ok(());
-                }
-                write_boot_fsck_record(code, &encoded, |payload| {
-                    self.set_env(BootEnvKey::FsckStatus(partition), Some(payload))
-                })
-            }
+            FsckChannel::Env => write_boot_fsck_record(code, &encoded, |payload| {
+                self.set_env(BootEnvKey::FsckStatus(partition), Some(payload))
+            }),
             // Boot is healthy at this point (its own fsck ran first), so this
             // write is safe regardless of this partition's exit code.
             FsckChannel::File => save_fsck_to_file(partition, &encoded),
