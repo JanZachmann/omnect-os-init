@@ -192,7 +192,7 @@ impl FsckResult {
 ///
 /// # Returns
 /// * `Ok(FsckResult)` - exit code 0, or 1 (errors corrected, safe to mount)
-/// * `Err(FilesystemError::FsckRequiresReboot)` - the reboot bit is set
+/// * `Err(FilesystemError::FsckRequiresReboot)` - the reboot bit is set on ext4
 /// * `Err(FilesystemError::FsckFailed)` - any other exit code, or fsck could not be spawned
 pub fn check_filesystem(device: &Path, fstype: FsType) -> Result<FsckResult> {
     disable_kmsg_ratelimit();
@@ -260,10 +260,19 @@ fn check_filesystem_with(
         );
     }
 
-    evaluate(device, exit_code, output)
+    evaluate(device, fstype, exit_code, output)
 }
 
-fn evaluate(device: &Path, exit_code: FsckExitCode, output: String) -> Result<FsckResult> {
+fn evaluate(
+    device: &Path,
+    fstype: FsType,
+    exit_code: FsckExitCode,
+    output: String,
+) -> Result<FsckResult> {
+    // fsck.fat has no reboot exit code: 2 is a usage error, and it exits with
+    // 6 when it cannot open the device.
+    let reboot_required = fstype != FsType::Vfat && exit_code.is_reboot_required();
+
     if exit_code.is_clean() {
         log::debug!("fsck: {} is clean", device.display());
     } else if exit_code == FsckExitCode::CORRECTED {
@@ -271,7 +280,7 @@ fn evaluate(device: &Path, exit_code: FsckExitCode, output: String) -> Result<Fs
             "fsck corrected errors on {} (code 1) — filesystem is clean, continuing",
             device.display()
         );
-    } else if exit_code.is_reboot_required() {
+    } else if reboot_required {
         log::warn!(
             "fsck on {} requires reboot ({})",
             device.display(),
@@ -286,7 +295,7 @@ fn evaluate(device: &Path, exit_code: FsckExitCode, output: String) -> Result<Fs
         );
     }
 
-    if exit_code.is_reboot_required() {
+    if reboot_required {
         return Err(FilesystemError::FsckRequiresReboot {
             device: device.to_path_buf(),
             code: exit_code,
@@ -614,6 +623,28 @@ cert: 12/10240 files (8.3% non-contiguous), 1679/10240 blocks
         let result = result.unwrap();
         assert_eq!(result.exit_code, FsckExitCode::CORRECTED);
         assert_eq!(result.output, REPLAY_OUTPUT);
+    }
+
+    #[test]
+    fn test_vfat_reboot_bit_is_failure() {
+        for code in [2, 6] {
+            let (result, _) = run_prepared(FsType::Vfat, vec![ok(code, "open: I/O error")]);
+            match result {
+                Err(FilesystemError::FsckFailed { code: c, .. }) => {
+                    assert_eq!(c, FsckExitCode::from(code));
+                }
+                other => panic!("code {code}: expected FsckFailed, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_ext4_reboot_bit_requires_reboot() {
+        let (result, _) = run_prepared(FsType::Ext4, vec![ok(2, CLEAN_OUTPUT)]);
+        assert!(matches!(
+            result,
+            Err(FilesystemError::FsckRequiresReboot { .. })
+        ));
     }
 
     #[test]
