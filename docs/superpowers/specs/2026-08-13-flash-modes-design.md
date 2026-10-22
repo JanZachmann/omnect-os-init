@@ -501,8 +501,9 @@ work tracked in §12 rather than part of the port.
     live in the partition table, so assigning them after the image copy is
     equivalent and keeps them in one place.
 13. Write the default bootloader environment to the destination:
-    - GRUB: mount the destination boot partition, copy
-      `/etc/omnect/grubenv.in` to `EFI/BOOT/grubenv`, unmount;
+    - GRUB: give the destination boot partition a new vfat volume ID with
+      `fatlabel -i -r`, then mount it, copy `/etc/omnect/grubenv.in` to
+      `EFI/BOOT/grubenv`, unmount;
     - U-Boot: write `/etc/omnect/uboot-env.bin` at `UBOOT_ENV1_START`, and at
       `UBOOT_ENV2_START` when that offset is defined. Where a machine reserves a
       second bank, skipping the write would leave it holding whatever the clone
@@ -909,7 +910,8 @@ Behaviour changes, as opposed to bug fixes:
 ### 9.1 Limitations: identifiers shared with the source disk
 
 Mode 1 reproduces some of the source disk's identifiers on the clone. Both
-points are parity with legacy, not regressions introduced by the port.
+points are parity with legacy, not regressions introduced by the port, except
+the GRUB boot volume ID, which the clone renews.
 
 - The destination keeps the source's disk-level identifier — the MBR disk
   signature on a DOS table, the GPT `label-id` on a GPT table — because the
@@ -918,16 +920,16 @@ points are parity with legacy, not regressions introduced by the port.
   its shipped size (§4.2). On GPT, `boot` and `rootA` additionally receive
   fresh per-partition UUIDs (§4.1 step 12); a DOS table has no per-partition
   UUID for `sfdisk` to refresh, so nothing is renewed there (§9 bug 3).
-- On both layouts the clone reproduces the source's vfat volume ID and ext4
-  superblock UUID: `boot` is copied as a raw byte range and the rootfs via
-  `e2image` (§4.1 steps 10, 11), and neither touches filesystem-level
-  identifiers.
+- On both layouts the clone reproduces the source's ext4 superblock UUID,
+  because the rootfs is copied with `e2image` (§4.1 step 11). `boot` is copied
+  as a raw byte range (§4.1 step 10), so on U-Boot it also keeps the vfat
+  volume ID.
 
-With both disks attached, GRUB's `bootpart_fsuuid` boot-partition lookup
-through `blkid` is therefore ambiguous — it matches by filesystem UUID, which
-both disks now share. Mode 1 powers off on success rather than rebooting
-(§10.4), which gives the operator a window to move the disk before either one
-is booted again.
+On GRUB, the init finds its disk with `blkid` by the volume ID of `boot`
+(`bootpart_fsuuid`), so step 13 gives the clone a new one. Otherwise, with
+both disks attached, the lookup could return the source. Mode 1 powers off on
+success rather than rebooting (§10.4), which gives the operator a window to
+move the disk before either one is booted again.
 
 Two further consequences, both legacy parity:
 

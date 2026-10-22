@@ -65,6 +65,8 @@ const URANDOM_PATH: &str = "/dev/urandom";
 const FATLABEL_CMD: &str = "/usr/sbin/fatlabel";
 #[cfg(feature = "grub")]
 const FATLABEL_NEW_VOLUME_ID_ARGS: [&str; 2] = ["-i", "-r"];
+#[cfg(feature = "grub")]
+const FATLABEL_REASON_LINES: usize = 3;
 #[cfg(feature = "gpt")]
 const UUID_BYTES: usize = 16;
 
@@ -357,6 +359,13 @@ fn copy_grubenv(target: &Path) -> Result<(), FlashError> {
     Ok(())
 }
 
+#[cfg(feature = "grub")]
+fn fatlabel_command(boot_partition: &Path) -> Command {
+    let mut cmd = Command::new(FATLABEL_CMD);
+    cmd.args(FATLABEL_NEW_VOLUME_ID_ARGS).arg(boot_partition);
+    cmd
+}
+
 /// The side effects of the clone, so a test can pin their order.
 trait CloneOps {
     #[cfg(feature = "gpt")]
@@ -481,16 +490,14 @@ impl CloneOps for RealCloneOps {
             device: boot_partition.to_path_buf(),
             reason,
         };
-        let output = Command::new(FATLABEL_CMD)
-            .args(FATLABEL_NEW_VOLUME_ID_ARGS)
-            .arg(boot_partition)
+        let output = fatlabel_command(boot_partition)
             .output()
             .map_err(|e| uuid_failed(format!("failed to run {FATLABEL_CMD}: {e}")))?;
         if !output.status.success() {
             return Err(uuid_failed(format!(
                 "{FATLABEL_CMD} failed ({}): {}",
                 output.status,
-                String::from_utf8_lossy(&output.stderr)
+                output_tail(&output.stderr, FATLABEL_REASON_LINES)
             )));
         }
         Ok(())
@@ -1169,6 +1176,15 @@ mod tests {
         ops.fail_on = Some("verify");
         assert!(run_recorded(&mut ops, &constants).is_err());
         assert!(ops.calls.last().unwrap().starts_with("verify"));
+    }
+
+    #[cfg(feature = "grub")]
+    #[test]
+    fn fatlabel_generates_a_new_volume_id() {
+        let cmd = fatlabel_command(Path::new("/dev/sdb1"));
+        assert_eq!(cmd.get_program(), FATLABEL_CMD);
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args, ["-i", "-r", "/dev/sdb1"]);
     }
 
     #[cfg(feature = "grub")]
