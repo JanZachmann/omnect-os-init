@@ -35,7 +35,7 @@ A fatal error ends the boot in the initramfs:
 - on a release image: the system halts and logs the error to the kernel log;
 - on a developer image: a debug shell starts on the console.
 
-A filesystem check that asks for a reboot always reboots.
+An ext4 filesystem check that asks for a reboot always reboots.
 
 ## Flash modes
 
@@ -91,7 +91,8 @@ The clone starts like a newly flashed device:
 The running rootfs is copied to rootfs A of the clone. The `boot`, `factory`
 and `cert` partitions and the bootloader area are copied as they are. On a GPT
 disk the clone's boot partition and rootfs A get new partition UUIDs
-(PARTUUID).
+(PARTUUID). With GRUB, the clone's boot partition also gets a new volume ID,
+because the init finds its disk by it.
 
 The system powers off after a successful clone.
 
@@ -347,7 +348,8 @@ holds both runs. This full check runs after every unclean shutdown and takes
 longer on large partitions.
 
 - Exit code 0 or 1 (no errors, or errors corrected): the boot continues.
-- Exit code with the "reboot required" bit (2): the system reboots.
+- ext4 exit code with the "reboot required" bit (2): the system reboots.
+  fsck.fat has no such code, so for `boot` this bit counts as another error.
 - Other errors: logged; the boot continues.
 
 If a check was not clean, its result is kept until the
@@ -357,8 +359,7 @@ If a check was not clean, its result is kept until the
   (gzip and base64);
 - GRUB: `boot` in `omnect_fsck_boot`, the other partitions in files
   `fsck.<partition>` on the boot partition. For `boot`, output that is too
-  large is replaced by a short note, and a result that asks for a reboot is
-  not kept.
+  large is replaced by a short note.
 
 Nothing is kept when the bootloader environment cannot be read. The full
 output is also written to `/mnt/data/var/log/fsck/<partition>.log` when the
