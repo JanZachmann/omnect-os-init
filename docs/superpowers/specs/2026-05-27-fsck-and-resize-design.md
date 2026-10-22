@@ -1,7 +1,7 @@
 # Design: fsck Handling & resize-data Policy
 
 **Date:** 2026-05-27
-**Status:** Draft for review
+**Status:** Implemented
 **Scope:** omnect-os-init — `filesystem::fsck`, `filesystem::boot_sequence`,
 `preflight::resize_data`, `filesystem::resize_data`, `runtime::OdsStatus`.
 **Depends on:** Plan A (Boot Failure & Recovery Policy) — this spec applies its
@@ -70,6 +70,29 @@ The persistence path (`persist_fsck_results`) and its call ordering (before the
 fsck error propagates) are unchanged. The review's "ordering is the contract,
 not a footnote" finding is resolved by Plan A's recovery model making the
 ordering an explicit step in `handle_fatal_error`'s decision flow.
+
+### 2.2 Full check after a journal replay (added 2026-10-21)
+
+After a power cut, e2fsck replays the ext4 journal, reports the filesystem
+clean and skips the full check. Damage the replay does not repair (e.g. a
+directory block with a bad checksum) stays until the kernel sets the error flag
+and a later boot checks again. Mount-count and interval checks are off
+(`tune2fs -c -1 -i 0`), so they do not catch it either.
+
+- **Trigger:** ext4, the first run printed `recovering journal` and exited 0.
+  Any other exit code means e2fsck did not skip, or the result is already
+  not clean; the first run is then the result.
+- **Second run:** `fsck -y -f`. Its exit code is the result; the outputs of
+  both runs are concatenated in `FsckResult.output`. `LC_ALL=C` keeps the
+  marker text untranslated.
+- **Cost:** the forced check runs after every unclean shutdown of an ext4
+  partition, which on an edge device is the normal power-off. Its time grows
+  with the partition size and the number of used inodes, largest on the data
+  partition with `resize-data`. Measured on a Raspberry Pi 4 SD card: an
+  empty data partition took 0.26 s, a 20 GB one with 2.5 M inodes 23-24 s.
+  No timeout bounds it. This is accepted: the
+  alternative is a corrupted directory that stays unreadable for a whole boot.
+  The duration is logged (`full check on <device> took ...`).
 
 ---
 

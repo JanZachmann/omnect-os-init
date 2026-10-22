@@ -26,7 +26,7 @@ src/
 ├── filesystem/
 │   ├── mod.rs               # Public API
 │   ├── boot_sequence.rs     # Mount + fsck orchestration (testable with mock bootloaders)
-│   ├── fsck.rs              # e2fsck wrapper (all exit codes handled)
+│   ├── fsck.rs              # e2fsck wrapper, full re-check after a journal replay
 │   ├── mount.rs             # Mount primitives (RAII, idempotency checks)
 │   ├── overlayfs.rs         # /etc overlay, /home overlay, bind mounts
 │   ├── reformat.rs          # mkfs.ext4 + tune2fs
