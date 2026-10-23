@@ -1,9 +1,22 @@
 # omnect-os-init usage
 
 This document describes what the initramfs does at run time and how to use it
-on a device. Which features an image contains is decided at build time; see the
-[meta-omnect README](https://github.com/omnect/meta-omnect#readme) for the
-distro and machine features.
+on a device. Which functions an image contains is decided at build time: the
+meta-omnect recipe of omnect-os-init sets the cargo features from these
+settings:
+
+| meta-omnect setting                          | Function                                         |
+| -------------------------------------------- | ------------------------------------------------ |
+| always                                       | [flash mode 1](#flash-mode-1), [factory reset](#factory-reset) |
+| `DISTRO_FEATURES` `flash-mode-2`             | [flash mode 2](#flash-mode-2)                    |
+| `OMNECT_FLASH_MODE_2_DIRECT_FLASHING = "1"`  | direct flashing in flash mode 2                  |
+| `DISTRO_FEATURES` `flash-mode-3`             | [flash mode 3](#flash-mode-3)                    |
+| `MACHINE_FEATURES` `rtc`                     | TLS certificate check in flash mode 3            |
+| `DISTRO_FEATURES` `resize-data`              | data partition resize on the first boot          |
+| `DISTRO_FEATURES` `persistent-var-log`       | `/var/log` on the data partition                 |
+| `MACHINE_FEATURES` `efi`                     | GRUB; without it U-Boot                          |
+| `OMNECT_RELEASE_IMAGE = "1"`                 | release image [error handling](#error-handling)  |
+| i.MX8MM machines                             | [early module load](#early-module-load)          |
 
 Most functions are triggered by a bootloader environment variable. Set it on
 the device with `bootloader_env.sh`, which needs root permissions, then reboot.
