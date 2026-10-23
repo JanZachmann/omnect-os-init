@@ -291,6 +291,19 @@ mod tests {
     }
 
     #[test]
+    fn a_record_with_the_reboot_bit_is_written() {
+        let mut seen: Vec<String> = Vec::new();
+
+        let result = write_boot_fsck_record(FsckExitCode::from(2), "encoded", |payload| {
+            seen.push(payload.to_string());
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert_eq!(seen, ["encoded"]);
+    }
+
+    #[test]
     fn rejected_record_falls_back_to_the_exit_code_alone() {
         let code = FsckExitCode::CORRECTED;
         let mut seen: Vec<String> = Vec::new();
