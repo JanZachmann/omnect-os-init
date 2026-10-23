@@ -10,6 +10,8 @@ use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(feature = "grub")]
+use std::process::Output;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -60,8 +62,6 @@ const UBOOT_ENV_SOURCE: &str = "/etc/omnect/uboot-env.bin";
 
 #[cfg(feature = "gpt")]
 const URANDOM_PATH: &str = "/dev/urandom";
-
-/// oe-core installs dosfstools to `/usr/sbin`.
 #[cfg(feature = "grub")]
 const FATLABEL_CMD: &str = "/usr/sbin/fatlabel";
 #[cfg(feature = "grub")]
@@ -367,6 +367,26 @@ fn fatlabel_command(boot_partition: &Path) -> Command {
     cmd
 }
 
+#[cfg(feature = "grub")]
+fn fatlabel_result(
+    boot_partition: &Path,
+    output: std::io::Result<Output>,
+) -> Result<(), FlashError> {
+    let uuid_failed = |reason: String| FlashError::UuidFailed {
+        device: boot_partition.to_path_buf(),
+        reason,
+    };
+    let output = output.map_err(|e| uuid_failed(format!("failed to run {FATLABEL_CMD}: {e}")))?;
+    if !output.status.success() {
+        return Err(uuid_failed(format!(
+            "{FATLABEL_CMD} failed ({}): {}",
+            output.status,
+            output_tail(&output.stderr, FATLABEL_REASON_LINES)
+        )));
+    }
+    Ok(())
+}
+
 /// The side effects of the clone, so a test can pin their order.
 trait CloneOps {
     #[cfg(feature = "gpt")]
@@ -487,21 +507,7 @@ impl CloneOps for RealCloneOps {
 
     #[cfg(feature = "grub")]
     fn new_volume_id(&mut self, boot_partition: &Path) -> Result<(), FlashError> {
-        let uuid_failed = |reason: String| FlashError::UuidFailed {
-            device: boot_partition.to_path_buf(),
-            reason,
-        };
-        let output = fatlabel_command(boot_partition)
-            .output()
-            .map_err(|e| uuid_failed(format!("failed to run {FATLABEL_CMD}: {e}")))?;
-        if !output.status.success() {
-            return Err(uuid_failed(format!(
-                "{FATLABEL_CMD} failed ({}): {}",
-                output.status,
-                output_tail(&output.stderr, FATLABEL_REASON_LINES)
-            )));
-        }
-        Ok(())
+        fatlabel_result(boot_partition, fatlabel_command(boot_partition).output())
     }
 
     #[cfg(feature = "grub")]
@@ -623,8 +629,8 @@ fn clone_with(
     #[cfg(feature = "grub")]
     {
         let boot_partition = destination_partition(destination, PARTITION_NUM_BOOT);
-        // GRUB passes the boot filesystem UUID to the init, which finds its
-        // disk by it, so the clone must not share it with the source.
+        // GRUB passes the boot partition's volume ID (`bootpart_fsuuid`) to the
+        // init, which finds its disk by it, so the clone needs its own.
         log::info!("assigning {} a new volume ID", boot_partition.display());
         ops.new_volume_id(&boot_partition)?;
         ops.write_grubenv(&boot_partition)?;
@@ -1186,6 +1192,59 @@ mod tests {
         assert_eq!(cmd.get_program(), FATLABEL_CMD);
         let args: Vec<_> = cmd.get_args().collect();
         assert_eq!(args, ["-i", "-r", "/dev/sdb1"]);
+    }
+
+    #[cfg(feature = "grub")]
+    fn fatlabel_output(raw_status: i32, stdout: &str, stderr: &str) -> std::io::Result<Output> {
+        use std::os::unix::process::ExitStatusExt;
+        Ok(Output {
+            status: std::process::ExitStatus::from_raw(raw_status),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        })
+    }
+
+    #[cfg(feature = "grub")]
+    #[test]
+    fn fatlabel_success_is_ok() {
+        assert!(fatlabel_result(Path::new("/dev/sdb1"), fatlabel_output(0, "", "")).is_ok());
+    }
+
+    #[cfg(feature = "grub")]
+    #[test]
+    fn fatlabel_failure_names_the_partition_and_stderr() {
+        // A raw wait status holds the exit code in its second byte.
+        let output = fatlabel_output(1 << 8, "fatlabel 4.2\n", "open: No such device\n");
+        let err = fatlabel_result(Path::new("/dev/sdb1"), output).unwrap_err();
+        let FlashError::UuidFailed { device, reason } = &err else {
+            panic!("expected UuidFailed, got {err:?}");
+        };
+        assert_eq!(device, Path::new("/dev/sdb1"));
+        assert_eq!(
+            reason,
+            &format!("{FATLABEL_CMD} failed (exit status: 1): open: No such device")
+        );
+        assert!(crate::mode::flash::keeps_log(&Err(err)));
+    }
+
+    #[cfg(feature = "grub")]
+    #[test]
+    fn fatlabel_killed_without_output() {
+        let output = fatlabel_output(9, "", "");
+        let err = fatlabel_result(Path::new("/dev/sdb1"), output).unwrap_err();
+        assert!(
+            err.to_string()
+                .ends_with("failed (signal: 9 (SIGKILL)): (no output)"),
+            "{err}"
+        );
+    }
+
+    #[cfg(feature = "grub")]
+    #[test]
+    fn fatlabel_spawn_error() {
+        let output = Err(std::io::Error::from(ErrorKind::NotFound));
+        let err = fatlabel_result(Path::new("/dev/sdb1"), output).unwrap_err();
+        assert!(err.to_string().contains("failed to run"), "{err}");
     }
 
     #[cfg(feature = "grub")]

@@ -99,8 +99,9 @@ The clone starts like a newly flashed device:
 The running rootfs is copied to rootfs A of the clone. The `boot`, `factory`
 and `cert` partitions and the bootloader area are copied as they are. On a GPT
 disk the clone's boot partition and rootfs A get new partition UUIDs
-(PARTUUID). With GRUB, the clone's boot partition also gets a new volume ID,
-because the init finds its disk by it.
+(PARTUUID). With GRUB, the clone's boot partition also gets a new volume ID.
+With GRUB, a failed run can leave the source's volume ID on the clone; erase
+that disk before you attach it next to the source again.
 
 Flash mode 1 is refused before anything is written when:
 

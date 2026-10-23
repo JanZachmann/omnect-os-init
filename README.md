@@ -315,6 +315,7 @@ files the called tools need.
 | `sgdisk`, `parted`, `resize2fs` | `resize-data` | `gptfdisk`, `parted`, `e2fsprogs-resize2fs` |
 | `sfdisk` | `flash-mode-1` | `util-linux-sfdisk` |
 | `e2image` | `flash-mode-1` | `e2fsprogs` |
+| `fatlabel` | `flash-mode-1` with `grub` | `dosfstools` |
 | `efibootmgr` | `flash-mode-1`, `flash-mode-2`, `flash-mode-3` on EFI machines | `efibootmgr` |
 | `efivarfs` filesystem | `flash-mode-1`, `flash-mode-2`, `flash-mode-3` on EFI machines | kernel (`CONFIG_EFIVAR_FS`) |
 | `/etc/omnect/grubenv.in` | `flash-mode-1` with `grub` | `grub-env` |
