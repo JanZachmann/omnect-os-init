@@ -22,9 +22,9 @@ Implemented functionality:
 - **ODS integration**: status file and update validation files for `omnect-device-service`
 - **fs-links**: symlinks from `etc/omnect/fs-link.json` and `etc/omnect/fs-link.d/`
 - **switch\_root**: MS_MOVE + chroot + exec systemd
-- **Factory reset (modes 1-3)**: [factory reset](docs/usage.md#factory-reset) (feature `factory-reset`)
-- **Flash modes 1-3**: [flash modes](docs/usage.md#flash-modes) (features `flash-mode-1`, `flash-mode-2`, `flash-mode-3`)
-- **Early module load**: [early module load](docs/usage.md#early-module-load) (feature `early-modules`)
+- [**Factory reset (modes 1-3)**](docs/usage.md#factory-reset) (feature `factory-reset`)
+- [**Flash modes 1-3**](docs/usage.md#flash-modes) (features `flash-mode-1`, `flash-mode-2`, `flash-mode-3`)
+- [**Early module load**](docs/usage.md#early-module-load) (feature `early-modules`)
 
 ## Startup Flow
 
@@ -186,18 +186,14 @@ from booting: `FactoryResetError` is classified as `ContinueDegraded`.
 
 **Factory reset — wipe modes (`FWIPE`)**
 
-The trigger must name a `mode` of 1 to 3 and carry a `preserve` array. `/etc/omnect/factory-reset.d/`
-is preserved in every case, so an empty array keeps that directory and nothing else. When
-`preserve` contains `applications`, every `*.json` file in that directory is read for its
-`paths` array, and one without a usable `paths` array fails the reset — skipping it would
-wipe the paths it was meant to keep and still report success.
+The behaviour is described in [factory reset](docs/usage.md#factory-reset). A
+`factory-reset.d` file without a usable `paths` array fails the reset, because skipping it
+would wipe the paths it was meant to keep and still report success.
 
 The wipe runs once the backup is in initramfs RAM and before the reformat. Mode 2 writes
 data from `/dev/urandom`, mode 3 uses the `BLKDISCARD` ioctl, which the hardware has to
-support. A failure never aborts the reset — the other partition is still wiped and
-reformat + restore still run, so the device stays usable — but the result is reported as
-`Error` with a note in the status `error` field, because the wipe the caller asked for did
-not happen.
+support. A failed wipe is reported as `Error` but does not abort the reset, so the device
+stays usable.
 
 **Factory reset — reformat/mount retry (`FFORMAT`)**
 
@@ -265,7 +261,7 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 | `flash-mode` | Shared flash layer: trigger detection, dispatch, log capture. Pulled in by a mode feature, never selected on its own | Implemented |
 | `flash-mode-1` | Disk cloning (part of the default feature set) | Implemented |
 | `flash-mode-2` | Flash a `wic.xz` pushed in over `scp` | Implemented |
-| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream. A broken image is seen only after writing started; the init then asks for bmap and image again, and the disk does not boot until a good one was flashed | Implemented |
+| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream | Implemented |
 | `flash-mode-3` | Flash a `wic.xz` downloaded from a URL | Implemented |
 | `flash-mode-network` | Shared layer of modes 2 and 3: network, unmount sweep, xz decoding. Pulled in by a mode feature, never selected on its own | Implemented |
 | `rtc` | The machine has a reliable real-time clock, so mode 3 checks TLS certificates | Implemented |
@@ -285,7 +281,7 @@ value that is not a number is ignored with a cargo warning.
 
 | Env var | Constant | Unit | Needed by |
 |---------|----------|------|-----------|
-| `OMNECT_PART_OFFSET_UBOOT_ENV1` | `UBOOT_ENV1_START` | KiB | `flash-mode-1` with `uboot`, or with `BOOTLOADER_SEEK` set |
+| `OMNECT_PART_OFFSET_UBOOT_ENV1` | `UBOOT_ENV1_START` | KiB | `flash-mode-1` with `uboot`; with `grub` only when `BOOTLOADER_SEEK` is set |
 | `OMNECT_PART_OFFSET_UBOOT_ENV2` | `UBOOT_ENV2_START` | KiB | `flash-mode-1` with `uboot`, optional |
 | `OMNECT_PART_SIZE_UBOOT_ENV` | `UBOOT_ENV_SIZE` | KiB | `flash-mode-1` with `uboot` |
 | `OMNECT_PART_SIZE_DATA` | `DATA_SIZE` | KiB | `flash-mode-1` |
@@ -310,7 +306,7 @@ files the called tools need.
 | `gzip`, `gunzip` | `core` (fsck output in the bootloader env) | `busybox` |
 | `base64`, `cp` | `core` | `coreutils` |
 | `bash` | debug shell | `bash` |
-| `sh` | emergency shell, fallback of the debug shell, login shell for `scp` | `bash`; `busybox` without `bash` |
+| `sh` | emergency shell, fallback of the debug shell, shell of the `omnect` user for `scp` | `bash` |
 | `grub-editenv` | `grub` | `grub-editenv` |
 | `fw_printenv`, `fw_setenv` | `uboot` | `libubootenv-bin` |
 | `/etc/fw_env.config` | `uboot` | `libubootenv` |
