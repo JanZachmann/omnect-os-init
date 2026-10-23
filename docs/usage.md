@@ -3,7 +3,7 @@
 This document describes what the initramfs does at run time and how to use it
 on a device. Which features an image contains is decided at build time; see the
 [meta-omnect README](https://github.com/omnect/meta-omnect#readme) for the
-distro features, machine features and recipe variables.
+distro features, machine features and `OMNECT_PART_TABLE`.
 
 Most functions are triggered by a bootloader environment variable. Set it on
 the device with `bootloader_env.sh`, which needs root permissions, then reboot.
@@ -63,9 +63,7 @@ adds one entry `omnect_os` for the written disk, and writes the output of
 `efibootmgr -v` to `EFI/BOOT/efibootmgr_entry` on the written disk.
 
 Each run writes a log file `flash-mode-<n>.log` to the data partition. After a
-normal boot it is found at `/mnt/data/flash-mode-<n>.log`. Modes 2 and 3 write
-it to the data partition of the new image, so it exists only when the new
-image has the same partition layout.
+normal boot it is found at `/mnt/data/flash-mode-<n>.log`.
 
 ### Flash mode 1
 
@@ -85,8 +83,9 @@ flash mode 1: cloning /dev/mmcblk1 onto /dev/mmcblk2
 ```
 
 Boot again from the disk you set the variables on, e.g. the USB stick; the
-init on that disk runs the clone. On a GRUB image the new boot entry points to
-the clone.
+init on that disk runs the clone. The bootloader environment of that disk is
+not changed. On a GRUB image the clone rewrites the EFI boot entries of the
+machine: the only entry left, `omnect_os`, points to the clone.
 
 The clone starts like a newly flashed device:
 
@@ -138,15 +137,16 @@ waits until `wic.bmap` ends with `</bmap>`, and warns when the file has not
 grown for 5 seconds.
 
 ```sh
-scp -O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null image.wic.bmap omnect@<target-ip>:wic.bmap
+scp -O image.wic.bmap omnect@<target-ip>:wic.bmap
 # after the init asked for the image:
-scp -O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null image.wic.xz omnect@<target-ip>:wic.xz
+scp -O image.wic.xz omnect@<target-ip>:wic.xz
 ```
 
 - The initramfs has no SFTP server, and OpenSSH 9.0 and later uses SFTP by
   default, so pass `-O` (legacy SCP protocol).
-- The SSH host key is created new on every run, so the host would warn about
-  a changed key; the `-o` options skip the check.
+- The SSH host key is created new on every run, so the host warns about a
+  changed key. `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null`
+  skips the check.
 - `scp` authenticates as user `omnect` with its password. The initramfs has its
   own `omnect` user; its password is set at build time from the same setting
   as the rootfs user. A password changed later in the rootfs does not change
@@ -172,12 +172,14 @@ end in the error handling.
 The log is not written when the disk was partly written or its partition table
 could not be read again.
 
-An image build can also add the file `/etc/enforce_flash_mode` to the
-initramfs. Then every boot starts flash mode 2. Only flash mode 1
-(`flash-mode` set to `1`) overrides it. On a release image this also works
-when the bootloader environment cannot be read. The init checks the file only
-after it has found its disk and mounted the rootfs and the boot partition, so
-the file cannot be used to flash a blank or broken disk.
+With the file `/etc/enforce_flash_mode` in the initramfs, every boot starts
+flash mode 2. meta-omnect does not add it; an image recipe adds it on purpose,
+for an initramfs that only receives images, e.g. in an automated test setup.
+Only flash mode 1 (`flash-mode` set to `1`) overrides it. On a release image
+this also works when the bootloader environment cannot be read. The init
+checks the file only after it has found its disk and mounted the rootfs and
+the boot partition, so the file cannot be used to flash a blank or broken
+disk.
 
 ### Flash mode 3
 
@@ -217,8 +219,10 @@ password, query and fragment of a URL, because they can contain an access
 token.
 
 The TLS certificate of an HTTPS URL is checked only on machines with a
-reliable real-time clock (cargo feature `rtc`). Without it, the sha256 file
-only detects a corrupted download, not one replaced on the server.
+reliable real-time clock (cargo feature `rtc`). Without it, the connection is
+encrypted but the server is not authenticated: a man-in-the-middle can replace
+both the image and the sha256 file. The sha256 file then only detects a
+download corrupted in transit.
 
 Mode 3 has no retry: any failure ends in the error handling. The log is not
 written when the disk was partly written or the partition table could not be
