@@ -3,7 +3,7 @@
 This document describes what the initramfs does at run time and how to use it
 on a device. Which features an image contains is decided at build time; see the
 [meta-omnect README](https://github.com/omnect/meta-omnect#readme) for the
-distro features, machine features and `OMNECT_PART_TABLE`.
+distro and machine features.
 
 Most functions are triggered by a bootloader environment variable. Set it on
 the device with `bootloader_env.sh`, which needs root permissions, then reboot.
