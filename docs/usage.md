@@ -7,22 +7,22 @@ distro features, machine features and recipe variables.
 
 Most functions are triggered by a bootloader environment variable. Set it on
 the device with `bootloader_env.sh`, which needs root permissions, then reboot.
+In the examples, the lines after `...` are the console output after the reboot.
 
 ## Boot sequence
 
 On every boot the init:
 
-1. mounts the rootfs read-only and the boot partition, after a filesystem check
-   of the boot partition;
+1. mounts the rootfs read-only, then checks and mounts the boot partition;
 2. reads the bootloader environment and selects the boot mode: a flash mode, a
    factory reset, or a normal boot;
 3. checks and mounts the `factory`, `cert`, `etc` and `data` partitions, sets
    up the overlays for `/etc` and `/home`, and creates the
-   [status file](#status-file) for omnect-device-service;
+   [status file](#status-file) for `omnect-device-service`;
 4. hands over to systemd with `switch_root`.
 
-A flash mode replaces steps 3 and 4: it unmounts what it needs and ends with a
-power off or a reboot.
+A flash mode replaces steps 3 and 4. Mode 1 ends with a power off, modes 2 and
+3 with a reboot.
 
 ## Error handling
 
@@ -31,33 +31,41 @@ A fatal error ends the boot in the initramfs:
 - while an update is being validated (`omnect_validate_update` is set): reboot,
   so the bootloader falls back to the old partition. This needs the bootloader
   environment, so an error before it was read (e.g. the rootfs cannot be
-  mounted) is handled as on any other boot;
+  mounted) halts or opens the debug shell as described below;
 - on a release image: the system halts and logs the error to the kernel log;
-- on a developer image: a debug shell starts on the console.
-
-A filesystem check that asks for a reboot always reboots.
+- on a debug image: a debug shell starts on the console.
 
 ## Flash modes
 
-The flash modes write a whole disk image, with all partitions:
+The running disk is the disk the system booted from. Modes 2 and 3 write a
+whole disk image onto it; mode 1 clones it:
 
-1. clone the disk the system runs from onto another disk;
+1. clone the running disk onto another disk;
 2. flash the running disk with an image pushed in over `scp`;
 3. flash the running disk with an image downloaded from a URL.
 
-Flash mode 1 is built in by default. Modes 2 and 3 are enabled at build time.
+Flash mode 1 is part of every image by default.
 
 The bootloader environment variable `flash-mode` selects the mode. A value
-that selects no built-in mode is logged and ignored; the init then checks
-`factory-reset`, or boots normally. All flash mode variables are deleted
-before anything is written, so a failed run is not repeated on the next boot.
-A refused or failed run ends in the [error handling](#error-handling).
+that selects no mode of the image is logged and ignored; the init then checks
+`factory-reset`, or boots normally. Such a value is not deleted, so the
+warning repeats on every boot until the variable is unset. All flash mode
+variables are deleted before anything is written, so a failed run is not
+repeated on the next boot. A refused or failed run ends in the
+[error handling](#error-handling).
 
-On an EFI machine every flash mode deletes all EFI boot entries and adds one
-entry `omnect_os` for the written disk.
+When the bootloader environment cannot be read, `flash-mode` and
+`factory-reset` are ignored and nothing is deleted. Only
+`/etc/enforce_flash_mode` (see [flash mode 2](#flash-mode-2)) still works.
+
+On a GRUB image (EFI machines) every flash mode deletes all EFI boot entries,
+adds one entry `omnect_os` for the written disk, and writes the output of
+`efibootmgr -v` to `EFI/BOOT/efibootmgr_entry` on the written disk.
 
 Each run writes a log file `flash-mode-<n>.log` to the data partition. After a
-normal boot it is found at `/mnt/data/flash-mode-<n>.log`.
+normal boot it is found at `/mnt/data/flash-mode-<n>.log`. Modes 2 and 3 write
+it to the data partition of the new image, so it exists only when the new
+image has the same partition layout.
 
 ### Flash mode 1
 
@@ -76,9 +84,9 @@ flash mode 1: cloning /dev/mmcblk1 onto /dev/mmcblk2
 ...
 ```
 
-After you set the variables, reboot from the same disk, e.g. from USB again
-when the clone was started from USB. On an EFI machine the new boot entry
-points to the clone.
+Boot again from the disk you set the variables on, e.g. the USB stick; the
+init on that disk runs the clone. On a GRUB image the new boot entry points to
+the clone.
 
 The clone starts like a newly flashed device:
 
@@ -93,20 +101,18 @@ and `cert` partitions and the bootloader area are copied as they are. On a GPT
 disk the clone's boot partition and rootfs A get new partition UUIDs
 (PARTUUID).
 
-The system powers off after a successful clone.
-
 Flash mode 1 is refused before anything is written when:
 
 - `flash-mode-devpath` is not set, is not a block device, or does not appear
   within 30 seconds;
-- `flash-mode-devpath` is a partition, or the disk the system booted from;
+- `flash-mode-devpath` is a partition, or the running disk;
 - a build constant the clone needs is missing;
 - `factory-reset` is set at the same time. Both variables are deleted; set the
-  one you meant again.
+  one you meant again. This leaves no log file; the reason is only in the
+  kernel log.
 
-The log is written to the data partition of the disk the system booted from,
-on success and on failure. A conflict with a factory reset is refused before
-the run starts and leaves no log file; its reason is only in the kernel log.
+The log is written to the data partition of the running disk, on success and
+on failure.
 
 ### Flash mode 2
 
@@ -123,25 +129,31 @@ flash mode 2: flashing /dev/mmcblk0 with an image pushed in over scp
 please run: scp -O <bmap-file> omnect@<target-ip>:wic.bmap
 ```
 
-Then send the bmap file and the image from the host. OpenSSH 9.0 and later
-needs the option `-O` (legacy protocol):
+Send the bmap file first. The init checks it: its checksum, its format
+version, its block ranges, and that the image fits the disk. Only then it asks
+for the image (`please run: scp -O <wic-image> omnect@<target-ip>:wic.xz`). The init
+waits until `wic.bmap` ends with `</bmap>`, and warns when the file has not
+grown for 5 seconds.
 
 ```sh
-scp -O image.wic.bmap omnect@<target-ip>:wic.bmap
-scp -O image.wic.xz omnect@<target-ip>:wic.xz
+scp -O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null image.wic.bmap omnect@<target-ip>:wic.bmap
+# after the init asked for the image:
+scp -O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null image.wic.xz omnect@<target-ip>:wic.xz
 ```
 
-Log in as user `omnect`. The initramfs has its own `omnect` user; its password
-is set at build time from the same setting as the rootfs user. A password
-changed later in the rootfs does not change the initramfs password.
+- The initramfs has no SFTP server, and OpenSSH 9.0 and later uses SFTP by
+  default, so pass `-O` (legacy SCP protocol).
+- The SSH host key is created new on every run, so the host would warn about
+  a changed key; the `-o` options skip the check.
+- `scp` authenticates as user `omnect` with its password. The initramfs has its
+  own `omnect` user; its password is set at build time from the same setting
+  as the rootfs user. A password changed later in the rootfs does not change
+  the initramfs password.
 
 The network setup has time limits: `eth0` must come up within 60 seconds and
 have an IPv4 address within 120 seconds after `dhcpcd` returns. Without a DHCP
 server, `dhcpcd` sets a link-local address (169.254.x.x), which is used as
 well. The wait for `wic.bmap` has no limit.
-
-The bmap file is checked before the image is asked for: its checksum, its
-format version, its block ranges, and that the image fits the disk.
 
 By default the init unpacks the blocks the bmap file lists into RAM, checks
 them against the bmap file, and only then writes the disk. An image build can
@@ -155,20 +167,23 @@ the device powered: after a failed write the disk may not boot any more.
 Failures before the first request (e.g. a network timeout) or after the flash
 end in the error handling.
 
-The system reboots after a successful flash. The log is not written when the
-disk was partly written or its partition table could not be read again.
+The log is not written when the disk was partly written or its partition table
+could not be read again.
 
 An image build can also add the file `/etc/enforce_flash_mode` to the
-initramfs. Then every boot starts flash mode 2. Only `flash-mode` `1`
-overrides it. On a release image this also works when the bootloader
-environment cannot be read. The init checks the file only after it has found
-its disk and mounted the rootfs and the boot partition, so the file does not
-help to flash a blank or broken disk.
+initramfs. Then every boot starts flash mode 2. Only flash mode 1
+(`flash-mode` set to `1`) overrides it. On a release image this also works
+when the bootloader environment cannot be read. The init checks the file only
+after it has found its disk and mounted the rootfs and the boot partition, so
+the file cannot be used to flash a blank or broken disk.
 
 ### Flash mode 3
 
 Flash mode 3 downloads a `wic.xz` image and its sha256 file over `eth0`, and
 flashes the image onto the running disk. The URLs are stored base64-encoded.
+
+On the host, create the sha256 file next to the image, and put both files on
+the web server:
 
 ```sh
 sha256sum image.wic.xz > image.wic.sha256
@@ -177,8 +192,8 @@ sha256sum image.wic.xz > image.wic.sha256
 ```sh
 sudo -s
 bootloader_env.sh set flash-mode 3
-bootloader_env.sh set flash-mode-url $(echo "http://url.to/image.wic.xz" | base64 -w 0 -)
-bootloader_env.sh set flash-mode-url-sha256 $(echo "http://url.to/image.wic.sha256" | base64 -w 0 -)
+bootloader_env.sh set flash-mode-url $(printf '%s' "http://url.to/image.wic.xz" | base64 -w 0)
+bootloader_env.sh set flash-mode-url-sha256 $(printf '%s' "http://url.to/image.wic.sha256" | base64 -w 0)
 reboot
 ...
 flash mode 3: flashing /dev/mmcblk0 with an image downloaded from http://url.to/image.wic.xz
@@ -186,7 +201,8 @@ flash mode 3: flashing /dev/mmcblk0 with an image downloaded from http://url.to/
 ```
 
 The device needs an address from a DHCP server; a link-local address is not
-enough, because it has no route and no DNS server.
+enough, because it has no route and no DNS server. The network time limits of
+[flash mode 2](#flash-mode-2) apply as well.
 
 The init downloads the sha256 file and the image into RAM. The image must fit
 into the available RAM minus 128 MiB. Before anything is written, the image is
@@ -200,10 +216,11 @@ token.
 
 The TLS certificate of an HTTPS URL is checked only on machines with a
 reliable real-time clock (cargo feature `rtc`). Without it, the sha256 file
-only detects a corrupted download, not a changed one.
+only detects a corrupted download, not one replaced on the server.
 
-The system reboots after a successful flash. The log is not written when the
-write to the disk failed or the partition table could not be read again.
+Mode 3 has no retry: any failure ends in the error handling. The log is not
+written when the disk was partly written or the partition table could not be
+read again.
 
 ### Flash mode and factory reset together
 
@@ -219,8 +236,9 @@ A factory reset re-creates the filesystems of the `etc` and `data` partitions.
 Set the bootloader environment variable `factory-reset` to a JSON object:
 
 ```sh
-sudo bootloader_env.sh set factory-reset '{"mode": 1, "preserve": ["network", "firewall", "certificates", "applications"]}'
-sudo reboot
+sudo -s
+bootloader_env.sh set factory-reset '{"mode": 1, "preserve": ["network", "firewall", "certificates", "applications"]}'
+reboot
 ```
 
 - `mode` selects how the old data is removed (see below).
@@ -254,7 +272,8 @@ A failed reset never stops the boot; the result is reported in the
   the reason is also stored in the bootloader environment variable
   `omnect_factory_reset_last_error` (`<partition>:<reason>`, the reason cut to
   128 bytes), because the following boot may halt on the same partition. The
-  init never deletes this variable, so it can be left from an older reset.
+  init never deletes this variable, so it may still hold the value of an older
+  reset.
 
 ### Preserve topics
 
@@ -279,6 +298,8 @@ key holds an array of paths. The topic `applications` adds the paths of every
   `/usr/local` (and `/var/log` with `persistent-var-log`). A path elsewhere
   fails the restore.
 - A path with a `..` component is a configuration error.
+- The paths of one file keep their order. The files are read in directory
+  order, not in name order.
 
 ### Factory reset result
 
@@ -330,7 +351,7 @@ not define:
   With status 2, `false` means nothing was changed; `true` means data may
   already be lost.
 
-An unusable trigger (status 1 or 3) does not start a reset. It is reported
+An unusable request (status 1 or 3) does not start a reset. It is reported
 once, so the request does not repeat on every boot.
 
 ## Filesystem check
@@ -347,18 +368,20 @@ holds both runs. This full check runs after every unclean shutdown and takes
 longer on large partitions.
 
 - Exit code 0 or 1 (no errors, or errors corrected): the boot continues.
-- Exit code with the "reboot required" bit (2): the system reboots.
+- Exit code with the "reboot required" bit (2): the system reboots, on release
+  and debug images.
 - Other errors: logged; the boot continues.
 
 If a check was not clean, its result is kept until the
 [status file](#status-file) is written, also over a reboot, and then deleted:
 
-- U-Boot: in the bootloader environment variable `omnect_fsck_<partition>`
-  (gzip and base64);
+- U-Boot: in the bootloader environment variable `omnect_fsck_<partition>`;
 - GRUB: `boot` in `omnect_fsck_boot`, the other partitions in files
-  `fsck.<partition>` on the boot partition. For `boot`, output that is too
-  large is replaced by a short note, and a result that asks for a reboot is
-  not kept.
+  `fsck.<partition>` on the boot partition. GRUB, `boot` only: output that is
+  too large is replaced by a short note, and a result that asks for a reboot
+  is not kept.
+
+The record is gzip-compressed and base64-encoded in all cases.
 
 Nothing is kept when the bootloader environment cannot be read. The full
 output is also written to `/mnt/data/var/log/fsck/<partition>.log` when the
@@ -366,34 +389,32 @@ data partition is mounted and fsck printed output.
 
 ## Update validation
 
-During an A/B update, the update agent and the bootloader set flags in the
-bootloader environment. The init turns them into files in
-`/run/omnect-device-service/` for omnect-device-service, which does the
-validation. This is skipped when the bootloader environment cannot be read.
+During an A/B update, the update agent and the bootloader set bootloader
+environment variables. The init only turns them into files in
+`/run/omnect-device-service/`; `omnect-device-service` does the validation. This is skipped when the bootloader environment cannot be read.
 See the
 [omnect-device-service docs](https://github.com/omnect/omnect-device-service/blob/main/src/twin/firmware_update/update_validation.md).
 
-| Bootloader variable             | File                            | Variable deleted |
+| Variable                        | File                            | Variable deleted |
 | ------------------------------- | ------------------------------- | ---------------- |
 | `omnect_validate_update`        | `omnect_validate_update`        | no               |
 | `omnect_validate_update_failed` | `omnect_validate_update_failed` | yes              |
 | `omnect_bootloader_updated`     | `omnect_bootloader_updated`     | yes              |
 
-Both validate flags set at once is a fatal error.
+Both validate variables set at once is a fatal error.
 
 ## Status file
 
 The init writes `/run/omnect-device-service/omnect-os-initramfs.json` for
-omnect-device-service. Only root and the omnect-device-service user can read
-it. `first_boot` is always present; the other keys appear only when there is
-something to report.
+`omnect-device-service`. Only root and the `omnect-device-service` user can
+read it.
 
 ```json
 {
   "fsck": {
     "boot": {
       "code": 1,
-      "output": "fsck from util-linux 2.37.4\nfsck.fat 4.2 (2021-01-31)\nDirty bit is set. Fs was not properly unmounted and some data may be corrupt.\n Automatically removing dirty bit.\n\n*** Filesystem was changed ***\nWriting changes.\n/dev/mmcblk0p1: 75 files, 11264/20431 clusters"
+      "output": "Dirty bit is set. Fs was not properly unmounted and some data may be corrupt.\n Automatically removing dirty bit.\n\n*** Filesystem was changed ***\nWriting changes.\n/dev/mmcblk0p1: 75 files, 11264/20431 clusters"
     }
   },
   "first_boot": false
@@ -402,18 +423,19 @@ something to report.
 
 | Key              | Present when                                   | Content |
 | ---------------- | ---------------------------------------------- | ------- |
-| `first_boot`     | always                                         | `true` on the first boot after flashing, and on later boots while the data resize or the [extra boot arguments](#extra-boot-arguments) sync fails |
+| `first_boot`     | always                                         | `true` while the first-boot marker in the bootloader environment is not set: after flashing, and on later boots while the data resize or the [extra boot arguments](#extra-boot-arguments) sync fails. `false` without a readable bootloader environment |
 | `fsck`           | a [filesystem check](#filesystem-check) was not clean | one object per partition: `code` (fsck exit code), `output` |
-| `factory_reset`  | a [factory reset](#factory-reset-result) was requested | see there |
+| `factory_reset`  | a factory reset was requested                  | see [factory reset result](#factory-reset-result) |
 | `degraded_boot`  | a release image booted without a usable bootloader environment | `reason` |
-| `resize_data`    | the data partition could not be resized on the first boot | `outcome` (`skipped_fsck`, `tool_error`, `invalid_layout`), `reason` |
+| `resize_data`    | the data partition could not be resized on a first boot, or on any boot without a readable bootloader environment | `outcome` (`skipped_fsck`, `tool_error`, `invalid_layout`), `reason` |
 | `extra_bootargs` | the extra boot arguments could not be synced    | `outcome` (`file_read_failed`, `read_failed`, `set_env_failed`, `read_back_failed`, `read_back_mismatch`), `reason` |
 
 ## Extra boot arguments
 
 On the first boot after flashing, the init reads the files
 `omnect_extra_bootargs_omnect` and `omnect_extra_bootargs_custom` from the boot
-partition and stores them in the bootloader variable `omnect_extra_bootargs`.
+partition and stores them in the bootloader environment variable
+`omnect_extra_bootargs`.
 If the value changed, the system reboots once so the bootloader uses it. This
 does not run while an update is being validated.
 
@@ -426,9 +448,7 @@ listed in the rootfs after the first-boot steps (extra boot arguments, data
 resize), before the other partitions are mounted. A flash mode loads none.
 
 To add a module, install a `.conf` file into `/etc/omnect/early-modules.d/` in
-the rootfs image and build the init with `early-modules`. The files are read
-before the `/etc` overlay is mounted, so a file added on the running device is
-not read:
+the rootfs image and build the init with `early-modules`:
 
 ```
 # <module> [parameters]
@@ -443,6 +463,8 @@ my_driver debug=1 mode=fast
 - The files are read in name order. A module listed again is ignored with a
   warning.
 - Without a `.conf` file the step does nothing.
+- The files are read before the `/etc` overlay is mounted, so a file added on
+  the running device is not read.
 
 The step:
 
@@ -453,7 +475,7 @@ The step:
    so a firmware request during the load finds the file in the rootfs. The
    path is not restored;
 3. for each listed module, in file and line order: skips it when it is built
-   in or already loaded; else loads its dependencies from `modules.dep` and
+   into the kernel or already loaded; else loads its dependencies from `modules.dep` and
    then the module itself with `finit_module`. A dependency that has its own
    line gets its parameters.
 
@@ -475,7 +497,7 @@ Not supported: the init reads only `modules.dep` and `modules.builtin`. So
 name the module, not an alias.
 
 The step is best effort. It never stops the boot and does not change the
-status reported to omnect-device-service. Each problem is logged as a warning
+status reported to `omnect-device-service`. Each problem is logged as a warning
 with its reason. When a listed module did not load, the step ends with one
 error line `early modules: not loaded: <names>`. udev may still load the
 module later, but a driver that started earlier does not use it.
