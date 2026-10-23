@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crate::error::FilesystemError;
 use crate::filesystem::{FsType, Result};
-use crate::logging::{KmsgRatelimitGuard, disable_kmsg_ratelimit};
+use crate::logging::{KmsgRatelimitGuard, disable_kmsg_ratelimit, output_tail};
 
 /// fsck command — util-linux wrapper that dispatches to fsck.ext4 / fsck.fat
 /// based on the -t argument. Requires e2fsprogs-e2fsck in the initramfs image
@@ -27,10 +27,14 @@ const FSCK_FORCE_FLAG: &str = "-f";
 /// e2fsck prints this when it replays the ext4 journal.
 const JOURNAL_REPLAY_MARKER: &str = "recovering journal";
 
+/// Output lines of a failed fsck in its error log line.
+const FSCK_REASON_LINES: usize = 3;
+
 /// Type-safe wrapper for fsck(8) exit codes.
 ///
 /// The value is a bitmask; individual bits can be tested with the predicate
-/// methods below.
+/// methods below. e2fsck follows this bitmask; fsck.fat does not (2 is a usage
+/// error, 6 means the device could not be opened).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsckExitCode(i32);
 
@@ -231,8 +235,12 @@ fn run_fsck(device: &Path, fstype: FsType, force: bool) -> Result<(FsckExitCode,
     ))
 }
 
+fn uses_fsck_bitmask(fstype: FsType) -> bool {
+    fstype == FsType::Ext4
+}
+
 fn needs_full_check(fstype: FsType, exit_code: FsckExitCode, output: &str) -> bool {
-    fstype == FsType::Ext4 && exit_code.is_clean() && output.contains(JOURNAL_REPLAY_MARKER)
+    uses_fsck_bitmask(fstype) && exit_code.is_clean() && output.contains(JOURNAL_REPLAY_MARKER)
 }
 
 fn check_filesystem_with(
@@ -269,9 +277,7 @@ fn evaluate(
     exit_code: FsckExitCode,
     output: String,
 ) -> Result<FsckResult> {
-    // fsck.fat has no reboot exit code: 2 is a usage error, and it exits with
-    // 6 when it cannot open the device.
-    let reboot_required = fstype == FsType::Ext4 && exit_code.is_reboot_required();
+    let reboot_required = uses_fsck_bitmask(fstype) && exit_code.is_reboot_required();
 
     if exit_code.is_clean() {
         log::debug!("fsck: {} is clean", device.display());
@@ -291,7 +297,7 @@ fn evaluate(
             "fsck failed on {} with {}: {}",
             device.display(),
             describe(exit_code, fstype),
-            output.lines().next().unwrap_or("(no output)")
+            output_tail(output.as_bytes(), FSCK_REASON_LINES)
         );
     }
 
@@ -318,10 +324,8 @@ fn evaluate(
     })
 }
 
-/// `FsckExitCode` decodes the fsck(8) bitmask, which only e2fsck follows;
-/// other exit codes are printed as numbers.
 fn describe(exit_code: FsckExitCode, fstype: FsType) -> String {
-    if fstype == FsType::Ext4 {
+    if uses_fsck_bitmask(fstype) || exit_code == FsckExitCode::UNKNOWN {
         exit_code.to_string()
     } else {
         format!("exit code {}", exit_code.bits())
@@ -333,7 +337,11 @@ fn describe(exit_code: FsckExitCode, fstype: FsType) -> String {
 /// Returns `Ok` even if fsck fails, unless a reboot is required.
 /// Useful for partitions where errors should be logged but boot should continue.
 pub fn check_filesystem_lenient(device: &Path, fstype: FsType) -> Result<FsckResult> {
-    match check_filesystem(device, fstype) {
+    tolerate_failure(check_filesystem(device, fstype), fstype)
+}
+
+fn tolerate_failure(result: Result<FsckResult>, fstype: FsType) -> Result<FsckResult> {
+    match result {
         Ok(result) => Ok(result),
         Err(e @ FilesystemError::FsckRequiresReboot { .. }) => Err(e),
         Err(FilesystemError::FsckFailed {
@@ -637,7 +645,7 @@ cert: 12/10240 files (8.3% non-contiguous), 1679/10240 blocks
 
     #[test]
     fn test_vfat_reboot_bit_is_failure() {
-        for code in [2, 6] {
+        for code in [2, 3, 6, 7] {
             let (result, _) = run_prepared(FsType::Vfat, vec![ok(code, "open: I/O error")]);
             match result {
                 Err(FilesystemError::FsckFailed { code: c, .. }) => {
@@ -656,6 +664,32 @@ cert: 12/10240 files (8.3% non-contiguous), 1679/10240 blocks
             "reboot required, uncorrected errors"
         );
         assert_eq!(describe(code, FsType::Vfat), "exit code 6");
+        assert_eq!(
+            describe(FsckExitCode::UNKNOWN, FsType::Vfat),
+            "unknown (fsck could not be spawned)"
+        );
+    }
+
+    #[test]
+    fn test_vfat_failure_logs_code_and_output_tail() {
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::logging::capture::install_test_logger();
+        crate::logging::capture::start_capture();
+        let output =
+            "fsck from util-linux 2.37.4\nfsck.fat 4.2 (2021-01-31)\nopen: Input/output error\n";
+        let (result, _) = run_prepared(FsType::Vfat, vec![ok(6, output)]);
+        let result = tolerate_failure(result, FsType::Vfat);
+        let lines = crate::logging::capture::take_capture();
+
+        assert_eq!(result.unwrap().exit_code, FsckExitCode::from(6));
+        for line in [
+            "[ERROR] fsck failed on /dev/omnect/cert with exit code 6: fsck from util-linux 2.37.4; fsck.fat 4.2 (2021-01-31); open: Input/output error",
+            "[WARN] fsck on /dev/omnect/cert had errors (exit code 6), continuing anyway",
+        ] {
+            assert!(lines.iter().any(|l| l == line), "{line:?} not in {lines:?}");
+        }
     }
 
     #[test]
