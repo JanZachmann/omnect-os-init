@@ -371,8 +371,8 @@ longer on large partitions.
 
 - Exit code 0 or 1 (no errors, or errors corrected): the boot continues.
 - ext4 exit code with the "reboot required" bit (2): the system reboots, on
-  release and debug images. fsck.fat has no such code, so for `boot` this bit
-  counts as another error.
+  release and debug images. fsck.fat does not use this bit; for `boot` such an
+  exit code is handled as another error.
 - Other errors: logged; the boot continues.
 
 If a check was not clean, its result is kept until the
@@ -426,7 +426,7 @@ read it.
 | Key              | Present when                                   | Content |
 | ---------------- | ---------------------------------------------- | ------- |
 | `first_boot`     | always                                         | `true` while the first-boot marker in the bootloader environment is not set: after flashing, and on later boots while the data resize or the [extra boot arguments](#extra-boot-arguments) sync fails. `false` without a readable bootloader environment |
-| `fsck`           | a [filesystem check](#filesystem-check) was not clean | one object per partition: `code` (fsck exit code), `output` |
+| `fsck`           | a [filesystem check](#filesystem-check) was not clean | one object per partition: `code` (the fsck exit code; for `boot` the fsck.fat code), `output` |
 | `factory_reset`  | a factory reset was requested                  | see [factory reset result](#factory-reset-result) |
 | `degraded_boot`  | a release image booted without a usable bootloader environment | `reason` |
 | `resize_data`    | the data partition could not be resized on a first boot, or on any boot without a readable bootloader environment | `outcome` (`skipped_fsck`, `tool_error`, `invalid_layout`), `reason` |
