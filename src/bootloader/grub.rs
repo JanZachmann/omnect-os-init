@@ -214,8 +214,6 @@ impl BootEnv for GrubBootEnv {
             FsckChannel::Env => write_boot_fsck_record(code, &encoded, |payload| {
                 self.set_env(BootEnvKey::FsckStatus(partition), Some(payload))
             }),
-            // Boot is healthy at this point (its own fsck ran first), so this
-            // write is safe regardless of this partition's exit code.
             FsckChannel::File => save_fsck_to_file(partition, &encoded),
         }
     }

@@ -168,7 +168,7 @@ src/
 ## 6. Key Patterns
 - **Error handling:** `thiserror` for typed errors, `Result<T>` everywhere
 - **Bootloader abstraction:** `dyn BootEnv` trait for GRUB/U-Boot
-- **Degraded boot:** `BootEnvState` is either `Available(Box<dyn BootEnv>)` or `Degraded(BootEnvError)`. `classify_boot_env()` decides which based on the open result and `is_release`. `apply_boot_env_decision()` enforces the invariant that `FsckRequiresReboot` always propagates before `DegradedBoot`.
+- **Degraded boot:** `BootEnvState` is either `Available(Box<dyn BootEnv>)` or `Degraded(BootEnvError)`. `classify_boot_env()` decides which based on the open result and `is_release`. `apply_boot_env_decision()` persists the fsck results first, then propagates an error from `mount_core_partitions` before `DegradedBoot`.
 - **Compression:** fsck exit code and full output stored in bootloader env as gzip+base64(`"exit_code\noutput"`); full output also written to `/data/var/log/fsck/<partition>.log`
 - **Idempotent mounts:** `is_mounted()` check before mounting
 - **No magic path strings:** All filesystem paths must be `const` values. Group related paths in a dedicated `pub mod mount_points` (or equivalent) rather than using inline string literals.

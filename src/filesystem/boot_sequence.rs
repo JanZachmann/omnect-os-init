@@ -80,9 +80,9 @@ pub fn fsck_and_record(
 ///
 /// # Errors
 ///
-/// When a mount fails, `ods_status` already holds the boot partition's fsck
-/// result. The caller must persist `ods_status` to the bootloader environment
-/// before propagating the error, or the result is lost on the next boot.
+/// Boot's fsck result is in `ods_status` before boot is mounted. On any error
+/// the caller must persist `ods_status` first, or the result is lost on the
+/// next boot.
 pub fn mount_core_partitions(
     layout: &PartitionLayout,
     rootfs: &Path,
