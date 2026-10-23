@@ -108,19 +108,6 @@ pub(crate) fn read_small_text(
     String::from_utf8(bytes).map_err(|_| invalid("not UTF-8 text".to_string()))
 }
 
-/// The last `count` non-empty lines of a child's output, joined for an error
-/// reason. A carriage return ends a line, as in progress output.
-#[cfg(any(feature = "flash-mode-1", feature = "flash-mode-3"))]
-pub(crate) fn output_tail(output: &[u8], count: usize) -> String {
-    let text = String::from_utf8_lossy(output);
-    let lines: Vec<&str> = text
-        .split(['\r', '\n'])
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect();
-    lines[lines.len().saturating_sub(count)..].join("; ")
-}
-
 #[cfg(feature = "flash-mode-network")]
 fn child(cmd: &str) -> Command {
     let mut command = Command::new(cmd);
