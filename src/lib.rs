@@ -96,13 +96,12 @@ fn compute_first_boot(env: &bootloader::BootEnvState) -> bool {
     }
 }
 
-/// Apply a boot env decision, enforcing the FsckRequiresReboot-wins invariant.
+/// Apply a boot env decision; an error in `core_result` wins over the decision.
 ///
 /// Persists fsck results to the bootloader environment *before* propagating
-/// `core_result`, satisfying the contract documented in `mount_core_partitions`:
-/// the diagnostic must be written before the error propagates, or it is lost
-/// across the reboot. This is a no-op for degraded boot (`env.available_mut()`
-/// returns `None`) and when `ods_status.fsck` is empty.
+/// `core_result`, as `mount_core_partitions` requires: a failed mount of `boot`
+/// must not lose the boot partition's fsck record. Without a bootloader
+/// environment (`env.available_mut()` returns `None`) nothing is written.
 ///
 /// The records stay in `ods_status`. `drain_fsck_env` reads the env back into the
 /// same map keys later in the boot, so nothing is duplicated, and a persist that
@@ -115,8 +114,6 @@ fn apply_boot_env_decision(
 ) -> Result<BootEnvState> {
     match decision {
         BootEnvDecision::Continue(mut env) => {
-            // Must precede core_result? — otherwise a FsckRequiresReboot error
-            // propagates before the diagnostic is written to the boot env.
             persist_fsck_results(ods_status, env.available_mut(), rootfs);
             core_result?;
             if let BootEnvState::Degraded(ref e) = env {
@@ -151,16 +148,12 @@ pub fn run_init() -> Result<()> {
 
     let mut ods_status = OdsStatus::new();
 
-    // Capture the result rather than propagating immediately: apply_boot_env_decision
-    // must persist any fsck diagnostic held in ods_status before the error propagates.
+    // Captured, not propagated: apply_boot_env_decision persists the fsck result first.
     let core_result = mount_core_partitions(&layout, rootfs, &mut ods_status);
 
-    // Best-effort: open the bootloader environment. The image type determines how
-    // to proceed when it is unavailable — see classify_boot_env.
-    //
-    // Note: if mount_core_partitions returned FsckRequiresReboot, the boot partition
-    // may not be mounted (GRUB), causing open_boot_env() to fail.
-    // apply_boot_env_decision always propagates core_result before DegradedBoot.
+    // The image type decides how to go on without a bootloader environment (see
+    // classify_boot_env). A failed core mount can leave boot unmounted, so on
+    // GRUB open_boot_env() may fail here.
     let is_release = cfg!(feature = "release-image");
     let decision = classify_boot_env(open_boot_env(), is_release);
 
@@ -244,14 +237,12 @@ mod tests {
         }))
     }
 
-    fn fsck_reboot_err() -> Result<()> {
-        Err(InitramfsError::Filesystem(
-            FilesystemError::FsckRequiresReboot {
-                device: PathBuf::from("/dev/sda1"),
-                code: FsckExitCode::REBOOT_REQUIRED,
-                output: String::new(),
-            },
-        ))
+    fn boot_mount_err() -> Result<()> {
+        Err(InitramfsError::Filesystem(FilesystemError::MountFailed {
+            src_path: PathBuf::from("/dev/sda1"),
+            target: PathBuf::from("/rootfs/boot"),
+            reason: "test".into(),
+        }))
     }
 
     #[test]
@@ -278,12 +269,11 @@ mod tests {
     }
 
     #[test]
-    fn fsck_reboot_wins_over_degraded_continue() {
-        // FsckRequiresReboot must propagate even when bootloader is also unavailable.
+    fn core_error_wins_over_degraded_continue() {
         let mut ods = OdsStatus::new();
         let result = apply_boot_env_decision(
             make_degraded(),
-            fsck_reboot_err(),
+            boot_mount_err(),
             &mut ods,
             Path::new("/tmp"),
         );
@@ -291,44 +281,41 @@ mod tests {
             matches!(
                 result,
                 Err(InitramfsError::Filesystem(
-                    FilesystemError::FsckRequiresReboot { .. }
+                    FilesystemError::MountFailed { .. }
                 ))
             ),
-            "expected FsckRequiresReboot, not DegradedBoot"
+            "expected MountFailed, not DegradedBoot"
         );
         assert!(
             ods.degraded_boot.is_none(),
-            "degraded flag must not be set on reboot path"
+            "degraded flag must not be set on a core error"
         );
     }
 
     #[test]
-    fn fsck_reboot_wins_over_abort() {
-        // FsckRequiresReboot must propagate even when decision is Abort(DegradedBoot).
+    fn core_error_wins_over_abort() {
         let mut ods = OdsStatus::new();
         let result =
-            apply_boot_env_decision(make_abort(), fsck_reboot_err(), &mut ods, Path::new("/tmp"));
+            apply_boot_env_decision(make_abort(), boot_mount_err(), &mut ods, Path::new("/tmp"));
         assert!(
             matches!(
                 result,
                 Err(InitramfsError::Filesystem(
-                    FilesystemError::FsckRequiresReboot { .. }
+                    FilesystemError::MountFailed { .. }
                 ))
             ),
-            "expected FsckRequiresReboot, not DegradedBoot"
+            "expected MountFailed, not DegradedBoot"
         );
         assert!(
             ods.degraded_boot.is_none(),
-            "degraded flag must not be set on reboot path"
+            "degraded flag must not be set on a core error"
         );
     }
 
     #[test]
-    fn persist_runs_before_fsck_reboot_propagates() {
-        // Regression test for uboot: on uboot open_boot_env() is infallible,
-        // so env is Available. The fsck diagnostic in ods_status.fsck must be
-        // persisted to the bootloader env *before* FsckRequiresReboot propagates,
-        // or it is lost across the reboot (mount_core_partitions persist-before-propagate contract).
+    fn persist_runs_before_core_error_propagates() {
+        // On U-Boot the env opens without the boot partition, so it is Available
+        // even when the boot mount failed.
         //
         // The env is moved into the decision and dropped when the error returns, so
         // the call log is read through a handle obtained before the move.
@@ -343,23 +330,22 @@ mod tests {
         let saved = bl.saved_fsck_calls();
         let decision = BootEnvDecision::Continue(BootEnvState::Available(Box::new(bl)));
         let result =
-            apply_boot_env_decision(decision, fsck_reboot_err(), &mut ods, Path::new("/tmp"));
+            apply_boot_env_decision(decision, boot_mount_err(), &mut ods, Path::new("/tmp"));
 
         assert!(
             matches!(
                 result,
                 Err(InitramfsError::Filesystem(
-                    FilesystemError::FsckRequiresReboot { .. }
+                    FilesystemError::MountFailed { .. }
                 ))
             ),
-            "FsckRequiresReboot must still propagate"
+            "MountFailed must still propagate"
         );
         let saved = saved.lock().unwrap();
         assert_eq!(
             saved.iter().map(|(p, _, _)| *p).collect::<Vec<_>>(),
             vec![crate::partition::PartitionName::Boot],
-            "persist_fsck_results must run before propagating FsckRequiresReboot \
-             (mount_core_partitions persist-before-propagate contract)"
+            "persist_fsck_results must run before core_result propagates"
         );
     }
 

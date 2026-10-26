@@ -59,7 +59,6 @@ flowchart TD
     CLASSIFY -->|"Fail + release → Degraded"| APPLY
     CLASSIFY -->|"Fail + debug → Abort"| FEB
 
-    APPLY -->|FsckRequiresReboot| FEB
     APPLY -->|Fatal| FEB
     APPLY -->|"OK\nDegraded: ods.degraded_boot=true"| FBDETECT["compute_first_boot()\nset_update_pending()"]
 
@@ -160,10 +159,11 @@ No dedicated design spec covers this region.
 **Notes on `apply_boot_env_decision`**
 
 `mount_core_partitions` result is captured rather than propagated immediately so that
-fsck diagnostics can be persisted to the bootloader environment before any reboot.
-`apply_boot_env_decision` enforces the invariant that `FsckRequiresReboot` always wins
-over a concurrent `DegradedBoot` — the two failure modes can co-occur when GRUB's
-boot partition is unmountable. `persist_fsck_results` runs on every mount path,
+fsck diagnostics can be persisted to the bootloader environment before the error
+propagates.
+`apply_boot_env_decision` propagates an error from `mount_core_partitions` before a
+concurrent `DegradedBoot` — the two can occur together when GRUB's boot partition
+is unmountable. `persist_fsck_results` runs on every mount path,
 including degraded boot.
 
 **Notes on factory reset (`FRESET` block)**
@@ -315,6 +315,7 @@ files the called tools need.
 | `sgdisk`, `parted`, `resize2fs` | `resize-data` | `gptfdisk`, `parted`, `e2fsprogs-resize2fs` |
 | `sfdisk` | `flash-mode-1` | `util-linux-sfdisk` |
 | `e2image` | `flash-mode-1` | `e2fsprogs` |
+| `fatlabel` | `flash-mode-1` with `grub` | `dosfstools` |
 | `efibootmgr` | `flash-mode-1`, `flash-mode-2`, `flash-mode-3` on EFI machines | `efibootmgr` |
 | `efivarfs` filesystem | `flash-mode-1`, `flash-mode-2`, `flash-mode-3` on EFI machines | kernel (`CONFIG_EFIVAR_FS`) |
 | `/etc/omnect/grubenv.in` | `flash-mode-1` with `grub` | `grub-env` |

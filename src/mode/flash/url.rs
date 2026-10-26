@@ -16,10 +16,11 @@ use sha2::{Digest, Sha256};
 use crate::{
     bootloader::sync_filesystems,
     error::FlashError,
+    logging::output_tail,
     mode::flash::{
         SHA256_LEN, child,
         config::Url,
-        net, output_tail, partly_written,
+        net, partly_written,
         rawio::{self, COPY_BUFFER_SIZE, open_existing_for_write},
         read_small_text, sha256_from_hex, unmount, xz,
     },
