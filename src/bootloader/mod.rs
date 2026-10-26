@@ -79,8 +79,8 @@ pub enum BootEnvKey {
     /// `omnect_fsck_<partition>` — fsck result for the given partition.
     FsckStatus(PartitionName),
     /// `omnect_first_boot_done` — set to `"1"` after the first successful
-    /// `run_init`. Unified first-boot sentinel; read by the resize-data init
-    /// setup step and the first-boot detection in `run_init`.
+    /// `run_init`, and on a boot after an update. Read by the first-boot
+    /// detection in `run_init`.
     FirstBootDone,
     /// `omnect_extra_bootargs` — extra kernel cmdline arguments the bootloader
     /// appends. Synced from the boot-partition files by the extra-bootargs

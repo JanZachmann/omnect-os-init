@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use log::{info, warn};
 
 use crate::{
+    bootloader::{BootEnvKey, FIRST_BOOT_DONE},
     config::Config,
     filesystem::{mount_core_partitions, persist_fsck_results},
     mode::{BootContext, BootMode},
@@ -102,23 +103,30 @@ fn compute_first_boot(env: &bootloader::BootEnvState) -> bool {
 /// with an init that did not write the marker. Writing it here keeps the next
 /// boot from being taken for a first boot. An update either is validated, or
 /// it updated the bootloader too, which skips the validation.
-fn detect_first_boot(env: &mut bootloader::BootEnvState, update_pending: bool) -> bool {
+fn detect_first_boot(env: &mut BootEnvState, update_pending: bool) -> bool {
     if !compute_first_boot(env) {
         return false;
     }
-    let bootloader_updated = env.available().is_some_and(|bl| {
-        bl.is_flag_set(bootloader::BootEnvKey::BootloaderUpdated)
-            .unwrap_or_else(|e| {
-                warn!("reading omnect_bootloader_updated failed; treating as not set: {e}");
-                false
-            })
-    });
-    if update_pending || bootloader_updated {
-        info!("first-boot marker missing on a boot after an update; setting it");
-        mode::normal::write_first_boot_marker(true, env);
+    let Some(bl) = env.available_mut() else {
         return false;
+    };
+    let bootloader_updated = match bl.is_flag_set(BootEnvKey::BootloaderUpdated) {
+        Ok(set) => set,
+        Err(e) => {
+            warn!(
+                "first-boot: reading omnect_bootloader_updated failed: {e}; treating as not-first-boot"
+            );
+            return false;
+        }
+    };
+    if !(update_pending || bootloader_updated) {
+        return true;
     }
-    true
+    info!("first-boot marker missing on a boot after an update; setting it");
+    if let Err(e) = bl.set_env(BootEnvKey::FirstBootDone, Some(FIRST_BOOT_DONE)) {
+        warn!("first-boot marker write failed: {e}; the next boot can be taken for a first boot");
+    }
+    false
 }
 
 /// Apply a boot env decision; an error in `core_result` wins over the decision.
@@ -188,9 +196,10 @@ pub fn run_init() -> Result<()> {
     // Read omnect_validate_update once, before any subsequent fallible step.
     // Stored in a process-global so handle_fatal_error in main.rs can branch
     // on it without threading the value through every return type.
-    set_update_pending(update_pending_from_env(&bootloader_env));
+    let update_pending = update_pending_from_env(&bootloader_env);
+    set_update_pending(update_pending);
 
-    ods_status.first_boot = detect_first_boot(&mut bootloader_env, read_update_pending());
+    ods_status.first_boot = detect_first_boot(&mut bootloader_env, update_pending);
     if ods_status.first_boot {
         info!("first-boot detected (omnect_first_boot_done not set to the marker value)");
     }
@@ -503,6 +512,42 @@ mod first_boot_detection_tests {
         let mut env = BootEnvState::Available(Box::new(mock));
         assert!(!detect_first_boot(&mut env, false));
         assert_eq!(marker(&env).as_deref(), Some(bootloader::FIRST_BOOT_DONE));
+    }
+
+    #[test]
+    fn empty_bootloader_updated_is_no_update() {
+        // The scripted init clears the flag to an empty value on GRUB.
+        let mock = MockBootEnv::new().with_env(BootEnvKey::BootloaderUpdated, "");
+        let mut env = BootEnvState::Available(Box::new(mock));
+        assert!(detect_first_boot(&mut env, false));
+        assert_eq!(marker(&env), None);
+    }
+
+    #[test]
+    fn update_boot_with_marker_set_writes_nothing() {
+        let mock = MockBootEnv::new()
+            .with_env(BootEnvKey::FirstBootDone, bootloader::FIRST_BOOT_DONE)
+            .with_env(BootEnvKey::BootloaderUpdated, "1");
+        let calls = mock.shared_set_env_calls();
+        let mut env = BootEnvState::Available(Box::new(mock));
+        assert!(!detect_first_boot(&mut env, true));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn update_boot_with_failed_marker_write_is_no_first_boot() {
+        let mock = MockBootEnv::new().with_set_env_error();
+        let mut env = BootEnvState::Available(Box::new(mock));
+        assert!(!detect_first_boot(&mut env, true));
+    }
+
+    #[test]
+    fn bootloader_updated_read_error_is_no_first_boot() {
+        let mock = MockBootEnv::new().with_get_env_error_for(BootEnvKey::BootloaderUpdated);
+        let calls = mock.shared_set_env_calls();
+        let mut env = BootEnvState::Available(Box::new(mock));
+        assert!(!detect_first_boot(&mut env, false));
+        assert!(calls.lock().unwrap().is_empty());
     }
 
     #[test]
