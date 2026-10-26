@@ -37,6 +37,11 @@ On every boot the init:
 A flash mode replaces steps 3 and 4. Mode 1 ends with a power off, modes 2 and
 3 with a reboot.
 
+With GRUB, the init finds its disk by the volume ID of the boot partition.
+Every disk written from the same image has the same volume ID. Do not attach
+two such disks at the same time: the init can then mount the partitions of the
+other disk.
+
 ## Error handling
 
 A fatal error ends the boot in the initramfs:
