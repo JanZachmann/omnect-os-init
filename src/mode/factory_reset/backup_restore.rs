@@ -1,3 +1,5 @@
+use std::fs;
+use std::os::unix::fs::{MetadataExt, chown};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -108,9 +110,33 @@ fn backup_path(rootfs: &Path, path: &str, backup_dir: &Path) -> Result<bool> {
 /// Path of a preserved entry inside the backup tree. One definition so
 /// `restore_all`'s existence check and `restore_path`'s copy source stay in sync.
 fn backup_source(rootfs: &Path, path: &str, backup_dir: &Path) -> PathBuf {
-    backup_dir
-        .join(rootfs.strip_prefix("/").unwrap_or(rootfs))
-        .join(path.trim_start_matches('/'))
+    backup_root(rootfs, backup_dir).join(path.trim_start_matches('/'))
+}
+
+fn backup_root(rootfs: &Path, backup_dir: &Path) -> PathBuf {
+    backup_dir.join(rootfs.strip_prefix("/").unwrap_or(rootfs))
+}
+
+/// Creates the missing directories up to `dest_dir` with the owner and mode
+/// they have in the backup.
+fn create_parent_dirs(rootfs: &Path, dest_dir: &Path, backup_root: &Path) -> std::io::Result<()> {
+    let missing: Vec<&Path> = dest_dir
+        .ancestors()
+        .take_while(|dir| *dir != rootfs && dir.symlink_metadata().is_err())
+        .collect();
+
+    for dir in missing.into_iter().rev() {
+        fs::create_dir(dir)?;
+        let rel = dir.strip_prefix(rootfs).map_err(std::io::Error::other)?;
+        let meta = fs::metadata(backup_root.join(rel))?;
+        chown(dir, Some(meta.uid()), Some(meta.gid()))?;
+        fs::set_permissions(dir, meta.permissions())?;
+    }
+
+    if !dest_dir.is_dir() {
+        return Err(std::io::Error::other("not a directory"));
+    }
+    Ok(())
 }
 
 fn restore_path(rootfs: &Path, path: &str, backup_dir: &Path) -> Result<()> {
@@ -127,9 +153,11 @@ fn restore_path(rootfs: &Path, path: &str, backup_dir: &Path) -> Result<()> {
     let dest_full = rootfs.join(path_stripped);
     let dest_dir = dest_full.parent().unwrap_or(rootfs);
 
-    std::fs::create_dir_all(dest_dir).map_err(|e| FactoryResetError::RestoreFailed {
-        path: PathBuf::from(path),
-        reason: format!("Failed to create directory {}: {e}", dest_dir.display()),
+    create_parent_dirs(rootfs, dest_dir, &backup_root(rootfs, backup_dir)).map_err(|e| {
+        FactoryResetError::RestoreFailed {
+            path: PathBuf::from(path),
+            reason: format!("Failed to create directory {}: {e}", dest_dir.display()),
+        }
     })?;
 
     let output = Command::new(CP_CMD)
@@ -204,6 +232,48 @@ mod tests {
         restore_path(&rootfs, "/etc/hostname", &backup).unwrap();
 
         assert_eq!(fs::read_to_string(restored).unwrap(), "restored-hostname");
+    }
+
+    #[test]
+    fn restore_path_creates_parents_like_backup() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        let backup = temp.path().join("backup");
+        let backup_root = backup_root(&rootfs, &backup);
+        fs::create_dir_all(rootfs.join("var")).unwrap();
+        fs::set_permissions(rootfs.join("var"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::create_dir_all(backup_root.join("var/app/sub")).unwrap();
+        fs::write(backup_root.join("var/app/sub/file"), "data").unwrap();
+        fs::set_permissions(backup_root.join("var"), fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(
+            backup_root.join("var/app"),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        fs::set_permissions(
+            backup_root.join("var/app/sub"),
+            fs::Permissions::from_mode(0o710),
+        )
+        .unwrap();
+
+        restore_path(&rootfs, "/var/app/sub/file", &backup).unwrap();
+
+        let mode = |p: &str| fs::metadata(rootfs.join(p)).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(
+            fs::read_to_string(rootfs.join("var/app/sub/file")).unwrap(),
+            "data"
+        );
+        assert_eq!(mode("var/app"), 0o750);
+        assert_eq!(mode("var/app/sub"), 0o710);
+        // An existing parent keeps its mode.
+        assert_eq!(mode("var"), 0o755);
+        let backup_uid = fs::metadata(backup_root.join("var/app")).unwrap().uid();
+        assert_eq!(
+            fs::metadata(rootfs.join("var/app")).unwrap().uid(),
+            backup_uid
+        );
     }
 
     #[test]
