@@ -98,7 +98,13 @@ pub fn encode_fsck_output(code: i32, output: &str) -> String {
 /// Decode a fsck result previously encoded with [`encode_fsck_output`].
 ///
 /// Returns a `FsckRecord` on success, or `None` if decoding fails.
+#[cfg(any(feature = "grub", test))]
 pub fn decode_fsck_output(encoded: &str) -> Option<super::FsckRecord> {
+    parse_fsck_text(&unpack_fsck_text(encoded)?)
+}
+
+/// Undo base64 and gzip. `None` if the value does not unpack or an applet fails.
+pub(crate) fn unpack_fsck_text(encoded: &str) -> Option<String> {
     // Decode base64 → compressed bytes.
     let b64_out = Command::new(BASE64_CMD)
         .args(["-d"])
@@ -135,7 +141,11 @@ pub fn decode_fsck_output(encoded: &str) -> Option<super::FsckRecord> {
         .ok()
         .filter(|out| out.status.success())?;
 
-    let raw = String::from_utf8_lossy(&gz_out.stdout);
+    Some(String::from_utf8_lossy(&gz_out.stdout).into_owned())
+}
+
+/// Split the unpacked text into the exit code line and the fsck output.
+pub(crate) fn parse_fsck_text(raw: &str) -> Option<super::FsckRecord> {
     let (code_str, output) = raw.split_once('\n')?;
     let code = code_str.trim().parse::<i32>().ok()?;
     Some(super::FsckRecord {
@@ -177,6 +187,31 @@ mod tests {
             crate::filesystem::FsckExitCode::from(code)
         );
         assert_eq!(record.output, output);
+    }
+
+    #[test]
+    fn test_decode_record_without_exit_code_is_invalid() {
+        assert!(commands_available());
+        // The format of an older initramfs: only the gzipped fsck output.
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                &format!("printf 'Pass 1\\nErrors corrected.' | {GZIP_CMD} -c | {BASE64_CMD} -w0"),
+            ])
+            .output()
+            .unwrap();
+        let encoded = String::from_utf8(output.stdout).unwrap();
+
+        let key = crate::bootloader::BootEnvKey::FsckStatus(crate::partition::PartitionName::Data);
+        assert!(matches!(
+            crate::bootloader::decode_fsck_env(key, &encoded),
+            Err(crate::error::BootEnvError::InvalidValue { .. })
+        ));
+        // A value that does not unpack reads as absent.
+        assert!(matches!(
+            crate::bootloader::decode_fsck_env(key, "not-valid-base64!!!"),
+            Ok(None)
+        ));
     }
 
     #[test]

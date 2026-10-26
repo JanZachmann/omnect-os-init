@@ -220,9 +220,13 @@ impl BootEnv for GrubBootEnv {
 
     fn get_fsck_status(&self, partition: PartitionName) -> Result<Option<FsckRecord>> {
         match FsckChannel::for_partition(partition) {
-            FsckChannel::Env => Ok(self
-                .get_env(BootEnvKey::FsckStatus(partition))?
-                .and_then(|v| decode_fsck_output(&v))),
+            FsckChannel::Env => {
+                let key = BootEnvKey::FsckStatus(partition);
+                match self.get_env(key)? {
+                    Some(v) => crate::bootloader::decode_fsck_env(key, &v),
+                    None => Ok(None),
+                }
+            }
             FsckChannel::File => get_fsck_from_file(partition),
         }
     }

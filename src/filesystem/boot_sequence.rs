@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use nix::mount::MsFlags;
 
 use crate::bootloader::BootEnv;
-use crate::error::{FilesystemError, InitramfsError, PartitionError};
+use crate::error::{BootEnvError, FilesystemError, InitramfsError, PartitionError};
 use crate::filesystem::{
     FsType, FsckExitCode, MountOptions, MountPoint, check_filesystem_lenient, is_path_mounted,
     mount, mount_points, mount_tmpfs,
@@ -205,7 +205,7 @@ pub fn mount_remaining_partitions(
         }
     }
 
-    // Mount cert partition read-write — initramfs creates ca/ and priv/ subdirs on first boot
+    // Mount cert partition read-write
     if let Some(cert_dev) = layout.partitions.get(&PartitionName::Cert) {
         let cert_mount = rootfs.join(mount_points::CERT_PARTITION);
         if is_path_mounted(&cert_mount)? {
@@ -372,6 +372,14 @@ pub fn drain_fsck_env(ods_status: &mut OdsStatus, bootloader: Option<&mut dyn Bo
     for partition in FSCK_PARTITIONS {
         let record = match bl.get_fsck_status(partition) {
             Ok(r) => r,
+            Err(e @ BootEnvError::InvalidValue { .. }) => {
+                // It would stay in the env for good otherwise.
+                log::warn!("Dropping the fsck record for {partition}: {e}");
+                if let Err(e) = bl.clear_fsck_status(partition) {
+                    log::warn!("Failed to clear fsck record for {partition} in boot env: {e}");
+                }
+                continue;
+            }
             Err(e) => {
                 log::warn!("Failed to read fsck record for {partition} from boot env: {e}");
                 continue;
@@ -577,6 +585,17 @@ mod tests {
         drain_fsck_env(&mut ods, None);
 
         assert_eq!(ods.fsck.len(), 1);
+    }
+
+    #[test]
+    fn test_drain_clears_an_undecodable_record() {
+        let mut ods = OdsStatus::new();
+        let mut bl = MockBootEnv::new().with_undecodable_fsck(PartitionName::Data);
+
+        drain_fsck_env(&mut ods, Some(&mut bl));
+
+        assert!(ods.fsck.is_empty());
+        assert_eq!(bl.get_fsck_status(PartitionName::Data).unwrap(), None);
     }
 
     #[test]

@@ -197,9 +197,11 @@ pub trait BootEnv: Send + Sync {
     /// Returns the decoded `FsckRecord` if a value is present,
     /// or `None` if no status was stored for this partition.
     fn get_fsck_status(&self, partition: PartitionName) -> Result<Option<FsckRecord>> {
-        Ok(self
-            .get_env(BootEnvKey::FsckStatus(partition))?
-            .and_then(|v| types::decode_fsck_output(&v)))
+        let key = BootEnvKey::FsckStatus(partition);
+        match self.get_env(key)? {
+            Some(v) => decode_fsck_env(key, &v),
+            None => Ok(None),
+        }
     }
 
     /// Clear fsck status from bootloader environment
@@ -297,6 +299,25 @@ pub fn create_mock_bootloader() -> MockBootEnv {
     MockBootEnv::new()
 }
 
+/// Decodes an fsck record from the env. A value that does not unpack reads as
+/// absent. One that unpacks but has no exit code line, the format of an older
+/// initramfs, is `BootEnvError::InvalidValue`.
+pub(crate) fn decode_fsck_env(key: BootEnvKey, encoded: &str) -> Result<Option<FsckRecord>> {
+    let Some(text) = types::unpack_fsck_text(encoded) else {
+        return Ok(None);
+    };
+    types::parse_fsck_text(&text)
+        .map(Some)
+        .ok_or_else(|| invalid_fsck_record(key))
+}
+
+fn invalid_fsck_record(key: BootEnvKey) -> BootEnvError {
+    BootEnvError::InvalidValue {
+        key: key.as_str().to_string(),
+        reason: "fsck record has no exit code".into(),
+    }
+}
+
 /// Mock boot environment for testing
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Default)]
@@ -331,6 +352,8 @@ pub struct MockBootEnv {
     save_fsck_errors: bool,
     /// When true, `get_fsck_status` returns an error instead of looking up the partition.
     get_fsck_errors: bool,
+    /// Partitions whose fsck record does not decode.
+    undecodable_fsck: std::collections::HashSet<PartitionName>,
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -376,6 +399,11 @@ impl MockBootEnv {
 
     pub fn with_get_fsck_error(mut self) -> Self {
         self.get_fsck_errors = true;
+        self
+    }
+
+    pub fn with_undecodable_fsck(mut self, partition: PartitionName) -> Self {
+        self.undecodable_fsck.insert(partition);
         self
     }
 
@@ -469,11 +497,15 @@ impl BootEnv for MockBootEnv {
                 reason: "injected get_fsck_status error".into(),
             });
         }
+        if self.undecodable_fsck.contains(&partition) {
+            return Err(invalid_fsck_record(BootEnvKey::FsckStatus(partition)));
+        }
         Ok(self.fsck.get(&partition).cloned())
     }
 
     fn clear_fsck_status(&mut self, partition: PartitionName) -> Result<()> {
         self.fsck.remove(&partition);
+        self.undecodable_fsck.remove(&partition);
         Ok(())
     }
 }
