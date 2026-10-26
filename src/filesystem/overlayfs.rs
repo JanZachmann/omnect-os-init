@@ -41,6 +41,10 @@ pub(crate) mod paths {
     pub const USR_LOCAL: &str = "usr/local";
     #[cfg(feature = "persistent-var-log")]
     pub const VAR_LOG: &str = "var/log";
+    /// Former location of the persistent /var/log on the data partition.
+    // TODO: remove me, as soon as the CR version boots with omnect-os-init
+    #[cfg(feature = "persistent-var-log")]
+    pub const DATA_LOG_OLD: &str = "log";
 }
 
 /// Mount point paths for partitions relative to rootfs
@@ -148,6 +152,7 @@ pub(crate) fn setup_data_overlay_tracked(
 
     #[cfg(feature = "persistent-var-log")]
     {
+        migrate_var_log(&data_mount);
         bind_mount(
             &data_mount.join(paths::VAR_LOG),
             &rootfs_dir.join(paths::VAR_LOG),
@@ -156,6 +161,47 @@ pub(crate) fn setup_data_overlay_tracked(
     }
 
     Ok(())
+}
+
+/// Move the logs from the former data partition location to `var/log`.
+///
+/// Best effort: a log that cannot be moved stays where it is and does not
+/// stop the boot. An entry that already exists in `var/log` is kept.
+// TODO: remove me, as soon as the CR version boots with omnect-os-init
+#[cfg(feature = "persistent-var-log")]
+fn migrate_var_log(data_mount: &Path) {
+    let old = data_mount.join(paths::DATA_LOG_OLD);
+    let new = data_mount.join(paths::VAR_LOG);
+    if !old.is_dir() {
+        return;
+    }
+
+    let entries = match ensure_dir(&new).and_then(|_| Ok(fs::read_dir(&old)?)) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!("Cannot move the logs from {}: {e}", old.display());
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let dst = new.join(entry.file_name());
+        if dst.symlink_metadata().is_ok() {
+            log::warn!(
+                "Not moving {}: {} exists",
+                entry.path().display(),
+                dst.display()
+            );
+            continue;
+        }
+        if let Err(e) = fs::rename(entry.path(), &dst) {
+            log::warn!("Cannot move {}: {e}", entry.path().display());
+        }
+    }
+
+    match fs::remove_dir(&old) {
+        Ok(()) => log::info!("Moved the logs from {} to {}", old.display(), new.display()),
+        Err(e) => log::warn!("Cannot remove {}: {e}", old.display()),
+    }
 }
 
 /// Setup home directory overlay
@@ -302,6 +348,54 @@ pub fn setup_raw_rootfs_mount(rootfs_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[cfg(feature = "persistent-var-log")]
+    #[test]
+    fn migrate_var_log_moves_old_logs() {
+        let data = TempDir::new().unwrap();
+        let old = data.path().join(paths::DATA_LOG_OLD);
+        let new = data.path().join(paths::VAR_LOG);
+        fs::create_dir_all(old.join("journal")).unwrap();
+        fs::write(old.join("journal/system.journal"), "j").unwrap();
+        fs::write(old.join("app.log"), "old").unwrap();
+        // The fsck results are written before the migration runs.
+        fs::create_dir_all(new.join("fsck")).unwrap();
+
+        migrate_var_log(data.path());
+
+        assert!(!old.exists());
+        assert_eq!(
+            fs::read_to_string(new.join("journal/system.journal")).unwrap(),
+            "j"
+        );
+        assert_eq!(fs::read_to_string(new.join("app.log")).unwrap(), "old");
+        assert!(new.join("fsck").is_dir());
+    }
+
+    #[cfg(feature = "persistent-var-log")]
+    #[test]
+    fn migrate_var_log_keeps_existing_entry() {
+        let data = TempDir::new().unwrap();
+        let old = data.path().join(paths::DATA_LOG_OLD);
+        let new = data.path().join(paths::VAR_LOG);
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+        fs::write(old.join("app.log"), "old").unwrap();
+        fs::write(new.join("app.log"), "new").unwrap();
+
+        migrate_var_log(data.path());
+
+        assert_eq!(fs::read_to_string(new.join("app.log")).unwrap(), "new");
+        assert_eq!(fs::read_to_string(old.join("app.log")).unwrap(), "old");
+    }
+
+    #[cfg(feature = "persistent-var-log")]
+    #[test]
+    fn migrate_var_log_without_old_logs_does_nothing() {
+        let data = TempDir::new().unwrap();
+        migrate_var_log(data.path());
+        assert!(!data.path().join(paths::VAR_LOG).exists());
+    }
 
     #[test]
     fn test_ensure_dir_creates_directory() {
