@@ -1,5 +1,10 @@
 # Design: `omnect_extra_bootargs` Sync in the Initramfs
 
+> **Correction (2026-10-26).** The `update_pending == false` gate below is
+> removed. `first_boot` is now `false` on every boot after an update, including
+> the validation boot of a device that comes from the legacy init, so
+> `first_boot` alone gives the same protection.
+
 **Date:** 2026-07-21
 **Status:** Approved
 **Scope:** omnect-os-init — `init_setup::extra_bootargs`, `error`, `recovery`,

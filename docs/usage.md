@@ -447,7 +447,7 @@ read it.
 
 | Key              | Present when                                   | Content |
 | ---------------- | ---------------------------------------------- | ------- |
-| `first_boot`     | always                                         | `true` while the first-boot marker in the bootloader environment is not set: after flashing, and on later boots while the data resize or the [extra boot arguments](#extra-boot-arguments) sync fails. `false` on a boot after an update: while the update is being validated, after a rollback, or after a bootloader update. That boot sets the marker before it clears the update flags, so the first-boot steps do not run again, also when they had failed. `false` without a readable bootloader environment |
+| `first_boot`     | always                                         | `true` on the first boot since flashing, and on later boots while the data resize or the [extra boot arguments](#extra-boot-arguments) sync fails. `false` on a boot after an update (validation, rollback, bootloader update); such a boot ends the first-boot phase, so failed first-boot steps are not retried after it. If the marker cannot be written on a validation boot, the boot after a successful validation is a first boot. `false` without a readable bootloader environment |
 | `fsck`           | a [filesystem check](#filesystem-check) was not clean | one object per partition: `code` (the fsck exit code; for `boot` the fsck.fat code), `output` |
 | `factory_reset`  | a factory reset was requested                  | see [factory reset result](#factory-reset-result) |
 | `degraded_boot`  | a release image booted without a usable bootloader environment | `reason` |
@@ -460,8 +460,7 @@ On the first boot after flashing, the init reads the files
 `omnect_extra_bootargs_omnect` and `omnect_extra_bootargs_custom` from the boot
 partition and stores them in the bootloader environment variable
 `omnect_extra_bootargs`.
-If the value changed, the system reboots once so the bootloader uses it. This
-does not run on the first boot after an update.
+If the value changed, the system reboots once so the bootloader uses it.
 
 ## Early module load
 

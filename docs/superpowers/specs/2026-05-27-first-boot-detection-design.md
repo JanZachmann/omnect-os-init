@@ -1,7 +1,15 @@
 # Design: First-Boot Detection
 
+> **Correction (2026-10-26).** A boot with `omnect_validate_update`,
+> `omnect_validate_update_failed` or `omnect_bootloader_updated` set, or with
+> one of them unreadable, is no first boot. A device updated from an init that
+> never wrote the marker therefore does not run the first-boot work again
+> (§2.1 "No migration logic" no longer holds). The marker has a second writer:
+> `handle_update_validation` sets it on such a boot, before it clears its
+> flags (§2.2 "Set once" and §5 "single point" no longer hold).
+
 **Date:** 2026-05-27
-**Status:** Draft for review
+**Status:** Implemented, partially superseded — see the correction above
 **Scope:** omnect-os-init — `bootloader::BootEnvKey` (one variant
 add/remove), `lib::run_init` (early detection), `mode::normal::run` (marker
 write), `runtime::OdsStatus.first_boot` (new field),
