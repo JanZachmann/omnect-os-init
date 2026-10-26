@@ -152,7 +152,7 @@ src/
 | `flash-mode-3` | Flash a `wic.xz` downloaded from a URL; tools in the README |
 | `flash-mode-network` | Shared layer of modes 2 and 3. Never selected directly |
 | `rtc` | The machine has a reliable clock, so mode 3 checks TLS certificates |
-| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass. The disk head is zeroed before the image arrives, so if no image is pushed the disk no longer boots |
+| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream |
 | `test-utils` | Expose `MockBootEnv` for integration tests — never enabled in production builds |
 
 ## 5. Runtime Constraints

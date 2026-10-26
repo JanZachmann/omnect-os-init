@@ -8,21 +8,23 @@ A single binary acting as `/init` in the initramfs, in place of the shell script
 used to do this. Runs as PID 1: it prepares the partitions, the boot environment and the
 runtime state for `omnect-device-service`, then hands over with `switch_root`.
 
+How to use it on a device (flash modes, factory reset, filesystem check,
+status file) is described in [docs/usage.md](docs/usage.md).
+
 Implemented functionality:
 
-- **Bootloader abstraction**: Unified `BootEnv` trait for GRUB (`grub-editenv`) and U-Boot (`fw_printenv`/`fw_setenv`); fsck output persisted across reboots as gzip+base64 in the bootloader env (encoded via busybox `gzip`/`base64` — no crate dependencies)
-- **Degraded boot mode**: When the bootloader environment is unavailable (corrupted env file, missing tool, I/O error), release images continue booting and flag `degraded_boot: true` in the ODS status JSON; debug images abort immediately and drop to a shell. `FsckRequiresReboot` always takes precedence over a concurrent bootloader failure.
-- **Configuration**: Parses `/proc/cmdline`; build-time constants from Yocto environment via `build.rs`
-- **Partition management**: Root device detection, partition layout (GPT/DOS), `/dev/omnect/*` symlinks
-- **Filesystem operations**: fsck, mount manager (RAII), overlayfs for `/etc` and `/home`, bind mounts
-- **Logging**: Kernel ring buffer (`/dev/kmsg`) with log level prefixes
-- **ODS integration**: Runtime files for `omnect-device-service`
-- **fs-links**: Symlink creation from `etc/omnect/fs-link.json` and `etc/omnect/fs-link.d/`
+- **Bootloader abstraction**: `BootEnv` trait for GRUB (`grub-editenv`) and U-Boot (`fw_printenv`/`fw_setenv`)
+- **Degraded boot mode**: a release image continues to boot without a usable bootloader environment and reports it; a debug image stops and opens a shell
+- **Configuration**: parses `/proc/cmdline`; build-time constants from the Yocto environment via `build.rs`
+- **Partition management**: root device detection, partition layout (GPT/DOS), `/dev/omnect/*` symlinks
+- **Filesystem operations**: fsck, mount manager, overlayfs for `/etc` and `/home`, bind mounts
+- **Logging**: kernel ring buffer (`/dev/kmsg`) with log level prefixes
+- **ODS integration**: status file and update validation files for `omnect-device-service`
+- **fs-links**: symlinks from `etc/omnect/fs-link.json` and `etc/omnect/fs-link.d/`
 - **switch\_root**: MS_MOVE + chroot + exec systemd
-- **Factory reset (modes 1-3)**: Selective-preserve backup → wipe `data`/`etc` (modes 2 and 3 only) → reformat → restore, triggered by the `factory-reset` bootloader env key; errors are non-fatal and always fall through to Normal boot (feature `factory-reset`)
-- **Flash mode 1**: Clones the running disk onto another block device given by the `flash-mode-devpath` bootloader env key, triggered by `flash-mode`; powers off on success so the clone can be moved to its own device (feature `flash-mode-1`, part of the default feature set)
-- **Flash mode 2**: Brings up `eth0` with DHCP and starts `dropbear`; the operator pushes a bmap and a `wic.xz` with `scp`, and the init checks the bmap and flashes the image onto the running disk; a failed attempt asks for both again. Triggered by `flash-mode=2` in the bootloader env or by the flag file `/etc/enforce_flash_mode` (feature `flash-mode-2`). Mode 2 wins over a `factory-reset` set at the same time: the reset does not run and an error is logged, with no further handling
-- **Flash mode 3**: Brings up `eth0` with DHCP, downloads a `wic.xz` and its sha256 file from the base64 URLs in `flash-mode-url` and `flash-mode-url-sha256`, checks the image and flashes it onto the running disk. Triggered by `flash-mode=3` (feature `flash-mode-3`). It wins over a `factory-reset` set at the same time
+- [**Factory reset (modes 1-3)**](docs/usage.md#factory-reset) (feature `factory-reset`)
+- [**Flash modes 1-3**](docs/usage.md#flash-modes) (features `flash-mode-1`, `flash-mode-2`, `flash-mode-3`)
+- [**Early module load**](docs/usage.md#early-module-load) (feature `early-modules`)
 
 ## Startup Flow
 
@@ -66,8 +68,8 @@ flowchart TD
     BMODE -->|"Flash(config)\nfeature = flash-mode"| FLASH
     BMODE -->|"Normal / FactoryReset"| ISETUP["init_setup::run()\nextra_bootargs sync — always\nresize-data preflight if feature = resize-data"]
 
-    FLASH["flash::run()\nclear flash triggers → clone (mode 1) or scp flash (mode 2)\nrun log → data partition"]
-    FLASH -->|OK| POWEROFF(["⏻ poweroff (mode 1) / reboot (mode 2)"])
+    FLASH["flash::run()\nclear flash triggers → clone (mode 1), scp flash (mode 2)\nor download flash (mode 3)\nrun log → data partition"]
+    FLASH -->|OK| POWEROFF(["⏻ poweroff (mode 1) / reboot (modes 2, 3)"])
     FLASH -->|Fatal| FEB
 
     ISETUP -->|"FsckRequiresReboot\nExtraBootArgsUpdated"| FEB
@@ -132,7 +134,7 @@ flowchart TD
 |--------|---------|---------|
 | ✅ | `switch_root` — systemd takes over | Normal completion |
 | ⏻ | Power off | Flash mode 1 finished; the clone can be moved to its own device |
-| 🔁 | Reboot | `FsckRequiresReboot` (unconditional); or any fatal error while `omnect_validate_update` is set — triggers bootloader OTA rollback |
+| 🔁 | Reboot | Flash mode 2 or 3 finished; `FsckRequiresReboot` (unconditional); `ExtraBootArgsUpdated` (first boot, new extra boot arguments); or any fatal error while `omnect_validate_update` is set — triggers bootloader OTA rollback |
 | 🔴 | Halt (kmsg loop, infinite) | Fatal error · release image · no OTA in flight |
 | 🐚 | Debug shell (bash → sh fallback, respawning) | Fatal error · debug image · no OTA in flight |
 
@@ -184,18 +186,14 @@ from booting: `FactoryResetError` is classified as `ContinueDegraded`.
 
 **Factory reset — wipe modes (`FWIPE`)**
 
-The trigger must name a `mode` of 1 to 3 and carry a `preserve` array. `/etc/omnect/factory-reset.d/`
-is preserved in every case, so an empty array keeps that directory and nothing else. When
-`preserve` contains `applications`, every `*.json` file in that directory is read for its
-`paths` array, and one without a usable `paths` array fails the reset — skipping it would
-wipe the paths it was meant to keep and still report success.
+The behaviour is described in [factory reset](docs/usage.md#factory-reset). A
+`factory-reset.d` file without a usable `paths` array fails the reset, because skipping it
+would wipe the paths it was meant to keep and still report success.
 
 The wipe runs once the backup is in initramfs RAM and before the reformat. Mode 2 writes
 data from `/dev/urandom`, mode 3 uses the `BLKDISCARD` ioctl, which the hardware has to
-support. A failure never aborts the reset — the other partition is still wiped and
-reformat + restore still run, so the device stays usable — but the result is reported as
-`Error` with a note in the status `error` field, because the wipe the caller asked for did
-not happen.
+support. A failed wipe is reported as `Error` but does not abort the reset, so the device
+stays usable.
 
 **Factory reset — reformat/mount retry (`FFORMAT`)**
 
@@ -254,7 +252,7 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 | `uboot` | U-Boot bootloader support — ARM targets | Implemented |
 | `gpt` | GPT partition table layout | Implemented |
 | `dos` | DOS/MBR partition table layout | Implemented |
-| `early-modules` | Load the modules listed in the rootfs before `switch_root`, see [Early module load](#early-module-load) | Implemented |
+| `early-modules` | Load the modules listed in the rootfs before `switch_root`, see [Early module load](docs/usage.md#early-module-load) | Implemented |
 | `persistent-var-log` | Bind-mount `/var/log` to data partition | Implemented |
 | `release-image` | Release error handling: loop on fatal error; continue in degraded boot | Implemented |
 | `resize-data` | Data partition auto-resize on first boot | Implemented |
@@ -263,105 +261,41 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 | `flash-mode` | Shared flash layer: trigger detection, dispatch, log capture. Pulled in by a mode feature, never selected on its own | Implemented |
 | `flash-mode-1` | Disk cloning (part of the default feature set) | Implemented |
 | `flash-mode-2` | Flash a `wic.xz` pushed in over `scp` | Implemented |
-| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream. A broken image is seen only after writing started; the init then asks for bmap and image again, and the disk does not boot until a good one was flashed | Implemented |
+| `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream | Implemented |
 | `flash-mode-3` | Flash a `wic.xz` downloaded from a URL | Implemented |
 | `flash-mode-network` | Shared layer of modes 2 and 3: network, unmount sweep, xz decoding. Pulled in by a mode feature, never selected on its own | Implemented |
 | `rtc` | The machine has a reliable real-time clock, so mode 3 checks TLS certificates | Implemented |
 
 > **Note:** `grub` and `uboot` are mutually exclusive, and so are `gpt` and `dos`.
 > Exactly one of each pair must be set at build time — `build.rs` panics otherwise.
-> The Yocto recipe selects the correct features via `CARGO_FEATURES` based on `MACHINE_FEATURES`.
+> The Yocto recipe sets `CARGO_FEATURES` from `MACHINE_FEATURES`, `DISTRO_FEATURES` and
+> recipe variables; see the [meta-omnect README](https://github.com/omnect/meta-omnect#readme).
 > `flash-mode-1` is in the default feature set, so it is already enabled in the
 > `cargo build` examples above; add `--no-default-features` to build without it.
 
-### Build constants for flash mode 2
+### Build constants
 
-`build.rs` reads these Yocto environment variables. Flash mode 2 needs all three; the
-build does not fail without them, but the mode refuses to run.
+`build.rs` reads these Yocto environment variables. The build does not fail
+without them, but a flash mode that needs a missing value refuses to run. A
+value that is not a number is ignored with a cargo warning.
 
-| Env var | Constant | Unit |
-|---------|----------|------|
-| `OMNECT_PART_OFFSET_BOOT` | `BOOT_START` | KB |
-| `OMNECT_PART_SIZE_BOOT` | `BOOT_SIZE` | KB |
-| `OMNECT_USER_ID` | `OMNECT_USER_ID` | uid and gid of the `omnect` user |
-
-### Early module load
-
-A driver that probes in the initramfs finds another module, for example a DMA
-engine, only when that module is already loaded. udev loads modules only after
-`switch_root`. With the `early-modules` feature, the init loads the modules
-listed in the rootfs after `init_setup`, before the other partitions are
-mounted. A flash mode loads none.
-
-To add a module, install a `.conf` file into `/etc/omnect/early-modules.d/` in
-the rootfs and build the init with `early-modules`:
-
-```
-# <module> [parameters]
-imx_sdma
-my_driver debug=1 mode=fast
-```
-
-- Each line names one module, followed by optional parameters in the format
-  `insmod` takes. A listed module gets its parameters only from its line.
-- `-` and `_` in a module name are equal.
-- Empty lines and lines that start with `#` are skipped.
-- The files are read in name order. A module listed again is ignored with a
-  warning.
-- Without a `.conf` file the step does nothing.
-
-The step:
-
-1. reads the kernel release from `/proc/sys/kernel/osrelease`, and
-   `modules.dep` and `modules.builtin` from `/lib/modules/<release>/` in the
-   rootfs;
-2. sets `/sys/module/firmware_class/parameters/path` to `/rootfs/lib/firmware`,
-   so a firmware request during the load finds the file in the rootfs. The
-   path is not restored;
-3. for each listed module, in file and line order: skips it when it is built
-   in or already loaded; else loads its dependencies from `modules.dep` and
-   then the module itself with `finit_module`. A dependency that has its own
-   line gets its parameters.
-
-Needs:
-
-- `modules.dep` and `modules.builtin` (`depmod`), the module files and their
-  firmware in the rootfs.
-- `CONFIG_MODULE_DECOMPRESS` in the kernel for a compressed module
-  (`.ko.xz`, `.ko.zst`, `.ko.gz`).
-- `CONFIG_FW_LOADER=y`. With `=m`, the `firmware_class` parameter file does
-  not exist in the initramfs, and no module is loaded.
-- A `/lib` link in the rootfs must be relative (`lib -> usr/lib`). An absolute
-  link resolves into the initramfs, so `modules.dep` and the firmware are not
-  found.
-
-Not supported: the init reads only `modules.dep` and `modules.builtin`. So
-`modprobe.d` (`options`, `alias`, `softdep`, `blacklist`) and
-`<module>.<param>=` on the kernel command line do not apply, and a line must
-name the module, not an alias.
-
-The step is best effort. It never stops the boot and does not change the
-status reported to omnect-device-service. Each problem is logged as a warning
-with its reason. When a listed module did not load, the step ends with one
-error line `early modules: not loaded: <names>`. udev may still load the
-module later, but a driver that probed before then ran without it.
-
-With `CONFIG_FW_LOADER_USER_HELPER_FALLBACK=y`, a firmware file missing in the
-rootfs can block the load for the sysfs fallback timeout (60 s by default).
-
-To check the result on a device:
-
-```bash
-dmesg | grep "early modules"
-cat /sys/module/firmware_class/parameters/path   # /rootfs/lib/firmware
-cat /sys/module/<module>/initstate               # live
-```
+| Env var | Constant | Unit | Needed by |
+|---------|----------|------|-----------|
+| `OMNECT_PART_OFFSET_UBOOT_ENV1` | `UBOOT_ENV1_START` | KiB | `flash-mode-1` with `uboot`; with `grub` only when `BOOTLOADER_SEEK` is set |
+| `OMNECT_PART_OFFSET_UBOOT_ENV2` | `UBOOT_ENV2_START` | KiB | `flash-mode-1` with `uboot`, optional |
+| `OMNECT_PART_SIZE_UBOOT_ENV` | `UBOOT_ENV_SIZE` | KiB | `flash-mode-1` with `uboot` |
+| `OMNECT_PART_SIZE_DATA` | `DATA_SIZE` | KiB | `flash-mode-1` |
+| `BOOTLOADER_SEEK` | `BOOTLOADER_START` | KiB | `flash-mode-1`, optional |
+| `OMNECT_PART_OFFSET_BOOT` | `BOOT_START` | KiB | `flash-mode-2` |
+| `OMNECT_PART_SIZE_BOOT` | `BOOT_SIZE` | KiB | `flash-mode-2` |
+| `OMNECT_USER_ID` | `OMNECT_USER_ID` | uid and gid of the `omnect` user | `flash-mode-2` |
 
 ## Runtime Dependencies
 
 The init calls these tools and reads these files from the initramfs image. The
 image recipe has to install them, or the step that needs them fails at run
-time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
+time. The paths are the `*_CMD` and `*_SOURCE` constants in the source, plus
+files the called tools need.
 
 | Tool or file | Needed by | Yocto package |
 |--------------|-----------|---------------|
@@ -371,11 +305,13 @@ time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
 | `blkid` | `core` | `util-linux-blkid` |
 | `gzip`, `gunzip` | `core` (fsck output in the bootloader env) | `busybox` |
 | `base64`, `cp` | `core` | `coreutils` |
-| `sh`, `bash` | emergency and debug shell | `bash` |
+| `bash` | debug shell | `bash` |
+| `sh` | emergency shell, fallback of the debug shell, shell of the `omnect` user for `scp` | `bash` |
 | `grub-editenv` | `grub` | `grub-editenv` |
 | `fw_printenv`, `fw_setenv` | `uboot` | `libubootenv-bin` |
+| `/etc/fw_env.config` | `uboot` | `libubootenv` |
 | `mkfs.ext4`, `tune2fs` | `factory-reset`, `flash-mode-1` | `e2fsprogs-mke2fs`, `e2fsprogs-tune2fs` |
-| `sync` | `factory-reset`, `resize-data` | `busybox` |
+| `sync` | `factory-reset`, `resize-data` | `coreutils` |
 | `sgdisk`, `parted`, `resize2fs` | `resize-data` | `gptfdisk`, `parted`, `e2fsprogs-resize2fs` |
 | `sfdisk` | `flash-mode-1` | `util-linux-sfdisk` |
 | `e2image` | `flash-mode-1` | `e2fsprogs` |
@@ -385,14 +321,14 @@ time. The paths are the `*_CMD` and `*_SOURCE` constants in the source.
 | `/etc/omnect/uboot-env.bin` | `flash-mode-1` with `uboot` | image recipe (`add_uboot_env`) |
 | `/sbin/ip` | `flash-mode-2`, `flash-mode-3` | `busybox` |
 | `/sbin/dhcpcd` | `flash-mode-2`, `flash-mode-3` | `dhcpcd`, `base-passwd` for its system user |
-| `/sbin/dropbear` | `flash-mode-2` | `dropbear` |
+| `/sbin/dropbear`, `scp` | `flash-mode-2` | `dropbear` |
 | `omnect` user and `/home/omnect` | `flash-mode-2` | image recipe (`inherit omnect_user`) |
 | `devpts` filesystem | `flash-mode-2` | kernel (`CONFIG_UNIX98_PTYS`) |
 | `/usr/bin/curl` | `flash-mode-3` | `curl` |
 | CA certificates | `flash-mode-3`, checked only with `rtc` | `ca-certificates` |
 
 With `early-modules`, the init also reads files from the rootfs, see
-[Early module load](#early-module-load).
+[Early module load](docs/usage.md#early-module-load).
 
 ## Testing
 
