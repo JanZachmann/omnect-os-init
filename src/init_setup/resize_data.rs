@@ -48,7 +48,7 @@ fn handle_result(result: Result<()>, ods_status: &mut OdsStatus) -> Result<()> {
 fn attempt(ctx: &mut InitSetupCtx<'_, '_, '_, '_>) -> Result<()> {
     // Use the already-computed flag rather than re-reading the boot env.
     // A redundant get_env call here could brick on a transient error
-    // (Bootloader → Fatal) while compute_first_boot already rode through it.
+    // (Bootloader → Fatal) where detect_first_boot already counted it as no first boot.
     let first_boot = ctx.ods_status.first_boot;
     match ctx.boot_env.available_mut() {
         Some(_) => {
