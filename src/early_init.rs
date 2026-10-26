@@ -23,33 +23,76 @@ mod mounts {
 
     pub const RUN_PATH: &str = "/run";
     pub const RUN_FSTYPE: &str = "tmpfs";
+    pub const RUN_DATA: &str = "mode=0755";
 }
+
+/// /run moves into the final root, and systemd keeps an existing /run as it is.
+const RUN_FLAGS: MsFlags = MsFlags::MS_NOSUID
+    .union(MsFlags::MS_NODEV)
+    .union(MsFlags::MS_STRICTATIME);
 
 /// Mounts essential filesystems required before any other initialization.
 ///
 /// Must be called as early as possible, before logging or device access.
 /// Order matters: /dev must be first (needed for /dev/kmsg logging).
 pub fn mount_essential_filesystems() -> Result<()> {
-    do_mount(mounts::DEV_FSTYPE, mounts::DEV_PATH, mounts::DEV_FSTYPE)?;
-    do_mount(mounts::PROC_FSTYPE, mounts::PROC_PATH, mounts::PROC_FSTYPE)?;
-    do_mount(mounts::SYS_FSTYPE, mounts::SYS_PATH, mounts::SYS_FSTYPE)?;
-    do_mount(mounts::RUN_FSTYPE, mounts::RUN_PATH, mounts::RUN_FSTYPE)?;
+    let none = MsFlags::empty();
+    do_mount(
+        mounts::DEV_FSTYPE,
+        mounts::DEV_PATH,
+        mounts::DEV_FSTYPE,
+        none,
+        None,
+    )?;
+    do_mount(
+        mounts::PROC_FSTYPE,
+        mounts::PROC_PATH,
+        mounts::PROC_FSTYPE,
+        none,
+        None,
+    )?;
+    do_mount(
+        mounts::SYS_FSTYPE,
+        mounts::SYS_PATH,
+        mounts::SYS_FSTYPE,
+        none,
+        None,
+    )?;
+    do_mount(
+        mounts::RUN_FSTYPE,
+        mounts::RUN_PATH,
+        mounts::RUN_FSTYPE,
+        RUN_FLAGS,
+        Some(mounts::RUN_DATA),
+    )?;
 
     disable_printk_ratelimit();
 
     Ok(())
 }
 
-fn do_mount(source: &str, target: &str, fstype: &str) -> Result<()> {
-    mount(
-        Some(source),
-        target,
-        Some(fstype),
-        MsFlags::empty(),
-        None::<&str>,
-    )
-    .map_err(|e| EarlyInitError::MountFailed {
-        target: target.to_string(),
-        reason: e.to_string(),
+fn do_mount(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    flags: MsFlags,
+    data: Option<&str>,
+) -> Result<()> {
+    mount(Some(source), target, Some(fstype), flags, data).map_err(|e| {
+        EarlyInitError::MountFailed {
+            target: target.to_string(),
+            reason: e.to_string(),
+        }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_is_mounted_without_suid_and_devices() {
+        assert!(RUN_FLAGS.contains(MsFlags::MS_NOSUID | MsFlags::MS_NODEV));
+        assert_eq!(mounts::RUN_DATA, "mode=0755");
+    }
 }
