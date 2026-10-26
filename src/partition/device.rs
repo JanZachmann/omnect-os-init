@@ -67,11 +67,15 @@ pub fn detect_root_device(cmdline: &CmdlineConfig) -> Result<RootDevice> {
             ))
         })?;
 
-        let fsuuid = cmdline.get("bootpart_fsuuid").ok_or_else(|| {
-            PartitionError::DeviceDetection(
-                "rootpart= present but bootpart_fsuuid= missing from cmdline".into(),
-            )
-        })?;
+        // GRUB passes an empty value when `probe` failed.
+        let fsuuid = cmdline
+            .get("bootpart_fsuuid")
+            .filter(|uuid| !uuid.is_empty())
+            .ok_or_else(|| {
+                PartitionError::DeviceDetection(
+                    "rootpart= present but bootpart_fsuuid= missing or empty on cmdline".into(),
+                )
+            })?;
 
         return device_from_fsuuid(fsuuid, part_num);
     }
@@ -100,8 +104,8 @@ pub fn detect_root_device(cmdline: &CmdlineConfig) -> Result<RootDevice> {
 
 /// Resolves the boot disk via the filesystem UUID of the boot partition (`bootpart_fsuuid=`).
 ///
-/// GRUB runs `probe --fs-uuid` on `${root}` (the boot partition) and passes the result
-/// on the kernel cmdline. `blkid` is retried in a loop until the UUID is found or the
+/// GRUB runs `probe --fs-uuid` on the boot partition of the disk it was loaded
+/// from and passes the result on the kernel cmdline. `blkid` is retried in a loop until the UUID is found or the
 /// timeout expires — block devices may not be ready immediately at initramfs startup.
 #[cfg(feature = "grub")]
 fn device_from_fsuuid(fsuuid: &str, part_num: u32) -> Result<RootDevice> {
@@ -497,6 +501,17 @@ mod tests {
         assert!(
             msg.contains("bootpart_fsuuid"),
             "error should mention 'bootpart_fsuuid', got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "grub")]
+    #[test]
+    fn test_detect_root_device_grub_empty_fsuuid() {
+        let cfg = crate::config::CmdlineConfig::parse("rootpart=2 bootpart_fsuuid= ro quiet");
+        let msg = detect_root_device(&cfg).unwrap_err().to_string();
+        assert!(
+            msg.contains("missing or empty"),
+            "error should name the empty bootpart_fsuuid, got: {msg}"
         );
     }
 
