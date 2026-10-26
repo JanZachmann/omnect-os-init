@@ -447,7 +447,7 @@ read it.
 
 | Key              | Present when                                   | Content |
 | ---------------- | ---------------------------------------------- | ------- |
-| `first_boot`     | always                                         | `true` while the first-boot marker in the bootloader environment is not set: after flashing, and on later boots while the data resize or the [extra boot arguments](#extra-boot-arguments) sync fails. `false` on the first boot after an update (while the update is being validated, or after a bootloader update); that boot sets the marker, so the first-boot steps do not run again, also when they had failed. `false` without a readable bootloader environment |
+| `first_boot`     | always                                         | `true` while the first-boot marker in the bootloader environment is not set: after flashing, and on later boots while the data resize or the [extra boot arguments](#extra-boot-arguments) sync fails. `false` on a boot after an update: while the update is being validated, after a rollback, or after a bootloader update. That boot sets the marker before it clears the update flags, so the first-boot steps do not run again, also when they had failed. `false` without a readable bootloader environment |
 | `fsck`           | a [filesystem check](#filesystem-check) was not clean | one object per partition: `code` (the fsck exit code; for `boot` the fsck.fat code), `output` |
 | `factory_reset`  | a factory reset was requested                  | see [factory reset result](#factory-reset-result) |
 | `degraded_boot`  | a release image booted without a usable bootloader environment | `reason` |

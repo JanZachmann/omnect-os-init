@@ -10,7 +10,7 @@ use std::path::Path;
 use nix::unistd::{Gid, Uid, chown};
 use serde::Serialize;
 
-use crate::bootloader::{BootEnv, BootEnvKey};
+use crate::bootloader::{BootEnv, BootEnvKey, FIRST_BOOT_DONE};
 use crate::error::{InitramfsError, Result};
 use crate::filesystem::FsckExitCode;
 use crate::partition::PartitionName;
@@ -367,12 +367,36 @@ fn write_trigger_file(
     set_mode(&path, mode)
 }
 
+/// Write the first-boot marker unless it is set; `true` if it is set afterwards.
+///
+/// A read error counts as not set: writing the marker again is harmless.
+fn ensure_first_boot_marker(bootloader: &mut dyn BootEnv) -> bool {
+    if let Ok(Some(v)) = bootloader.get_env(BootEnvKey::FirstBootDone)
+        && v == FIRST_BOOT_DONE
+    {
+        return true;
+    }
+    match bootloader.set_env(BootEnvKey::FirstBootDone, Some(FIRST_BOOT_DONE)) {
+        Ok(()) => {
+            log::info!("first-boot marker set on a boot after an update");
+            true
+        }
+        Err(e) => {
+            log::warn!("first-boot marker write failed: {e}; update flags not cleared");
+            false
+        }
+    }
+}
+
 /// Handle update validation workflow; applies ownership and permissions to any
 /// trigger files it creates.
 ///
 /// `omnect_validate_update_failed` and `omnect_bootloader_updated` are cleared
 /// once their trigger file exists. No other component resets them, so without
 /// this the file would reappear on every later boot.
+///
+/// A boot after an update first sets the first-boot marker. The flags stay set
+/// until it is written, so the next boot is not taken for a first boot.
 fn handle_update_validation(
     ods_dir: &Path,
     bootloader: &mut dyn BootEnv,
@@ -388,6 +412,10 @@ fn handle_update_validation(
     if validate_update && validate_update_failed {
         return Err(InitramfsError::ConflictingUpdateFlags);
     }
+
+    let bootloader_updated = read_flag(bootloader, BootEnvKey::BootloaderUpdated)?;
+    let marker_set = !(validate_update || validate_update_failed || bootloader_updated)
+        || ensure_first_boot_marker(bootloader);
 
     if validate_update {
         write_trigger_file(
@@ -408,11 +436,13 @@ fn handle_update_validation(
             uid,
             gid,
         )?;
-        clear_flag(bootloader, BootEnvKey::ValidateUpdateFailed);
+        if marker_set {
+            clear_flag(bootloader, BootEnvKey::ValidateUpdateFailed);
+        }
         log::warn!("Update validation failed marker created");
     }
 
-    if read_flag(bootloader, BootEnvKey::BootloaderUpdated)? {
+    if bootloader_updated {
         write_trigger_file(
             ods_dir,
             BOOTLOADER_UPDATED_FILE,
@@ -420,7 +450,9 @@ fn handle_update_validation(
             uid,
             gid,
         )?;
-        clear_flag(bootloader, BootEnvKey::BootloaderUpdated);
+        if marker_set {
+            clear_flag(bootloader, BootEnvKey::BootloaderUpdated);
+        }
         log::info!("BootEnv update marker created");
     }
 
@@ -777,6 +809,10 @@ mod tests {
             None,
             "marker would reappear on every later boot if the flag stays set"
         );
+        assert_eq!(
+            bl.get_env(BootEnvKey::FirstBootDone).unwrap().as_deref(),
+            Some(FIRST_BOOT_DONE)
+        );
     }
 
     #[test]
@@ -811,6 +847,70 @@ mod tests {
             None,
             "marker would reappear on every later boot if the flag stays set"
         );
+        assert_eq!(
+            bl.get_env(BootEnvKey::FirstBootDone).unwrap().as_deref(),
+            Some(FIRST_BOOT_DONE)
+        );
+    }
+
+    #[test]
+    fn test_handle_update_validation_sets_marker_on_validation_boot() {
+        let temp = TempDir::new().unwrap();
+        let mut bl =
+            crate::bootloader::create_mock_bootloader().with_env(BootEnvKey::ValidateUpdate, "1");
+
+        handle_update_validation(temp.path(), &mut bl, current_uid(), current_gid()).unwrap();
+
+        assert_eq!(
+            bl.get_env(BootEnvKey::FirstBootDone).unwrap().as_deref(),
+            Some(FIRST_BOOT_DONE)
+        );
+    }
+
+    #[test]
+    fn test_handle_update_validation_marker_set_writes_only_the_clear() {
+        let temp = TempDir::new().unwrap();
+        let mut bl = crate::bootloader::create_mock_bootloader()
+            .with_env(BootEnvKey::FirstBootDone, FIRST_BOOT_DONE)
+            .with_env(BootEnvKey::BootloaderUpdated, "1");
+        let calls = bl.shared_set_env_calls();
+
+        handle_update_validation(temp.path(), &mut bl, current_uid(), current_gid()).unwrap();
+
+        assert_eq!(*calls.lock().unwrap(), [BootEnvKey::BootloaderUpdated]);
+    }
+
+    #[test]
+    fn test_handle_update_validation_no_flag_writes_nothing() {
+        let temp = TempDir::new().unwrap();
+        let mut bl = crate::bootloader::create_mock_bootloader();
+        let calls = bl.shared_set_env_calls();
+
+        handle_update_validation(temp.path(), &mut bl, current_uid(), current_gid()).unwrap();
+
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_handle_update_validation_failed_marker_write_keeps_flags() {
+        for key in [
+            BootEnvKey::ValidateUpdateFailed,
+            BootEnvKey::BootloaderUpdated,
+        ] {
+            let temp = TempDir::new().unwrap();
+            let mut bl = crate::bootloader::create_mock_bootloader()
+                .with_env(key, "1")
+                .with_set_env_error();
+
+            handle_update_validation(temp.path(), &mut bl, current_uid(), current_gid()).unwrap();
+
+            assert_eq!(
+                bl.get_env(key).unwrap().as_deref(),
+                Some("1"),
+                "{} must stay set so the next boot is no first boot",
+                key.as_str()
+            );
+        }
     }
 
     #[test]

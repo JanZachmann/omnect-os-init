@@ -25,6 +25,14 @@ pub type Result<T> = std::result::Result<T, BootEnvError>;
 /// Value of `omnect_first_boot_done`, shared by its writer and its reader.
 pub const FIRST_BOOT_DONE: &str = "1";
 
+/// Flags an update leaves for the boots after it: the validation boot, the
+/// rollback boot, and the boot after a bootloader update, which is not validated.
+pub const UPDATE_FLAGS: [BootEnvKey; 3] = [
+    BootEnvKey::ValidateUpdate,
+    BootEnvKey::ValidateUpdateFailed,
+    BootEnvKey::BootloaderUpdated,
+];
+
 /// Upper bound (bytes) on the failure reason stored via `save_factory_reset_failure`.
 /// The bootloader env block is small and shared by all variables, so keep it short.
 #[cfg(feature = "factory-reset")]
@@ -79,8 +87,8 @@ pub enum BootEnvKey {
     /// `omnect_fsck_<partition>` — fsck result for the given partition.
     FsckStatus(PartitionName),
     /// `omnect_first_boot_done` — set to `"1"` after the first successful
-    /// `run_init`, and on a boot after an update. Read by the first-boot
-    /// detection in `run_init`.
+    /// `run_init`, and on a boot after an update before its update flags are
+    /// cleared. Read by the first-boot detection in `run_init`.
     FirstBootDone,
     /// `omnect_extra_bootargs` — extra kernel cmdline arguments the bootloader
     /// appends. Synced from the boot-partition files by the extra-bootargs
