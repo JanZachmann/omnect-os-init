@@ -29,13 +29,13 @@ fn extra_bootargs_applied_ok(ods_status: &crate::runtime::OdsStatus) -> bool {
     ods_status.extra_bootargs.is_none()
 }
 
-fn write_first_boot_marker(first_boot: bool, bootloader: &mut crate::bootloader::BootEnvState) {
+pub(crate) fn write_first_boot_marker(
+    first_boot: bool,
+    bootloader: &mut crate::bootloader::BootEnvState,
+) {
     if first_boot
         && let Some(bl) = bootloader.available_mut()
-        && let Err(e) = bl.set_env(
-            crate::bootloader::BootEnvKey::FirstBootDone,
-            Some(crate::bootloader::FIRST_BOOT_DONE),
-        )
+        && let Err(e) = bl.set_first_boot_done()
     {
         log::warn!("first-boot marker write failed: {e}; will retry next boot");
     }
@@ -80,10 +80,6 @@ pub fn run(ctx: BootContext<'_>) -> Result<()> {
         Path::new(ODS_RUNTIME_DIR),
     )?;
 
-    // Best-effort: failure is logged and does not abort the boot — the next
-    // boot retries.
-    // Suppress the write when resize or the extra-bootargs sync failed, so the
-    // next boot retries them.
     write_first_boot_marker(
         ods_status.first_boot
             && resize_succeeded(&ods_status)

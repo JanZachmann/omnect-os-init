@@ -79,7 +79,7 @@ pub fn run(ctx: &mut InitSetupCtx<'_, '_, '_, '_>) -> Result<()> {
         }
     };
 
-    // `first_boot == true` implies the env is available (`compute_first_boot`
+    // `first_boot == true` implies the env is available (`detect_first_boot`
     // returns false on a degraded env), so this None arm cannot occur in
     // production. Kept as a defensive no-op rather than an unwrap.
     let bl = match ctx.boot_env.available_mut() {
