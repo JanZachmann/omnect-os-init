@@ -701,6 +701,74 @@ mod tests {
         }
     }
 
+    /// The files in `tests/contract` are the factory reset results that
+    /// omnect-device-service must parse; it keeps a copy for its own tests.
+    #[test]
+    fn factory_reset_status_matches_the_contract_files() {
+        use FactoryResetStatusCode::*;
+        let cases = [
+            ("success", Success, None, None, &["/etc/hostname"][..], true),
+            (
+                "invalid",
+                Invalid,
+                Some("unknown factory reset mode 7"),
+                None,
+                &[][..],
+                false,
+            ),
+            (
+                "error-before-wipe",
+                Error,
+                Some("backup of /etc/hostname failed"),
+                None,
+                &[][..],
+                false,
+            ),
+            (
+                "error-after-wipe",
+                Error,
+                Some("mkfs.ext4 failed for data"),
+                Some("data:reformat"),
+                &[][..],
+                true,
+            ),
+            (
+                "config-error",
+                ConfigError,
+                Some("unknown preserve topic foo"),
+                None,
+                &[][..],
+                false,
+            ),
+            (
+                "warning",
+                Warning,
+                Some("restore of /etc/hostname failed"),
+                Some("etc/hostname:restore"),
+                &["/etc/hostname"][..],
+                true,
+            ),
+        ];
+
+        for (name, status, error, context, paths, data_wiped) in cases {
+            let mut ods = OdsStatus::new();
+            ods.set_factory_reset(FactoryResetStatus {
+                status,
+                error: error.map(str::to_string),
+                context: context.map(str::to_string),
+                paths: paths.iter().map(|p| p.to_string()).collect(),
+                data_wiped,
+            });
+            let file = format!(
+                "{}/tests/contract/status-factory-reset-{name}.json",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let expected: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+            assert_eq!(serde_json::to_value(&ods).unwrap(), expected, "{file}");
+        }
+    }
+
     #[test]
     fn factory_reset_data_wiped_always_serialized() {
         // Absence of the key would itself be a bug (mirrors first_boot_always_serialized) —
