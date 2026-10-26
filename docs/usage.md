@@ -13,7 +13,7 @@ settings:
 | `DISTRO_FEATURES` `flash-mode-3`             | [flash mode 3](#flash-mode-3)                    |
 | `MACHINE_FEATURES` `rtc`                     | TLS certificate check in flash mode 3            |
 | `DISTRO_FEATURES` `resize-data`              | data partition resize on the first boot          |
-| `DISTRO_FEATURES` `persistent-var-log`       | `/var/log` on the data partition                 |
+| `DISTRO_FEATURES` `persistent-var-log`       | `/var/log` on the data partition, see [boot sequence](#boot-sequence) |
 | `MACHINE_FEATURES` `efi`                     | GRUB; without it U-Boot                          |
 | `OMNECT_RELEASE_IMAGE = "1"`                 | release image [error handling](#error-handling)  |
 | i.MX8MM machines                             | [early module load](#early-module-load)          |
@@ -30,17 +30,37 @@ On every boot the init:
 2. reads the bootloader environment and selects the boot mode: a flash mode, a
    factory reset, or a normal boot;
 3. checks and mounts the `factory`, `cert`, `etc` and `data` partitions, sets
-   up the overlays for `/etc` and `/home`, and creates the
-   [status file](#status-file) for `omnect-device-service`;
+   up the overlays for `/etc` and `/home`, creates the [symlinks](#symlinks),
+   and creates the [status file](#status-file) for `omnect-device-service`;
 4. hands over to systemd with `switch_root`.
 
 A flash mode replaces steps 3 and 4. Mode 1 ends with a power off, modes 2 and
 3 with a reboot.
 
+With `persistent-var-log`, `/var/log` is `/mnt/data/var/log`. On the first
+boot after an update from an older initramfs, the init moves the logs from
+`/mnt/data/log` there.
+
 With GRUB, the init finds its disk by the volume ID of the boot partition.
 Every disk written from the same image has the same volume ID. Do not attach
 two such disks at the same time: the init can then mount the partitions of the
 other disk.
+
+## Symlinks
+
+On every normal boot the init creates the symlinks listed in
+`/etc/omnect/fs-link.json` and in the `*.json` files of
+`/etc/omnect/fs-link.d/`:
+
+```json
+{ "links": [ { "target": "/mnt/data/app", "link": "opt/app" } ] }
+```
+
+`link` is relative to `/`. The init also reads `/etc/omnect/create-fs-links.txt`
+with one `<target> <link>` pair per line, where `link` may be absolute and a
+line starting with `#` is a comment. It deletes this file after the links are
+created, so its links are created only once. An existing file or link at
+`link` is replaced; a directory there is an error.
 
 ## Error handling
 
@@ -78,7 +98,9 @@ When the bootloader environment cannot be read, `flash-mode` and
 
 On a GRUB image (EFI machines) every flash mode deletes all EFI boot entries,
 adds one entry `omnect_os` for the written disk, and writes the output of
-`efibootmgr -v` to `EFI/BOOT/efibootmgr_entry` on the written disk.
+`efibootmgr -v` to `EFI/BOOT/efibootmgr_entry` on the written disk. If this
+fails, the flash mode ends with a fatal error (see
+[error handling](#error-handling)), although the disk is already written.
 
 Each run writes a log file `flash-mode-<n>.log` to the data partition. After a
 normal boot it is found at `/mnt/data/flash-mode-<n>.log`.

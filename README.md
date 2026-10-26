@@ -20,7 +20,7 @@ Implemented functionality:
 - **Filesystem operations**: fsck, mount manager, overlayfs for `/etc` and `/home`, bind mounts
 - **Logging**: kernel ring buffer (`/dev/kmsg`) with log level prefixes
 - **ODS integration**: status file and update validation files for `omnect-device-service`
-- **fs-links**: symlinks from `etc/omnect/fs-link.json` and `etc/omnect/fs-link.d/`
+- **fs-links**: symlinks from `etc/omnect/fs-link.json`, `etc/omnect/fs-link.d/` and the one-time list `etc/omnect/create-fs-links.txt`
 - **switch\_root**: MS_MOVE + chroot + exec systemd
 - [**Factory reset (modes 1-3)**](docs/usage.md#factory-reset) (feature `factory-reset`)
 - [**Flash modes 1-3**](docs/usage.md#flash-modes) (features `flash-mode-1`, `flash-mode-2`, `flash-mode-3`)
@@ -353,6 +353,10 @@ cargo test --features grub,gpt,resize-data,test-utils
 cargo test --features grub,dos,resize-data,test-utils
 cargo test --features uboot,gpt,resize-data,test-utils
 cargo test --features uboot,dos,resize-data,test-utils
+
+# With persistent-var-log feature
+cargo test --features grub,gpt,persistent-var-log,test-utils
+cargo test --features uboot,dos,persistent-var-log,factory-reset,test-utils
 
 # With early-modules feature
 cargo test --features grub,gpt,early-modules,test-utils
