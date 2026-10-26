@@ -131,7 +131,6 @@ mod tests {
             boot_env: &mut env,
             ods_status: &mut ods,
             rootfs: Path::new("/rootfs"),
-            update_pending: false,
         };
         assert!(run(&mut ctx).is_ok());
         assert!(
@@ -155,7 +154,6 @@ mod tests {
             boot_env: &mut env,
             ods_status: &mut ods,
             rootfs: Path::new("/rootfs"),
-            update_pending: false,
         };
         let result = run(&mut ctx);
         assert!(
@@ -186,7 +184,6 @@ mod tests {
             boot_env: &mut env,
             ods_status: &mut ods,
             rootfs: Path::new("/rootfs"),
-            update_pending: false,
         };
         assert!(run(&mut ctx).is_ok());
     }
@@ -208,7 +205,6 @@ mod tests {
             boot_env: &mut env,
             ods_status: &mut ods,
             rootfs: Path::new("/rootfs"),
-            update_pending: false,
         };
         // With a data partition present and no real tooling, resize_if_needed
         // will fail. The absorb logic turns the error into Ok + indicator.

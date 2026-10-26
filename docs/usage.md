@@ -440,7 +440,7 @@ read it.
 
 | Key              | Present when                                   | Content |
 | ---------------- | ---------------------------------------------- | ------- |
-| `first_boot`     | always                                         | `true` while the first-boot marker in the bootloader environment is not set: after flashing, and on later boots while the data resize or the [extra boot arguments](#extra-boot-arguments) sync fails. `false` without a readable bootloader environment |
+| `first_boot`     | always                                         | `true` while the first-boot marker in the bootloader environment is not set: after flashing, and on later boots while the data resize or the [extra boot arguments](#extra-boot-arguments) sync fails. `false` on the first boot after an update (validated, or with a bootloader update); that boot sets the marker, so the first-boot steps do not run again, also when they had failed. `false` without a readable bootloader environment |
 | `fsck`           | a [filesystem check](#filesystem-check) was not clean | one object per partition: `code` (fsck exit code), `output` |
 | `factory_reset`  | a factory reset was requested                  | see [factory reset result](#factory-reset-result) |
 | `degraded_boot`  | a release image booted without a usable bootloader environment | `reason` |
@@ -454,7 +454,7 @@ On the first boot after flashing, the init reads the files
 partition and stores them in the bootloader environment variable
 `omnect_extra_bootargs`.
 If the value changed, the system reboots once so the bootloader uses it. This
-does not run while an update is being validated.
+does not run on the first boot after an update.
 
 ## Early module load
 

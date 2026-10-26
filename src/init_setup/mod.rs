@@ -19,8 +19,6 @@ pub struct InitSetupCtx<'l, 'b, 's, 'r> {
     pub boot_env: &'b mut BootEnvState,
     pub ods_status: &'s mut OdsStatus,
     pub rootfs: &'r Path,
-    /// OTA update in flight (`omnect_validate_update` set).
-    pub update_pending: bool,
 }
 
 /// Run all enabled init setup steps in order.

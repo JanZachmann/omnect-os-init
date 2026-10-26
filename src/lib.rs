@@ -96,6 +96,31 @@ fn compute_first_boot(env: &bootloader::BootEnvState) -> bool {
     }
 }
 
+/// Compute the first-boot flag; on a boot after an update also write the marker.
+///
+/// A boot after an update is never a first boot: the device ran before, maybe
+/// with an init that did not write the marker. Writing it here keeps the next
+/// boot from being taken for a first boot. An update either is validated, or
+/// it updated the bootloader too, which skips the validation.
+fn detect_first_boot(env: &mut bootloader::BootEnvState, update_pending: bool) -> bool {
+    if !compute_first_boot(env) {
+        return false;
+    }
+    let bootloader_updated = env.available().is_some_and(|bl| {
+        bl.is_flag_set(bootloader::BootEnvKey::BootloaderUpdated)
+            .unwrap_or_else(|e| {
+                warn!("reading omnect_bootloader_updated failed; treating as not set: {e}");
+                false
+            })
+    });
+    if update_pending || bootloader_updated {
+        info!("first-boot marker missing on a boot after an update; setting it");
+        mode::normal::write_first_boot_marker(true, env);
+        return false;
+    }
+    true
+}
+
 /// Apply a boot env decision, enforcing the FsckRequiresReboot-wins invariant.
 ///
 /// Persists fsck results to the bootloader environment *before* propagating
@@ -167,15 +192,15 @@ pub fn run_init() -> Result<()> {
     let mut bootloader_env =
         apply_boot_env_decision(decision, core_result, &mut ods_status, rootfs)?;
 
-    ods_status.first_boot = compute_first_boot(&bootloader_env);
-    if ods_status.first_boot {
-        info!("first-boot detected (omnect_first_boot_done not set to the marker value)");
-    }
-
     // Read omnect_validate_update once, before any subsequent fallible step.
     // Stored in a process-global so handle_fatal_error in main.rs can branch
     // on it without threading the value through every return type.
     set_update_pending(update_pending_from_env(&bootloader_env));
+
+    ods_status.first_boot = detect_first_boot(&mut bootloader_env, read_update_pending());
+    if ods_status.first_boot {
+        info!("first-boot detected (omnect_first_boot_done not set to the marker value)");
+    }
 
     // Detected once: a second read would log the detection warnings again and
     // could see a different answer than the one that is dispatched below.
@@ -196,7 +221,6 @@ pub fn run_init() -> Result<()> {
             boot_env: &mut bootloader_env,
             ods_status: &mut ods_status,
             rootfs,
-            update_pending: read_update_pending(),
         };
         init_setup::run(ctx)?;
 
@@ -464,6 +488,44 @@ mod first_boot_detection_tests {
         let mock = MockBootEnv::new().with_env(BootEnvKey::FirstBootDone, "yes");
         let env: BootEnvState = BootEnvState::Available(Box::new(mock));
         assert!(compute_first_boot(&env));
+    }
+
+    fn marker(env: &BootEnvState) -> Option<String> {
+        env.available()
+            .unwrap()
+            .get_env(BootEnvKey::FirstBootDone)
+            .unwrap()
+    }
+
+    #[test]
+    fn detect_first_boot_without_update_keeps_marker_unset() {
+        let mut env = BootEnvState::Available(Box::new(MockBootEnv::new()));
+        assert!(detect_first_boot(&mut env, false));
+        assert_eq!(marker(&env), None);
+    }
+
+    #[test]
+    fn validation_boot_is_no_first_boot_and_sets_marker() {
+        let mut env = BootEnvState::Available(Box::new(MockBootEnv::new()));
+        assert!(!detect_first_boot(&mut env, true));
+        assert_eq!(marker(&env).as_deref(), Some(bootloader::FIRST_BOOT_DONE));
+    }
+
+    #[test]
+    fn bootloader_update_boot_is_no_first_boot_and_sets_marker() {
+        let mock = MockBootEnv::new().with_env(BootEnvKey::BootloaderUpdated, "1");
+        let mut env = BootEnvState::Available(Box::new(mock));
+        assert!(!detect_first_boot(&mut env, false));
+        assert_eq!(marker(&env).as_deref(), Some(bootloader::FIRST_BOOT_DONE));
+    }
+
+    #[test]
+    fn detect_first_boot_on_degraded_env_is_false() {
+        let mut env = BootEnvState::Degraded(BootEnvError::CommandFailed {
+            command: "boot-env-tool".into(),
+            reason: "test".into(),
+        });
+        assert!(!detect_first_boot(&mut env, true));
     }
 
     #[test]

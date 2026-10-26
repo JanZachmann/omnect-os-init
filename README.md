@@ -61,7 +61,7 @@ flowchart TD
 
     APPLY -->|FsckRequiresReboot| FEB
     APPLY -->|Fatal| FEB
-    APPLY -->|"OK\nDegraded: ods.degraded_boot=true"| FBDETECT["compute_first_boot()\nset_update_pending()"]
+    APPLY -->|"OK\nDegraded: ods.degraded_boot=true"| FBDETECT["set_update_pending()\ndetect_first_boot()\nsets the marker on a boot after an update"]
 
     FBDETECT --> BMODE{"BootMode::detect()"}
     BMODE -->|"Fatal: flash mode 1 and factory reset\nboth queued (both cleared)"| FEB

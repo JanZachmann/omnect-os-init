@@ -19,14 +19,6 @@ const BOOTARGS_OMNECT_FILE: &str = "omnect_extra_bootargs_omnect";
 /// Boot-partition file for user-managed extra boot arguments.
 const BOOTARGS_CUSTOM_FILE: &str = "omnect_extra_bootargs_custom";
 
-/// Gate: the sync runs only on the fresh-flash boot and never during an OTA
-/// validation boot. `first_boot` alone already excludes OTA on devices that
-/// already ran the Rust init; `update_pending` covers the legacy-migration
-/// validation boot, where the marker is still absent.
-fn should_sync(first_boot: bool, update_pending: bool) -> bool {
-    first_boot && !update_pending
-}
-
 /// Build the combined bootargs value from the two boot-partition files: the
 /// distro file plus the optional custom file. Whitespace runs are squeezed to
 /// single spaces to normalize irregular whitespace in hand-edited files, so the
@@ -68,8 +60,8 @@ fn read_bootargs_file(path: &Path) -> std::io::Result<Option<String>> {
 /// path returns `Ok(())`: the step is best-effort and never blocks boot. ODS
 /// status is set only on failure (`None` otherwise).
 pub fn run(ctx: &mut InitSetupCtx<'_, '_, '_, '_>) -> Result<()> {
-    if !should_sync(ctx.ods_status.first_boot, ctx.update_pending) {
-        log::debug!("extra-bootargs: skipping (not first boot or update pending)");
+    if !ctx.ods_status.first_boot {
+        log::debug!("extra-bootargs: skipping (not first boot)");
         return Ok(());
     }
 
@@ -192,7 +184,6 @@ mod tests {
         ods: &'s mut OdsStatus,
         rootfs: &'r Path,
         first_boot: bool,
-        update_pending: bool,
     ) -> InitSetupCtx<'l, 'b, 's, 'r> {
         ods.first_boot = first_boot;
         InitSetupCtx {
@@ -200,7 +191,6 @@ mod tests {
             boot_env: env,
             ods_status: ods,
             rootfs,
-            update_pending,
         }
     }
 
@@ -253,16 +243,6 @@ mod tests {
         );
     }
 
-    // ---- should_sync ---------------------------------------------------
-
-    #[test]
-    fn should_sync_only_on_first_boot_without_update() {
-        assert!(should_sync(true, false));
-        assert!(!should_sync(false, false));
-        assert!(!should_sync(true, true));
-        assert!(!should_sync(false, true));
-    }
-
     // ---- run() ---------------------------------------------------------
 
     #[test]
@@ -276,27 +256,11 @@ mod tests {
         let mock = MockBootEnv::new();
         let mut env = BootEnvState::Available(Box::new(mock));
         let mut ods = OdsStatus::new();
-        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), false, false);
+        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), false);
         assert!(run(&mut ctx).is_ok());
         assert!(ctx.ods_status.extra_bootargs.is_none());
         let bl = ctx.boot_env.available_mut().unwrap();
         assert_eq!(bl.get_env(BootEnvKey::ExtraBootArgs).unwrap(), None);
-    }
-
-    #[test]
-    fn skips_when_update_pending() {
-        let tmp = TempDir::new().unwrap();
-        let boot_dir = tmp.path().join("boot");
-        std::fs::create_dir_all(&boot_dir).unwrap();
-        write_file(&boot_dir, BOOTARGS_OMNECT_FILE, "quiet");
-
-        let layout = empty_layout();
-        let mock = MockBootEnv::new();
-        let mut env = BootEnvState::Available(Box::new(mock));
-        let mut ods = OdsStatus::new();
-        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true, true);
-        assert!(run(&mut ctx).is_ok());
-        assert!(ctx.ods_status.extra_bootargs.is_none());
     }
 
     #[test]
@@ -310,7 +274,7 @@ mod tests {
         let mock = MockBootEnv::new().with_env(BootEnvKey::ExtraBootArgs, "quiet loglevel=3");
         let mut env = BootEnvState::Available(Box::new(mock));
         let mut ods = OdsStatus::new();
-        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true, false);
+        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true);
         assert!(run(&mut ctx).is_ok());
         assert!(
             ctx.ods_status.extra_bootargs.is_none(),
@@ -329,7 +293,7 @@ mod tests {
         let mock = MockBootEnv::new();
         let mut env = BootEnvState::Available(Box::new(mock));
         let mut ods = OdsStatus::new();
-        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true, false);
+        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true);
         let result = run(&mut ctx);
         assert!(matches!(result, Err(InitramfsError::ExtraBootArgsUpdated)));
         assert!(
@@ -354,7 +318,7 @@ mod tests {
         let mock = MockBootEnv::new().with_set_env_normalize("mangled");
         let mut env = BootEnvState::Available(Box::new(mock));
         let mut ods = OdsStatus::new();
-        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true, false);
+        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true);
         let result = run(&mut ctx);
         assert!(
             result.is_ok(),
@@ -379,7 +343,7 @@ mod tests {
         let mock = MockBootEnv::new().with_env(BootEnvKey::ExtraBootArgs, "quiet loglevel=3");
         let mut env = BootEnvState::Available(Box::new(mock));
         let mut ods = OdsStatus::new();
-        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true, false);
+        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true);
         let result = run(&mut ctx);
         assert!(result.is_ok(), "read error must not request a reboot");
         assert_eq!(
@@ -419,7 +383,7 @@ mod tests {
         let mock = MockBootEnv::new().with_get_env_error();
         let mut env = BootEnvState::Available(Box::new(mock));
         let mut ods = OdsStatus::new();
-        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true, false);
+        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true);
         let result = run(&mut ctx);
         assert!(result.is_ok(), "get_env failure must not block boot");
         assert_eq!(
@@ -439,7 +403,7 @@ mod tests {
         let mock = MockBootEnv::new();
         let mut env = BootEnvState::Available(Box::new(mock));
         let mut ods = OdsStatus::new();
-        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true, false);
+        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true);
         let result = run(&mut ctx);
         assert!(
             result.is_ok(),
@@ -461,7 +425,7 @@ mod tests {
         let mock = MockBootEnv::new().with_env(BootEnvKey::ExtraBootArgs, "stale=1");
         let mut env = BootEnvState::Available(Box::new(mock));
         let mut ods = OdsStatus::new();
-        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true, false);
+        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true);
         let result = run(&mut ctx);
         assert!(matches!(result, Err(InitramfsError::ExtraBootArgsUpdated)));
         let bl = ctx.boot_env.available_mut().unwrap();
@@ -479,7 +443,7 @@ mod tests {
         let mock = MockBootEnv::new().with_set_env_error();
         let mut env = BootEnvState::Available(Box::new(mock));
         let mut ods = OdsStatus::new();
-        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true, false);
+        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true);
         let result = run(&mut ctx);
         assert!(
             result.is_ok(),
@@ -503,7 +467,7 @@ mod tests {
         let mock = MockBootEnv::new().with_get_env_error_after(1);
         let mut env = BootEnvState::Available(Box::new(mock));
         let mut ods = OdsStatus::new();
-        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true, false);
+        let mut ctx = make_ctx(&layout, &mut env, &mut ods, tmp.path(), true);
         let result = run(&mut ctx);
         assert!(result.is_ok(), "read-back failure must not reboot");
         assert_eq!(
