@@ -48,6 +48,11 @@ before they propagate further. Below, "propagates" means the error reaches
 | uncorrected, not reboot-required (4, 5, 8, 9, …) | swallowed by lenient: mount + record | does not propagate |
 | tool failure / spawn error (UNKNOWN) | swallowed by lenient: mount + record | does not propagate |
 
+Note (2026-10-22): the reboot-required row applies to ext4 only. fsck.fat does
+not follow the fsck(8) bitmask: 2 is a usage error, 6 means the device could
+not be opened. On `boot` (vfat) every code other than 0 and 1 is handled like
+the uncorrected row.
+
 The `mount(2)` syscall remains the real gate for partitions that are too corrupt
 to be mounted at all — `MountFailed` is `Fatal`. `FsckFailed` is reachable as a
 propagated error only via a **strict** caller (`check_filesystem` directly). The

@@ -500,6 +500,8 @@ work tracked in §12 rather than part of the port.
 12. Assign fresh partition UUIDs to destination `boot` and `rootA`. The UUIDs
     live in the partition table, so assigning them after the image copy is
     equivalent and keeps them in one place.
+    GRUB only: give the destination boot partition a new vfat volume ID with
+    `fatlabel -i -r`.
 13. Write the default bootloader environment to the destination:
     - GRUB: mount the destination boot partition, copy
       `/etc/omnect/grubenv.in` to `EFI/BOOT/grubenv`, unmount;
@@ -918,16 +920,18 @@ points are parity with legacy, not regressions introduced by the port.
   its shipped size (§4.2). On GPT, `boot` and `rootA` additionally receive
   fresh per-partition UUIDs (§4.1 step 12); a DOS table has no per-partition
   UUID for `sfdisk` to refresh, so nothing is renewed there (§9 bug 3).
-- On both layouts the clone reproduces the source's vfat volume ID and ext4
-  superblock UUID: `boot` is copied as a raw byte range and the rootfs via
-  `e2image` (§4.1 steps 10, 11), and neither touches filesystem-level
-  identifiers.
+- On both layouts the clone reproduces the source's ext4 superblock UUID,
+  because the rootfs is copied with `e2image` (§4.1 step 11). `boot` is copied
+  as a raw byte range (§4.1 step 10), so on U-Boot it also keeps the vfat
+  volume ID.
 
-With both disks attached, GRUB's `bootpart_fsuuid` boot-partition lookup
-through `blkid` is therefore ambiguous — it matches by filesystem UUID, which
-both disks now share. Mode 1 powers off on success rather than rebooting
-(§10.4), which gives the operator a window to move the disk before either one
-is booted again.
+On GRUB, the init finds its disk with `blkid` by the volume ID of `boot`
+(`bootpart_fsuuid`), so step 12 gives the clone a new one (legacy kept the
+source's ID). Otherwise, with both disks attached, the lookup could return the
+source. Mode 1 powers off on success rather than rebooting (§10.4), which
+gives the operator a window to move the disk before either one is booted
+again. This still matters: on U-Boot the clone keeps the source's volume ID,
+and on GRUB the EFI entry names the destination (§6).
 
 Two further consequences, both legacy parity:
 

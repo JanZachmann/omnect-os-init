@@ -80,12 +80,9 @@ pub fn fsck_and_record(
 ///
 /// # Errors
 ///
-/// Returns `FilesystemError::FsckRequiresReboot` if the boot partition fsck
-/// determines a clean reboot is needed before the filesystem can be safely used.
-/// In that case `ods_status` already holds the fsck diagnostic (recorded by
-/// `fsck_and_record`). The caller must persist `ods_status` to the bootloader
-/// environment before propagating this error, or the diagnostic is lost on
-/// the subsequent reboot.
+/// Boot's fsck result is in `ods_status` before boot is mounted. On any error
+/// the caller must persist `ods_status` first, or the result is lost on the
+/// next boot.
 pub fn mount_core_partitions(
     layout: &PartitionLayout,
     rootfs: &Path,
@@ -297,7 +294,7 @@ fn write_fsck_log(
 /// - Stores the gzip+base64 encoded exit code and full output in the bootloader
 ///   environment (grubenv / uboot-env), so the record survives a reboot that
 ///   happens before the ODS status JSON is written. `drain_fsck_env` consumes it.
-///   Skipped when `boot_env` is `None` (degraded boot — env unavailable).
+///   Skipped with a warning when `bootloader` is `None` (env unavailable).
 /// - Writes the full output to `/data/var/log/fsck/<partition>.log` (written
 ///   to /rootfs/mnt/data/var/log/fsck/; visible as `/data/var/log/fsck/`
 ///   after switch_root) so ODS and operators can inspect it after boot.
@@ -307,10 +304,6 @@ pub fn persist_fsck_results(
     mut bootloader: Option<&mut dyn BootEnv>,
     rootfs_dir: &Path,
 ) {
-    // BootEnv save (grubenv or env file) is the primary persistence mechanism
-    // and works as long as the boot partition is mounted — which is true even on
-    // the FsckRequiresReboot path (boot is mounted before fsck runs).
-    //
     // The data partition log is best-effort: it is only mounted when
     // mount_remaining_partitions() succeeds fully, so it may not be available here.
     let log_dir = rootfs_dir
@@ -328,14 +321,19 @@ pub fn persist_fsck_results(
             continue;
         }
 
-        if let Some(bl) = &mut bootloader
-            && let Err(e) = bl.save_fsck_status(*partition, exit_code, &fsck.output)
-        {
-            log::warn!(
-                "Failed to save fsck status for {} to bootloader env: {}",
-                partition,
-                e
-            );
+        match &mut bootloader {
+            Some(bl) => {
+                if let Err(e) = bl.save_fsck_status(*partition, exit_code, &fsck.output) {
+                    log::warn!(
+                        "Failed to save fsck status for {} to bootloader env: {}",
+                        partition,
+                        e
+                    );
+                }
+            }
+            None => log::warn!(
+                "Bootloader env unavailable; fsck status for {partition} not saved to it"
+            ),
         }
 
         if !fsck.output.is_empty() {
@@ -636,9 +634,17 @@ mod tests {
         );
         let temp = TempDir::new().unwrap();
 
+        let _guard = crate::logging::capture::SERIALIZE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        crate::logging::capture::install_test_logger();
+        crate::logging::capture::start_capture();
         // Must not panic; no boot env write; no log dir (data not mounted).
         persist_fsck_results(&ods, None, temp.path());
+        let lines = crate::logging::capture::take_capture();
         assert!(!temp.path().join("mnt/data/var/log/fsck").exists());
+        let line = "[WARN] Bootloader env unavailable; fsck status for boot not saved to it";
+        assert!(lines.iter().any(|l| l == line), "{line:?} not in {lines:?}");
     }
 
     #[test]

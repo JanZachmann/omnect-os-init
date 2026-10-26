@@ -37,6 +37,11 @@ On every boot the init:
 A flash mode replaces steps 3 and 4. Mode 1 ends with a power off, modes 2 and
 3 with a reboot.
 
+With GRUB, the init finds its disk by the volume ID of the boot partition.
+Every disk written from the same image has the same volume ID. Do not attach
+two such disks at the same time: the init can then mount the partitions of the
+other disk.
+
 ## Error handling
 
 A fatal error ends the boot in the initramfs:
@@ -111,7 +116,9 @@ The clone starts like a newly flashed device:
 The running rootfs is copied to rootfs A of the clone. The `boot`, `factory`
 and `cert` partitions and the bootloader area are copied as they are. On a GPT
 disk the clone's boot partition and rootfs A get new partition UUIDs
-(PARTUUID).
+(PARTUUID). With GRUB, the clone's boot partition also gets a new volume ID.
+With GRUB, a failed run can leave the source's volume ID on the clone; erase
+that disk before you attach it next to the source again.
 
 Flash mode 1 is refused before anything is written when:
 
@@ -385,8 +392,9 @@ holds both runs. This full check runs after every unclean shutdown and takes
 longer on large partitions.
 
 - Exit code 0 or 1 (no errors, or errors corrected): the boot continues.
-- Exit code with the "reboot required" bit (2): the system reboots, on release
-  and debug images.
+- ext4 exit code with the "reboot required" bit (2): the system reboots, on
+  release and debug images. fsck.fat does not use this bit; for `boot` such an
+  exit code is handled as another error.
 - Other errors: logged; the boot continues.
 
 If a check was not clean, its result is kept until the
@@ -395,8 +403,7 @@ If a check was not clean, its result is kept until the
 - U-Boot: in the bootloader environment variable `omnect_fsck_<partition>`;
 - GRUB: `boot` in `omnect_fsck_boot`, the other partitions in files
   `fsck.<partition>` on the boot partition. GRUB, `boot` only: output that is
-  too large is replaced by a short note, and a result that asks for a reboot
-  is not kept.
+  too large is replaced by a short note.
 
 The record is gzip-compressed and base64-encoded in all cases.
 
@@ -441,7 +448,7 @@ read it.
 | Key              | Present when                                   | Content |
 | ---------------- | ---------------------------------------------- | ------- |
 | `first_boot`     | always                                         | `true` while the first-boot marker in the bootloader environment is not set: after flashing, and on later boots while the data resize or the [extra boot arguments](#extra-boot-arguments) sync fails. `false` on the first boot after an update (validated, or with a bootloader update); that boot sets the marker, so the first-boot steps do not run again, also when they had failed. `false` without a readable bootloader environment |
-| `fsck`           | a [filesystem check](#filesystem-check) was not clean | one object per partition: `code` (fsck exit code), `output` |
+| `fsck`           | a [filesystem check](#filesystem-check) was not clean | one object per partition: `code` (the fsck exit code; for `boot` the fsck.fat code), `output` |
 | `factory_reset`  | a factory reset was requested                  | see [factory reset result](#factory-reset-result) |
 | `degraded_boot`  | a release image booted without a usable bootloader environment | `reason` |
 | `resize_data`    | the data partition could not be resized on a first boot, or on any boot without a readable bootloader environment | `outcome` (`skipped_fsck`, `tool_error`, `invalid_layout`), `reason` |
