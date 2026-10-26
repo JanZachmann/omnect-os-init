@@ -16,6 +16,10 @@ const FS_LINK_CONFIG_PATH: &str = "etc/omnect/fs-link.json";
 /// Drop-in config directory; its `*.json` files are merged with the main config.
 const FS_LINK_CONFIG_PATH_D: &str = "etc/omnect/fs-link.d";
 
+/// One-time link list, removed after its links are created. One `<target> <link>`
+/// pair per line; a line starting with `#` is a comment.
+const FS_LINK_LIST_PATH: &str = "etc/omnect/create-fs-links.txt";
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct FsLinkConfig {
     pub links: Vec<LinkEntry>,
@@ -40,7 +44,50 @@ pub fn create_fs_links(rootfs_dir: &Path) -> Result<()> {
         log::info!("Created {} fs-links", config.links.len());
     }
 
+    create_links_from_list(rootfs_dir)
+}
+
+fn create_links_from_list(rootfs_dir: &Path) -> Result<()> {
+    let list_path = rootfs_dir.join(FS_LINK_LIST_PATH);
+    if !list_path.exists() {
+        return Ok(());
+    }
+
+    let entries = parse_link_list(&fs::read_to_string(&list_path)?)?;
+    for entry in &entries {
+        create_link(rootfs_dir, entry)?;
+    }
+    fs::remove_file(&list_path)?;
+
+    log::info!(
+        "Created {} fs-links from {}",
+        entries.len(),
+        list_path.display()
+    );
+
     Ok(())
+}
+
+fn parse_link_list(content: &str) -> Result<Vec<LinkEntry>> {
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            let mut fields = line.split_whitespace();
+            match (fields.next(), fields.next()) {
+                (Some(target), Some(link)) => Ok(LinkEntry {
+                    target: target.to_string(),
+                    // The list names the link as an absolute path on the device.
+                    link: link.trim_start_matches('/').to_string(),
+                }),
+                _ => Err(InitramfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{FS_LINK_LIST_PATH}: expected \"<target> <link>\", got \"{line}\""),
+                ))),
+            }
+        })
+        .collect()
 }
 
 fn load_fs_link_config(rootfs_dir: &Path) -> Result<FsLinkConfig> {
@@ -116,17 +163,8 @@ fn validate_relative_path(path: &str) -> Result<()> {
 
 /// Create a single symbolic link
 ///
-/// # Trust boundary
-/// `entry.target` is used verbatim as the symlink target and is intentionally
-/// not validated — symlink targets are allowed to be absolute paths or point
-/// outside the rootfs (e.g. `/dev/null`, `/proc/self/fd/0`). Only `entry.link`
-/// (the location of the symlink itself) is validated to be relative and
-/// confined within `rootfs_dir`.
-///
-/// This is safe as long as the JSON config is loaded exclusively from the
-/// read-only rootfs (`etc/omnect/fs-link.d/*.json`). If a future change ever
-/// loads configs from a writable location, `entry.target` must be reviewed for
-/// the new trust context.
+/// `entry.target` is used as given, so a link may point anywhere, e.g. to
+/// `/dev/null`. Only `entry.link` must stay inside `rootfs_dir`.
 fn create_link(rootfs_dir: &Path, entry: &LinkEntry) -> Result<()> {
     validate_relative_path(&entry.link)?;
     let link_path = rootfs_dir.join(&entry.link);
@@ -301,6 +339,54 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let config = load_fs_link_config(temp.path()).unwrap();
         assert!(config.links.is_empty());
+    }
+
+    #[test]
+    fn test_parse_link_list() {
+        let entries = parse_link_list(
+            "# comment\n\n/etc/systemd/system/app.service /etc/systemd/system/multi-user.target.wants/app.service\n  /data/app opt/app  extra\n",
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].target, "/etc/systemd/system/app.service");
+        assert_eq!(
+            entries[0].link,
+            "etc/systemd/system/multi-user.target.wants/app.service"
+        );
+        assert_eq!(entries[1].target, "/data/app");
+        assert_eq!(entries[1].link, "opt/app");
+    }
+
+    #[test]
+    fn test_parse_link_list_rejects_single_field() {
+        assert!(parse_link_list("/data/app\n").is_err());
+    }
+
+    #[test]
+    fn test_create_fs_links_from_list_removes_list() {
+        let temp = TempDir::new().unwrap();
+        let list = temp.path().join(FS_LINK_LIST_PATH);
+        fs::create_dir_all(list.parent().unwrap()).unwrap();
+        fs::write(&list, "/data/app /opt/app\n").unwrap();
+
+        create_fs_links(temp.path()).unwrap();
+
+        assert_eq!(
+            fs::read_link(temp.path().join("opt/app")).unwrap(),
+            PathBuf::from("/data/app")
+        );
+        assert!(!list.exists());
+    }
+
+    #[test]
+    fn test_create_fs_links_from_list_rejects_dotdot() {
+        let temp = TempDir::new().unwrap();
+        let list = temp.path().join(FS_LINK_LIST_PATH);
+        fs::create_dir_all(list.parent().unwrap()).unwrap();
+        fs::write(&list, "/data/app ../escape\n").unwrap();
+
+        assert!(create_fs_links(temp.path()).is_err());
+        assert!(list.exists());
     }
 
     #[test]
