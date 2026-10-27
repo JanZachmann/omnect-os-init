@@ -264,7 +264,7 @@ cargo build --release --features grub,gpt,factory-reset,persistent-var-log
 | `flash-mode-2-direct` | Implies `flash-mode-2`; no verify pass, flashes straight from the `scp` stream | Implemented |
 | `flash-mode-3` | Flash a `wic.xz` downloaded from a URL | Implemented |
 | `flash-mode-network` | Shared layer of modes 2 and 3: network, unmount sweep, xz decoding. Pulled in by a mode feature, never selected on its own | Implemented |
-| `rtc` | The machine has a reliable real-time clock, so mode 3 checks TLS certificates | Implemented |
+| `rtc` | The machine has a reliable real-time clock, so mode 3 checks TLS certificates; without it, mode 3 does not authenticate the server | Implemented |
 
 > **Note:** `grub` and `uboot` are mutually exclusive, and so are `gpt` and `dos`.
 > Exactly one of each pair must be set at build time — `build.rs` panics otherwise.

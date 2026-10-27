@@ -223,6 +223,10 @@ disk.
 
 ### Flash mode 3
 
+> **Warning:** On a machine without `rtc`, mode 3 does not check TLS
+> certificates. A man-in-the-middle can replace the image and the sha256 file.
+> Use mode 3 without `rtc` only on a trusted network.
+
 Flash mode 3 downloads a `wic.xz` image and its sha256 file over `eth0`, and
 flashes the image onto the running disk. The URLs are stored base64-encoded.
 
