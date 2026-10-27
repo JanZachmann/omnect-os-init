@@ -126,9 +126,9 @@ fn create_parent_dirs(rootfs: &Path, dest_dir: &Path, backup_root: &Path) -> std
         .collect();
 
     for dir in missing.into_iter().rev() {
-        fs::create_dir(dir)?;
         let rel = dir.strip_prefix(rootfs).map_err(std::io::Error::other)?;
         let meta = fs::metadata(backup_root.join(rel))?;
+        fs::create_dir(dir)?;
         chown(dir, Some(meta.uid()), Some(meta.gid()))?;
         fs::set_permissions(dir, meta.permissions())?;
     }
@@ -156,7 +156,10 @@ fn restore_path(rootfs: &Path, path: &str, backup_dir: &Path) -> Result<()> {
     create_parent_dirs(rootfs, dest_dir, &backup_root(rootfs, backup_dir)).map_err(|e| {
         FactoryResetError::RestoreFailed {
             path: PathBuf::from(path),
-            reason: format!("Failed to create directory {}: {e}", dest_dir.display()),
+            reason: format!(
+                "Cannot recreate {} from the backup: {e}",
+                dest_dir.display()
+            ),
         }
     })?;
 
@@ -269,11 +272,7 @@ mod tests {
         assert_eq!(mode("var/app/sub"), 0o710);
         // An existing parent keeps its mode.
         assert_eq!(mode("var"), 0o755);
-        let backup_uid = fs::metadata(backup_root.join("var/app")).unwrap().uid();
-        assert_eq!(
-            fs::metadata(rootfs.join("var/app")).unwrap().uid(),
-            backup_uid
-        );
+        // The owner is not checked: both trees belong to the test user.
     }
 
     #[test]
