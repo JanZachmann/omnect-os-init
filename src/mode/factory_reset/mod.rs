@@ -1007,6 +1007,31 @@ mod tests {
         }
 
         #[test]
+        fn a_lost_backup_matches_the_error_after_wipe_contract() {
+            let temp = tempfile::TempDir::new().unwrap();
+            let preserve = vec!["/etc/hostname".to_string()];
+            let restore = restore_all(temp.path(), &preserve, temp.path()).unwrap();
+
+            crate::runtime::assert_factory_reset_contract(
+                "error-after-wipe",
+                restored_status(&[], &[], restore, &preserve),
+            );
+        }
+
+        #[test]
+        fn a_reformat_retry_matches_the_warning_contract() {
+            crate::runtime::assert_factory_reset_contract(
+                "warning",
+                restored_status(
+                    &[PartitionName::Data],
+                    &[],
+                    RestoreResult::Success,
+                    &["/etc/hostname".to_string()],
+                ),
+            );
+        }
+
+        #[test]
         fn restored_status_success_no_retry() {
             let status = restored_status(&[], &[], RestoreResult::Success, &["/p".to_string()]);
             assert_eq!(status.status, FactoryResetStatusCode::Success);

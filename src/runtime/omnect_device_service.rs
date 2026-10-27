@@ -581,6 +581,21 @@ fn set_mode(path: &Path, mode: FilePermission) -> Result<()> {
     })
 }
 
+/// Compares the ODS JSON of `status` with
+/// `tests/contract/status-factory-reset-<name>.json`.
+#[cfg(test)]
+pub(crate) fn assert_factory_reset_contract(name: &str, status: FactoryResetStatus) {
+    let mut ods = OdsStatus::new();
+    ods.set_factory_reset(status);
+    let file = format!(
+        "{}/tests/contract/status-factory-reset-{name}.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let expected: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(serde_json::to_value(&ods).unwrap(), expected, "{file}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -738,7 +753,8 @@ mod tests {
     }
 
     /// The files in `tests/contract` are the factory reset results that
-    /// omnect-device-service must parse; it keeps a copy for its own tests.
+    /// omnect-device-service must parse. The factory reset module checks the
+    /// files it can build from its own status functions.
     #[test]
     fn factory_reset_status_matches_the_contract_files() {
         use FactoryResetStatusCode::*;
@@ -761,14 +777,6 @@ mod tests {
                 false,
             ),
             (
-                "error-after-wipe",
-                Error,
-                Some("mkfs.ext4 failed for data"),
-                Some("data:reformat"),
-                &[][..],
-                true,
-            ),
-            (
                 "config-error",
                 ConfigError,
                 Some("unknown preserve topic foo"),
@@ -776,32 +784,19 @@ mod tests {
                 &[][..],
                 false,
             ),
-            (
-                "warning",
-                Warning,
-                Some("restore of /etc/hostname failed"),
-                Some("etc/hostname:restore"),
-                &["/etc/hostname"][..],
-                true,
-            ),
         ];
 
         for (name, status, error, context, paths, data_wiped) in cases {
-            let mut ods = OdsStatus::new();
-            ods.set_factory_reset(FactoryResetStatus {
-                status,
-                error: error.map(str::to_string),
-                context: context.map(str::to_string),
-                paths: paths.iter().map(|p| p.to_string()).collect(),
-                data_wiped,
-            });
-            let file = format!(
-                "{}/tests/contract/status-factory-reset-{name}.json",
-                env!("CARGO_MANIFEST_DIR")
+            assert_factory_reset_contract(
+                name,
+                FactoryResetStatus {
+                    status,
+                    error: error.map(str::to_string),
+                    context: context.map(str::to_string),
+                    paths: paths.iter().map(|p| p.to_string()).collect(),
+                    data_wiped,
+                },
             );
-            let expected: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&file).unwrap()).unwrap();
-            assert_eq!(serde_json::to_value(&ods).unwrap(), expected, "{file}");
         }
     }
 
