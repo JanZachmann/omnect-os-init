@@ -456,6 +456,11 @@ See the
 
 Both validate variables set at once is a fatal error.
 
+On a boot without `omnect_validate_update`, the init deletes
+`/mnt/data/var/lib/omnect-device-service/update_validation_conf.json`. Only a
+local update writes this file, right before the reboot into its validation
+boot; on any other boot it is left over.
+
 ## Status file
 
 The init writes `/run/omnect-device-service/omnect-os-initramfs.json` for
