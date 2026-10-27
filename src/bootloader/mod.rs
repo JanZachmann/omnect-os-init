@@ -205,11 +205,7 @@ pub trait BootEnv: Send + Sync {
     /// Returns the decoded `FsckRecord` if a value is present,
     /// or `None` if no status was stored for this partition.
     fn get_fsck_status(&self, partition: PartitionName) -> Result<Option<FsckRecord>> {
-        let key = BootEnvKey::FsckStatus(partition);
-        match self.get_env(key)? {
-            Some(v) => decode_fsck_env(key, &v),
-            None => Ok(None),
-        }
+        get_fsck_env(self, partition)
     }
 
     /// Clear fsck status from bootloader environment
@@ -307,22 +303,38 @@ pub fn create_mock_bootloader() -> MockBootEnv {
     MockBootEnv::new()
 }
 
-/// Decodes an fsck record from the env. A value that does not unpack reads as
-/// absent. One that unpacks but has no exit code line, the format of an older
-/// initramfs, is `BootEnvError::InvalidValue`.
-pub(crate) fn decode_fsck_env(key: BootEnvKey, encoded: &str) -> Result<Option<FsckRecord>> {
-    let Some(text) = types::unpack_fsck_text(encoded) else {
+/// Reads the fsck record of `partition` from the env. A value that does not
+/// unpack or has no exit code line is `BootEnvError::InvalidValue`. If an applet
+/// cannot run, the record is kept for a later boot.
+pub(crate) fn get_fsck_env<B: BootEnv + ?Sized>(
+    bl: &B,
+    partition: PartitionName,
+) -> Result<Option<FsckRecord>> {
+    let key = BootEnvKey::FsckStatus(partition);
+    let Some(encoded) = bl.get_env(key)? else {
         return Ok(None);
     };
-    types::parse_fsck_text(&text)
-        .map(Some)
-        .ok_or_else(|| invalid_fsck_record(key))
+    let text = match types::unpack_fsck_text(&encoded) {
+        Ok(Some(text)) => text,
+        Ok(None) => return Err(invalid_fsck_record(key, "does not unpack")),
+        Err(e) => {
+            log::warn!("Cannot unpack the fsck record for {partition}: {e}");
+            return Ok(None);
+        }
+    };
+    match types::parse_fsck_text(&text) {
+        Some(record) => Ok(Some(record)),
+        None => {
+            log::warn!("fsck record for {partition} without exit code: {text}");
+            Err(invalid_fsck_record(key, "has no exit code"))
+        }
+    }
 }
 
-fn invalid_fsck_record(key: BootEnvKey) -> BootEnvError {
+fn invalid_fsck_record(key: BootEnvKey, reason: &str) -> BootEnvError {
     BootEnvError::InvalidValue {
         key: key.as_str().to_string(),
-        reason: "fsck record has no exit code".into(),
+        reason: format!("fsck record {reason}"),
     }
 }
 
@@ -513,7 +525,10 @@ impl BootEnv for MockBootEnv {
             });
         }
         if self.undecodable_fsck.contains(&partition) {
-            return Err(invalid_fsck_record(BootEnvKey::FsckStatus(partition)));
+            return Err(invalid_fsck_record(
+                BootEnvKey::FsckStatus(partition),
+                "has no exit code",
+            ));
         }
         Ok(self.fsck.get(&partition).cloned())
     }
