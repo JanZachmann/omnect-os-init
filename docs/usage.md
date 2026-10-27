@@ -38,9 +38,10 @@ On every boot the init:
 A flash mode replaces steps 3 and 4. Mode 1 ends with a power off, modes 2 and
 3 with a reboot.
 
-With `persistent-var-log`, `/var/log` is `/mnt/data/var/log`. On the first
-boot after an update from an older initramfs, the init moves the logs from
-`/mnt/data/log` there.
+With `persistent-var-log`, `/var/log` is `/mnt/data/var/log`. If
+`/mnt/data/log` exists (the log location of an older initramfs), the init moves
+its content to `/mnt/data/var/log`. An entry that exists in both places is
+moved as `<name>.old`.
 
 With GRUB, the init finds its disk by the volume ID of the boot partition.
 Every disk written from the same image has the same volume ID. Do not attach

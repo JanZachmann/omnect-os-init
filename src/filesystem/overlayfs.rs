@@ -42,7 +42,6 @@ pub(crate) mod paths {
     #[cfg(feature = "persistent-var-log")]
     pub const VAR_LOG: &str = "var/log";
     /// Former location of the persistent /var/log on the data partition.
-    // TODO: remove me, as soon as the CR version boots with omnect-os-init
     #[cfg(feature = "persistent-var-log")]
     pub const DATA_LOG_OLD: &str = "log";
 }
@@ -166,10 +165,12 @@ pub(crate) fn setup_data_overlay_tracked(
 /// Move the logs from the former data partition location to `var/log`.
 ///
 /// Best effort: a log that cannot be moved stays where it is and does not
-/// stop the boot. An entry that already exists in `var/log` is kept.
+/// stop the boot.
 // TODO: remove me, as soon as the CR version boots with omnect-os-init
 #[cfg(feature = "persistent-var-log")]
 fn migrate_var_log(data_mount: &Path) {
+    const MIGRATED_LOG_SUFFIX: &str = ".old";
+
     let old = data_mount.join(paths::DATA_LOG_OLD);
     let new = data_mount.join(paths::VAR_LOG);
     if !old.is_dir() {
@@ -184,7 +185,12 @@ fn migrate_var_log(data_mount: &Path) {
         }
     };
     for entry in entries.flatten() {
-        let dst = new.join(entry.file_name());
+        let mut dst = new.join(entry.file_name());
+        if dst.symlink_metadata().is_ok() {
+            let mut name = entry.file_name();
+            name.push(MIGRATED_LOG_SUFFIX);
+            dst = new.join(name);
+        }
         if dst.symlink_metadata().is_ok() {
             log::warn!(
                 "Not moving {}: {} exists",
@@ -374,7 +380,27 @@ mod tests {
 
     #[cfg(feature = "persistent-var-log")]
     #[test]
-    fn migrate_var_log_keeps_existing_entry() {
+    fn migrate_var_log_moves_a_conflicting_entry_to_old() {
+        let data = TempDir::new().unwrap();
+        let old = data.path().join(paths::DATA_LOG_OLD);
+        let new = data.path().join(paths::VAR_LOG);
+        fs::create_dir_all(old.join("journal")).unwrap();
+        fs::create_dir_all(new.join("journal")).unwrap();
+        fs::write(old.join("journal/system.journal"), "old").unwrap();
+
+        migrate_var_log(data.path());
+
+        assert!(!old.exists());
+        assert!(new.join("journal").is_dir());
+        assert_eq!(
+            fs::read_to_string(new.join("journal.old/system.journal")).unwrap(),
+            "old"
+        );
+    }
+
+    #[cfg(feature = "persistent-var-log")]
+    #[test]
+    fn migrate_var_log_keeps_an_entry_that_conflicts_twice() {
         let data = TempDir::new().unwrap();
         let old = data.path().join(paths::DATA_LOG_OLD);
         let new = data.path().join(paths::VAR_LOG);
@@ -382,10 +408,15 @@ mod tests {
         fs::create_dir_all(&new).unwrap();
         fs::write(old.join("app.log"), "old").unwrap();
         fs::write(new.join("app.log"), "new").unwrap();
+        fs::write(new.join("app.log.old"), "older").unwrap();
 
         migrate_var_log(data.path());
 
         assert_eq!(fs::read_to_string(new.join("app.log")).unwrap(), "new");
+        assert_eq!(
+            fs::read_to_string(new.join("app.log.old")).unwrap(),
+            "older"
+        );
         assert_eq!(fs::read_to_string(old.join("app.log")).unwrap(), "old");
     }
 

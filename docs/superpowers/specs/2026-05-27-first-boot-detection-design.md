@@ -7,6 +7,10 @@
 > (§2.1 "No migration logic" no longer holds). The marker has a second writer:
 > `handle_update_validation` sets it on such a boot, before it clears its
 > flags (§2.2 "Set once" and §5 "single point" no longer hold).
+>
+> **Correction (2026-10-27).** With `persistent-var-log`, the init moves the
+> logs from `/mnt/data/log`, the location of an older initramfs, to
+> `/mnt/data/var/log`. This is a migration of its own (§2.1).
 
 **Date:** 2026-05-27
 **Status:** Implemented, partially superseded — see the correction above
