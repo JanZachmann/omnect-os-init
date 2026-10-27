@@ -60,7 +60,7 @@ flowchart TD
     CLASSIFY -->|"Fail + debug → Abort"| FEB
 
     APPLY -->|Fatal| FEB
-    APPLY -->|"OK\nDegraded: ods.degraded_boot=true"| FBDETECT["compute_first_boot()\nset_update_pending()"]
+    APPLY -->|"OK\nDegraded: ods.degraded_boot=true"| FBDETECT["set_update_pending()\ndetect_first_boot()\nfalse on a boot after an update"]
 
     FBDETECT --> BMODE{"BootMode::detect()"}
     BMODE -->|"Fatal: flash mode 1 and factory reset\nboth queued (both cleared)"| FEB
@@ -100,7 +100,7 @@ flowchart TD
     MREM -->|Fatal| FEB
     MREM -->|OK| OVL["setup_raw_rootfs_mount()\nsetup_etc_overlay()\nsetup_data_overlay()"]
 
-    OVL -->|OK| LINKS["create_fs_links()\ndrain_fsck_env() — env → JSON, then clear\ncreate_ods_runtime_files()"]
+    OVL -->|OK| LINKS["create_fs_links()\ndrain_fsck_env() — env → JSON, then clear\ncreate_ods_runtime_files()\nsets the first-boot marker after an update"]
     OVL -->|Fail| FEB
 
     LINKS -->|OK| FBM["write_first_boot_marker()\nif first_boot ∧ resize_ok ∧ extra_bootargs_ok ∧ env_available\nbest-effort — warn on fail"]

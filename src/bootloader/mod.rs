@@ -25,6 +25,13 @@ pub type Result<T> = std::result::Result<T, BootEnvError>;
 /// Value of `omnect_first_boot_done`, shared by its writer and its reader.
 pub const FIRST_BOOT_DONE: &str = "1";
 
+/// Flags that mark a boot after an update.
+pub const UPDATE_FLAGS: [BootEnvKey; 3] = [
+    BootEnvKey::ValidateUpdate,
+    BootEnvKey::ValidateUpdateFailed,
+    BootEnvKey::BootloaderUpdated,
+];
+
 /// Upper bound (bytes) on the failure reason stored via `save_factory_reset_failure`.
 /// The bootloader env block is small and shared by all variables, so keep it short.
 #[cfg(feature = "factory-reset")]
@@ -78,9 +85,8 @@ pub enum BootEnvKey {
     BootloaderUpdated,
     /// `omnect_fsck_<partition>` — fsck result for the given partition.
     FsckStatus(PartitionName),
-    /// `omnect_first_boot_done` — set to `"1"` after the first successful
-    /// `run_init`. Unified first-boot sentinel; read by the resize-data init
-    /// setup step and the first-boot detection in `run_init`.
+    /// `omnect_first_boot_done` — `"1"` once the first-boot steps are done or
+    /// an update ran; later boots are no first boot.
     FirstBootDone,
     /// `omnect_extra_bootargs` — extra kernel cmdline arguments the bootloader
     /// appends. Synced from the boot-partition files by the extra-bootargs
@@ -168,6 +174,16 @@ pub trait BootEnv: Send + Sync {
     /// [`FIRST_BOOT_DONE`].
     fn is_flag_set(&self, key: BootEnvKey) -> Result<bool> {
         Ok(self.get_env(key)?.is_some_and(|v| !v.is_empty()))
+    }
+
+    /// Whether `omnect_first_boot_done` holds [`FIRST_BOOT_DONE`]; any other
+    /// value counts as not set.
+    fn is_first_boot_done(&self) -> Result<bool> {
+        Ok(self.get_env(BootEnvKey::FirstBootDone)?.as_deref() == Some(FIRST_BOOT_DONE))
+    }
+
+    fn set_first_boot_done(&mut self) -> Result<()> {
+        self.set_env(BootEnvKey::FirstBootDone, Some(FIRST_BOOT_DONE))
     }
 
     /// Save fsck result to bootloader environment.
@@ -312,6 +328,8 @@ pub struct MockBootEnv {
     get_env_error_keys: Vec<BootEnvKey>,
     /// When true, `set_env` returns an error instead of setting the key.
     set_env_errors: bool,
+    /// Keys whose `set_env` returns an error while every other key is written.
+    set_env_error_keys: Vec<BootEnvKey>,
     /// When set, `set_env` stores this fixed value instead of the given one,
     /// simulating a bootloader tool that normalizes the written value.
     set_env_normalize: Option<String>,
@@ -353,6 +371,11 @@ impl MockBootEnv {
 
     pub fn with_set_env_error(mut self) -> Self {
         self.set_env_errors = true;
+        self
+    }
+
+    pub fn with_set_env_error_for(mut self, key: BootEnvKey) -> Self {
+        self.set_env_error_keys.push(key);
         self
     }
 
@@ -405,7 +428,7 @@ impl BootEnv for MockBootEnv {
     }
 
     fn set_env(&mut self, key: BootEnvKey, value: Option<&str>) -> Result<()> {
-        if self.set_env_errors {
+        if self.set_env_errors || self.set_env_error_keys.contains(&key) {
             return Err(crate::error::BootEnvError::CommandFailed {
                 command: "mock".into(),
                 reason: "injected set_env error".into(),
@@ -538,6 +561,26 @@ mod tests {
             "an entry with an empty value means not set"
         );
         assert!(!bl.is_flag_set(BootEnvKey::BootloaderUpdated).unwrap());
+    }
+
+    #[test]
+    fn is_flag_set_counts_whitespace_as_set() {
+        // Both readers strip the line end; any other whitespace was written.
+        let bl = MockBootEnv::new().with_env(BootEnvKey::BootloaderUpdated, " ");
+        assert!(bl.is_flag_set(BootEnvKey::BootloaderUpdated).unwrap());
+    }
+
+    #[test]
+    fn is_first_boot_done_requires_the_marker_value() {
+        assert!(!MockBootEnv::new().is_first_boot_done().unwrap());
+        for other in ["", "yes"] {
+            let bl = MockBootEnv::new().with_env(BootEnvKey::FirstBootDone, other);
+            assert!(!bl.is_first_boot_done().unwrap(), "{other:?}");
+        }
+
+        let mut bl = MockBootEnv::new();
+        bl.set_first_boot_done().unwrap();
+        assert!(bl.is_first_boot_done().unwrap());
     }
 
     #[test]

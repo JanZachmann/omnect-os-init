@@ -1,5 +1,11 @@
 # Design: Suppress `FirstBootDone` marker when resize fails
 
+> **Correction (2026-10-26).** The retry also ends with an update: a boot after
+> an update is no first boot and sets the marker, so a resize that failed on
+> every boot since flashing is not tried again. The marker is in the shared
+> env, so a rollback does not bring the retry back. Without a readable boot env
+> the resize runs on every boot, whatever `first_boot` says.
+
 **Date:** 2026-06-22
 **Status:** Draft
 **Scope:** `src/mode/normal.rs` only — one conditional added to `write_first_boot_marker` call.

@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use log::{info, warn};
 
 use crate::{
+    bootloader::UPDATE_FLAGS,
     config::Config,
     filesystem::{mount_core_partitions, persist_fsck_results},
     mode::{BootContext, BootMode},
@@ -79,21 +80,29 @@ fn update_pending_from_env(env: &BootEnvState) -> bool {
 
 /// Compute the first-boot flag from the opened boot env.
 ///
-/// `true` unless the marker holds exactly `FIRST_BOOT_DONE`. Repeating the work it
-/// gates is a no-op, skipping it can leave the device unresized, so a missing,
-/// empty or unexpected value counts as a fresh first boot. A read error or a
-/// degraded env yield `false`: under uncertainty, no first-boot side effects.
-fn compute_first_boot(env: &bootloader::BootEnvState) -> bool {
-    match env.available() {
-        Some(bl) => match bl.get_env(bootloader::BootEnvKey::FirstBootDone) {
-            Ok(v) => v.as_deref() != Some(bootloader::FIRST_BOOT_DONE),
-            Err(e) => {
-                warn!("first-boot: get_env failed: {e}; treating as not-first-boot");
-                false
-            }
-        },
-        None => false,
-    }
+/// `true` only when the marker does not hold `FIRST_BOOT_DONE` and no update
+/// flag is set: after an update the device ran before, even if the marker is
+/// missing. A read error or a degraded env yield `false`: under uncertainty,
+/// no first-boot side effects.
+fn detect_first_boot(env: &BootEnvState) -> bool {
+    let Some(bl) = env.available() else {
+        return false;
+    };
+    let set = |key: bootloader::BootEnvKey, value: bootloader::Result<bool>| {
+        value.unwrap_or_else(|e| {
+            warn!(
+                "first-boot: reading {} failed: {e}; treating as not-first-boot",
+                key.as_str()
+            );
+            true
+        })
+    };
+    !set(
+        bootloader::BootEnvKey::FirstBootDone,
+        bl.is_first_boot_done(),
+    ) && UPDATE_FLAGS
+        .into_iter()
+        .all(|key| !set(key, bl.is_flag_set(key)))
 }
 
 /// Apply a boot env decision; an error in `core_result` wins over the decision.
@@ -160,15 +169,15 @@ pub fn run_init() -> Result<()> {
     let mut bootloader_env =
         apply_boot_env_decision(decision, core_result, &mut ods_status, rootfs)?;
 
-    ods_status.first_boot = compute_first_boot(&bootloader_env);
-    if ods_status.first_boot {
-        info!("first-boot detected (omnect_first_boot_done not set to the marker value)");
-    }
-
-    // Read omnect_validate_update once, before any subsequent fallible step.
+    // Read omnect_validate_update before any subsequent fallible step.
     // Stored in a process-global so handle_fatal_error in main.rs can branch
     // on it without threading the value through every return type.
     set_update_pending(update_pending_from_env(&bootloader_env));
+
+    ods_status.first_boot = detect_first_boot(&bootloader_env);
+    if ods_status.first_boot {
+        info!("first-boot detected (omnect_first_boot_done not set to the marker value)");
+    }
 
     // Detected once: a second read would log the detection warnings again and
     // could see a different answer than the one that is dispatched below.
@@ -189,7 +198,6 @@ pub fn run_init() -> Result<()> {
             boot_env: &mut bootloader_env,
             ods_status: &mut ods_status,
             rootfs,
-            update_pending: read_update_pending(),
         };
         init_setup::run(ctx)?;
 
@@ -426,14 +434,14 @@ mod first_boot_detection_tests {
     #[test]
     fn marker_absent_yields_first_boot_true() {
         let env: BootEnvState = BootEnvState::Available(Box::new(MockBootEnv::new()));
-        assert!(compute_first_boot(&env));
+        assert!(detect_first_boot(&env));
     }
 
     #[test]
     fn marker_present_yields_first_boot_false() {
         let mock = MockBootEnv::new().with_env(BootEnvKey::FirstBootDone, "1");
         let env: BootEnvState = BootEnvState::Available(Box::new(mock));
-        assert!(!compute_first_boot(&env));
+        assert!(!detect_first_boot(&env));
     }
 
     #[test]
@@ -442,14 +450,56 @@ mod first_boot_detection_tests {
         // marker we wrote, so the first-boot work runs again.
         let mock = MockBootEnv::new().with_env(BootEnvKey::FirstBootDone, "");
         let env: BootEnvState = BootEnvState::Available(Box::new(mock));
-        assert!(compute_first_boot(&env));
+        assert!(detect_first_boot(&env));
     }
 
     #[test]
     fn unexpected_marker_value_yields_first_boot_true() {
         let mock = MockBootEnv::new().with_env(BootEnvKey::FirstBootDone, "yes");
         let env: BootEnvState = BootEnvState::Available(Box::new(mock));
-        assert!(compute_first_boot(&env));
+        assert!(detect_first_boot(&env));
+    }
+
+    #[test]
+    fn no_update_flag_is_first_boot() {
+        let mock = MockBootEnv::new();
+        let calls = mock.shared_set_env_calls();
+        let env = BootEnvState::Available(Box::new(mock));
+        assert!(detect_first_boot(&env));
+        assert!(calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn boot_after_update_is_no_first_boot() {
+        for key in UPDATE_FLAGS {
+            let mock = MockBootEnv::new().with_env(key, "1");
+            let calls = mock.shared_set_env_calls();
+            let env = BootEnvState::Available(Box::new(mock));
+            assert!(!detect_first_boot(&env), "{} set", key.as_str());
+            assert!(
+                calls.lock().unwrap().is_empty(),
+                "detection must not write the env"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_update_flag_is_no_update() {
+        // GRUB scripts clear a flag by assigning an empty value.
+        for key in UPDATE_FLAGS {
+            let mock = MockBootEnv::new().with_env(key, "");
+            let env = BootEnvState::Available(Box::new(mock));
+            assert!(detect_first_boot(&env), "{} empty", key.as_str());
+        }
+    }
+
+    #[test]
+    fn update_flag_read_error_is_no_first_boot() {
+        for key in UPDATE_FLAGS {
+            let mock = MockBootEnv::new().with_get_env_error_for(key);
+            let env = BootEnvState::Available(Box::new(mock));
+            assert!(!detect_first_boot(&env), "{} not readable", key.as_str());
+        }
     }
 
     #[test]
@@ -460,7 +510,7 @@ mod first_boot_detection_tests {
             command: "boot-env-tool".into(),
             reason: "test".into(),
         });
-        assert!(!compute_first_boot(&env));
+        assert!(!detect_first_boot(&env));
     }
 
     #[test]
@@ -469,6 +519,6 @@ mod first_boot_detection_tests {
         // side effects (treat as not-first-boot under uncertainty).
         let mock = MockBootEnv::new().with_get_env_error();
         let env = BootEnvState::Available(Box::new(mock));
-        assert!(!compute_first_boot(&env));
+        assert!(!detect_first_boot(&env));
     }
 }

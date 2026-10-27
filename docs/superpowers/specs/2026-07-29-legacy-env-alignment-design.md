@@ -1,5 +1,11 @@
 # Design: Legacy Alignment of Boot-Env and fsck Handling
 
+> **Correction (2026-10-26).** §3.4: `omnect_validate_update_failed` and
+> `omnect_bootloader_updated` are cleared only after the first-boot marker is
+> set. If the marker write fails on every boot, for example on a full env, the
+> flag stays set and its trigger file is written again on every boot; the init
+> logs this as an error.
+
 > **Correction (2026-09-21).** The three factory-reset gaps this document
 > records as out of scope are closed: an unusable trigger is cleared and
 > reported, `preserve` is mandatory, and a problem in a preserve configuration

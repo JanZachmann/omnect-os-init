@@ -48,7 +48,7 @@ fn handle_result(result: Result<()>, ods_status: &mut OdsStatus) -> Result<()> {
 fn attempt(ctx: &mut InitSetupCtx<'_, '_, '_, '_>) -> Result<()> {
     // Use the already-computed flag rather than re-reading the boot env.
     // A redundant get_env call here could brick on a transient error
-    // (Bootloader → Fatal) while compute_first_boot already rode through it.
+    // (Bootloader → Fatal) where detect_first_boot already counted it as no first boot.
     let first_boot = ctx.ods_status.first_boot;
     match ctx.boot_env.available_mut() {
         Some(_) => {
@@ -131,7 +131,6 @@ mod tests {
             boot_env: &mut env,
             ods_status: &mut ods,
             rootfs: Path::new("/rootfs"),
-            update_pending: false,
         };
         assert!(run(&mut ctx).is_ok());
         assert!(
@@ -155,7 +154,6 @@ mod tests {
             boot_env: &mut env,
             ods_status: &mut ods,
             rootfs: Path::new("/rootfs"),
-            update_pending: false,
         };
         let result = run(&mut ctx);
         assert!(
@@ -186,7 +184,6 @@ mod tests {
             boot_env: &mut env,
             ods_status: &mut ods,
             rootfs: Path::new("/rootfs"),
-            update_pending: false,
         };
         assert!(run(&mut ctx).is_ok());
     }
@@ -208,7 +205,6 @@ mod tests {
             boot_env: &mut env,
             ods_status: &mut ods,
             rootfs: Path::new("/rootfs"),
-            update_pending: false,
         };
         // With a data partition present and no real tooling, resize_if_needed
         // will fail. The absorb logic turns the error into Ok + indicator.
