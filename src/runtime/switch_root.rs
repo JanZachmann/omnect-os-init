@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nix::mount::{MsFlags, mount};
-use nix::sys::statfs::{TMPFS_MAGIC, statfs};
+use nix::sys::statfs::{FsType, TMPFS_MAGIC, statfs};
 use nix::unistd::{chdir, chroot};
 
 use crate::config::CmdlineConfig;
@@ -21,6 +21,9 @@ use crate::error::{InitramfsError, Result};
 /// Magic number of ramfs (linux/magic.h), not provided by nix. Compared as
 /// `u32`, because `f_type` is signed and only 32 bits wide on 32-bit targets.
 const RAMFS_MAGIC: u32 = 0x8584_58f6;
+
+/// The old root is reached through its open file descriptor after the switch.
+const PROC_SELF_FD: &str = "/proc/self/fd";
 
 /// Default init binary path, used when `init=` is absent from the kernel cmdline.
 const DEFAULT_INIT: &str = "/sbin/init";
@@ -151,12 +154,16 @@ pub fn switch_root(new_root: &Path, cmdline: &CmdlineConfig) -> Result<()> {
 /// Returns `None` when `/` is not a ramfs or tmpfs: then it is a real disk and
 /// must stay as it is.
 fn open_initramfs_root() -> Option<(File, u64)> {
-    let on_ram = statfs("/").is_ok_and(|s| {
-        s.filesystem_type().0 as u32 == RAMFS_MAGIC || s.filesystem_type() == TMPFS_MAGIC
-    });
-    if !on_ram {
-        log::warn!("/ is not a ramfs or tmpfs; the initramfs is kept");
-        return None;
+    match statfs("/") {
+        Ok(s) if is_ram_fs(s.filesystem_type()) => {}
+        Ok(_) => {
+            log::warn!("/ is not a ramfs or tmpfs; the initramfs is kept");
+            return None;
+        }
+        Err(e) => {
+            log::warn!("Cannot statfs /: {e}; the initramfs is kept");
+            return None;
+        }
     }
 
     match File::open("/").and_then(|dir| Ok((dir.metadata()?.dev(), dir))) {
@@ -168,12 +175,13 @@ fn open_initramfs_root() -> Option<(File, u64)> {
     }
 }
 
-/// Deletes the initramfs files to free their RAM, like busybox `switch_root`.
-///
-/// Called after the switch, so the old root is reached through its open
-/// file descriptor.
+fn is_ram_fs(fs_type: FsType) -> bool {
+    fs_type.0 as u32 == RAMFS_MAGIC || fs_type == TMPFS_MAGIC
+}
+
+/// Deletes the initramfs files to free their RAM.
 fn free_initramfs(dir: &File, dev: u64) {
-    let path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    let path = PathBuf::from(format!("{PROC_SELF_FD}/{}", dir.as_raw_fd()));
     let mut count = DeleteCount::default();
     delete_contents(&path, dev, &mut count);
     log::info!(
@@ -192,9 +200,13 @@ struct DeleteCount {
 /// Best effort, recursive delete of the contents of `dir`. Stops at entries on
 /// another device than `dev`, so mounted filesystems are not touched.
 fn delete_contents(dir: &Path, dev: u64, count: &mut DeleteCount) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        count.failed += 1;
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            count.failed += 1;
+            log::warn!("Cannot read {}: {e}", dir.display());
+            return;
+        }
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -360,6 +372,56 @@ mod tests {
 
         assert!(temp.path().join("a/file").exists());
         assert_eq!(count, DeleteCount::default());
+    }
+
+    #[test]
+    fn delete_contents_counts_an_unreadable_dir_as_failed() {
+        let temp = TempDir::new().unwrap();
+        let mut count = DeleteCount::default();
+
+        delete_contents(&temp.path().join("missing"), 0, &mut count);
+
+        assert_eq!(
+            count,
+            DeleteCount {
+                deleted: 0,
+                failed: 1
+            }
+        );
+    }
+
+    #[test]
+    fn delete_contents_deletes_a_dir_symlink_but_not_its_target() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let target = temp.path().join("target");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("file"), "x").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("link")).unwrap();
+
+        let dev = root.metadata().unwrap().dev();
+        let mut count = DeleteCount::default();
+        delete_contents(&root, dev, &mut count);
+
+        assert!(root.join("link").symlink_metadata().is_err());
+        assert!(target.join("file").exists());
+        assert_eq!(
+            count,
+            DeleteCount {
+                deleted: 1,
+                failed: 0
+            }
+        );
+    }
+
+    #[test]
+    fn ramfs_and_tmpfs_are_ram_filesystems() {
+        use nix::sys::statfs::EXT4_SUPER_MAGIC;
+
+        assert!(is_ram_fs(FsType(RAMFS_MAGIC as _)));
+        assert!(is_ram_fs(TMPFS_MAGIC));
+        assert!(!is_ram_fs(EXT4_SUPER_MAGIC));
     }
 
     #[test]
