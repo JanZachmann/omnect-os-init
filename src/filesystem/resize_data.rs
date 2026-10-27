@@ -19,7 +19,7 @@ const SYNC_CMD: &str = "/bin/sync";
 
 #[cfg(feature = "gpt")]
 const SGDISK_MOVE_BACKUP_HEADER: &str = "-e";
-/// Script mode: parted never asks, an answer it needs makes it fail.
+/// Script mode: parted fails instead of waiting for an answer.
 const PARTED_SCRIPT: &str = "-s";
 const PARTED_RESIZEPART: &str = "resizepart";
 const PARTED_RESIZE_FULL: &str = "100%";
@@ -119,24 +119,21 @@ fn resizepart_args<'a>(disk: &'a str, part_nr: &'a str) -> [&'a str; 5] {
     ]
 }
 
+#[cfg(feature = "dos")]
+fn print_args(disk: &str) -> [&str; 3] {
+    [PARTED_SCRIPT, disk, PARTED_PRINT]
+}
+
 /// Find the extended partition number on a DOS/MBR disk.
 ///
 /// Invokes `parted print` and scans its output for a line whose type column
 /// contains "extended". Only relevant for `dos` partition layouts.
 #[cfg(feature = "dos")]
 fn find_extended_partition(rootblk: &Path) -> ResizeResult<u32> {
-    let out = Command::new(PARTED_CMD)
-        .args([
-            PARTED_SCRIPT,
-            rootblk
-                .to_str()
-                .ok_or_else(|| ResizeDataError::NonUtf8Path(rootblk.to_path_buf()))?,
-            PARTED_PRINT,
-        ])
-        .output()
-        .map_err(ResizeDataError::Io)?;
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let disk = rootblk
+        .to_str()
+        .ok_or_else(|| ResizeDataError::NonUtf8Path(rootblk.to_path_buf()))?;
+    let stdout = run_cmd(PARTED_CMD, &print_args(disk))?;
     parse_extended_partition_nr(&stdout)
         .ok_or_else(|| ResizeDataError::ExtendedPartitionNotFound(rootblk.to_path_buf()))
 }
@@ -155,8 +152,8 @@ fn parse_extended_partition_nr(parted_output: &str) -> Option<u32> {
     None
 }
 
-/// Run an external command and return an error if it exits non-zero.
-fn run_cmd(program: &str, args: &[&str]) -> ResizeResult<()> {
+/// Run an external command and return its stdout, or an error if it exits non-zero.
+fn run_cmd(program: &str, args: &[&str]) -> ResizeResult<String> {
     if args.is_empty() {
         log::info!("Running: {}", program);
     } else {
@@ -183,7 +180,7 @@ fn run_cmd(program: &str, args: &[&str]) -> ResizeResult<()> {
         });
     }
 
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(test)]
@@ -221,6 +218,12 @@ mod tests {
     #[test]
     fn test_partition_number_no_digits() {
         assert_eq!(partition_number(Path::new("/dev/sda")), None);
+    }
+
+    #[cfg(feature = "dos")]
+    #[test]
+    fn print_runs_parted_in_script_mode() {
+        assert_eq!(print_args("/dev/mmcblk0"), ["-s", "/dev/mmcblk0", "print"]);
     }
 
     #[cfg(feature = "dos")]
