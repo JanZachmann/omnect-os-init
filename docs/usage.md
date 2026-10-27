@@ -457,9 +457,11 @@ See the
 Both validate variables set at once is a fatal error.
 
 On a boot without `omnect_validate_update`, the init deletes
-`/mnt/data/var/lib/omnect-device-service/update_validation_conf.json`. Only a
-local update writes this file, right before the reboot into its validation
-boot; on any other boot it is left over.
+`/mnt/data/var/lib/omnect-device-service/update_validation_conf.json`.
+`omnect-device-service` writes this file before the reboot into the validation
+boot of an update it runs itself, and deletes it after a successful
+validation. After a failed validation the file is left over. An ADU update does
+not write the file, but its validation reads it.
 
 ## Status file
 

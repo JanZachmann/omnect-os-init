@@ -413,8 +413,6 @@ fn clear_update_flag(bootloader: &mut dyn BootEnv, key: BootEnvKey, marker_set: 
 /// here stay set until it is written, so the next boot is not taken for a first
 /// boot. ODS clears `omnect_validate_update`: if the marker write fails on a
 /// validation boot, the boot after the validation runs the first-boot steps.
-///
-/// On a boot without validation the local validation config is removed.
 fn handle_update_validation(
     ods_dir: &Path,
     rootfs_dir: &Path,
@@ -478,9 +476,10 @@ fn handle_update_validation(
     Ok(())
 }
 
-/// Only a local update writes the config, right before the reboot into its
-/// validation boot. On any other boot it is left over and would make a later
-/// cloud update validate as a local one.
+/// ODS writes the config before the reboot into the validation boot of an
+/// update it runs itself, and removes it after a successful validation. A failed
+/// validation leaves it behind. An ADU update does not write it but its
+/// validation reads it, so a leftover `"local": true` skips the IoT Hub check.
 ///
 /// Best-effort: a boot is not aborted for a file ODS treats as optional.
 fn remove_update_validation_conf(rootfs_dir: &Path) {
