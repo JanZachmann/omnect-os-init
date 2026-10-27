@@ -30,6 +30,7 @@ use std::fs;
 use std::fs::File;
 #[cfg(feature = "flash-mode-network")]
 use std::io::Read;
+use std::io::Write as _;
 use std::path::Path;
 #[cfg(any(feature = "flash-mode-1", feature = "grub"))]
 use std::path::PathBuf;
@@ -42,7 +43,7 @@ use nix::sys::reboot::{RebootMode, reboot};
 use crate::bootloader::BootEnvKey;
 use crate::bootloader::sync_filesystems;
 use crate::error::FlashError;
-use crate::filesystem::{MountOptions, MountPoint, mount, umount};
+use crate::filesystem::{MountOptions, MountPoint, create_root_only_file, mount, umount};
 use crate::logging::{start_capture, take_capture};
 use crate::mode::{BootContext, clear_flash_triggers};
 use crate::partition::{PartitionLayout, PartitionName};
@@ -235,7 +236,8 @@ fn write_log(data_partition: &Path, file: &str, lines: &[String]) -> Result<(), 
         MountOptions::ext4_readwrite(),
         |mount_point| {
             let path = mount_point.join(file);
-            fs::write(&path, log_contents(lines))
+            create_root_only_file(&path)
+                .and_then(|mut f| f.write_all(log_contents(lines).as_bytes()))
                 .map_err(|source| FlashError::PathIo { path, source })
         },
     )

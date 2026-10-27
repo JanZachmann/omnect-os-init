@@ -13,8 +13,8 @@ use nix::mount::MsFlags;
 use crate::bootloader::BootEnv;
 use crate::error::{BootEnvError, FilesystemError, InitramfsError, PartitionError};
 use crate::filesystem::{
-    FsType, FsckExitCode, MountOptions, MountPoint, check_filesystem_lenient, is_path_mounted,
-    mount, mount_points, mount_tmpfs,
+    FsType, FsckExitCode, MountOptions, MountPoint, check_filesystem_lenient, create_root_only_dir,
+    create_root_only_file, is_path_mounted, mount, mount_points, mount_tmpfs,
 };
 use crate::partition::{PartitionLayout, PartitionName};
 use crate::runtime::OdsStatus;
@@ -280,7 +280,7 @@ fn write_fsck_log(
     output: &str,
 ) -> std::io::Result<PathBuf> {
     let log_path = log_dir.join(format!("{partition}.log"));
-    let mut file = fs::File::create(&log_path)?;
+    let mut file = create_root_only_file(&log_path)?;
     file.write_all(output.as_bytes())?;
     file.sync_all()?;
     // Flushing the file does not make its name durable — that lives in the directory.
@@ -344,7 +344,7 @@ pub fn persist_fsck_results(
                 );
                 continue;
             }
-            if let Err(e) = fs::create_dir_all(&log_dir) {
+            if let Err(e) = create_root_only_dir(&log_dir) {
                 log::warn!("Failed to create fsck log dir {}: {}", log_dir.display(), e);
             } else {
                 match write_fsck_log(&log_dir, *partition, &fsck.output) {
@@ -433,6 +433,16 @@ mod tests {
 
         assert_eq!(path, temp.path().join("data.log"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "errors corrected");
+    }
+
+    #[test]
+    fn write_fsck_log_makes_the_file_root_only() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = TempDir::new().unwrap();
+
+        let path = write_fsck_log(temp.path(), PartitionName::Data, "errors corrected").unwrap();
+
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
     }
 
     #[test]

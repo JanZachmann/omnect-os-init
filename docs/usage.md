@@ -104,7 +104,8 @@ fails, the flash mode ends with a fatal error (see
 [error handling](#error-handling)), although the disk is already written.
 
 Each run writes a log file `flash-mode-<n>.log` to the data partition. After a
-normal boot it is found at `/mnt/data/flash-mode-<n>.log`.
+normal boot it is found at `/mnt/data/flash-mode-<n>.log`, readable only by
+root (mode 0600).
 
 ### Flash mode 1
 
@@ -436,7 +437,8 @@ The record is gzip-compressed and base64-encoded in all cases.
 
 Nothing is kept when the bootloader environment cannot be read. The full
 output is also written to `/mnt/data/var/log/fsck/<partition>.log` when the
-data partition is mounted and fsck printed output.
+data partition is mounted and fsck printed output. Only root can read it: the
+directory has mode 0700, the files 0600.
 
 ## Update validation
 
