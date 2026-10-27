@@ -15,8 +15,9 @@ settings:
 | `DISTRO_FEATURES` `resize-data`              | data partition resize on the first boot          |
 | `DISTRO_FEATURES` `persistent-var-log`       | `/var/log` on the data partition, see [boot sequence](#boot-sequence) |
 | `MACHINE_FEATURES` `efi`                     | GRUB; without it U-Boot                          |
+| `OMNECT_PART_TABLE` (`gpt` or `dos`)         | partition table layout, default `gpt`            |
 | `OMNECT_RELEASE_IMAGE = "1"`                 | release image [error handling](#error-handling)  |
-| i.MX8MM machines                             | [early module load](#early-module-load)          |
+| `OMNECT_EARLY_MODULES` (set on i.MX8MM)      | [early module load](#early-module-load)          |
 
 Most functions are triggered by a bootloader environment variable. Set it on
 the device with `bootloader_env.sh`, which needs root permissions, then reboot.
