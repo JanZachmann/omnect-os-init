@@ -105,8 +105,9 @@ pub fn detect_root_device(cmdline: &CmdlineConfig) -> Result<RootDevice> {
 /// Resolves the boot disk via the filesystem UUID of the boot partition (`bootpart_fsuuid=`).
 ///
 /// GRUB runs `probe --fs-uuid` on the boot partition of the disk it was loaded
-/// from and passes the result on the kernel cmdline. `blkid` is retried in a loop until the UUID is found or the
-/// timeout expires — block devices may not be ready immediately at initramfs startup.
+/// from and passes the result on the kernel cmdline. `blkid` is retried in a
+/// loop until the UUID is found or the timeout expires — block devices may not
+/// be ready immediately at initramfs startup.
 #[cfg(feature = "grub")]
 fn device_from_fsuuid(fsuuid: &str, part_num: u32) -> Result<RootDevice> {
     use std::process::Command;

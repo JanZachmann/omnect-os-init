@@ -205,7 +205,6 @@ pub fn mount_remaining_partitions(
         }
     }
 
-    // Mount cert partition read-write
     if let Some(cert_dev) = layout.partitions.get(&PartitionName::Cert) {
         let cert_mount = rootfs.join(mount_points::CERT_PARTITION);
         if is_path_mounted(&cert_mount)? {
@@ -279,6 +278,7 @@ fn write_fsck_log(
     partition: PartitionName,
     output: &str,
 ) -> std::io::Result<PathBuf> {
+    create_root_only_dir(log_dir)?;
     let log_path = log_dir.join(format!("{partition}.log"));
     let mut file = create_root_only_file(&log_path)?;
     file.write_all(output.as_bytes())?;
@@ -344,13 +344,9 @@ pub fn persist_fsck_results(
                 );
                 continue;
             }
-            if let Err(e) = create_root_only_dir(&log_dir) {
-                log::warn!("Failed to create fsck log dir {}: {}", log_dir.display(), e);
-            } else {
-                match write_fsck_log(&log_dir, *partition, &fsck.output) {
-                    Ok(path) => log::info!("Wrote fsck log: {}", path.display()),
-                    Err(e) => log::warn!("Failed to write fsck log for {partition}: {e}"),
-                }
+            match write_fsck_log(&log_dir, *partition, &fsck.output) {
+                Ok(path) => log::info!("Wrote fsck log: {}", path.display()),
+                Err(e) => log::warn!("Failed to write fsck log for {partition}: {e}"),
             }
         }
     }
@@ -373,7 +369,7 @@ pub fn drain_fsck_env(ods_status: &mut OdsStatus, bootloader: Option<&mut dyn Bo
         let record = match bl.get_fsck_status(partition) {
             Ok(r) => r,
             Err(e @ BootEnvError::InvalidValue { .. }) => {
-                // It would stay in the env for good otherwise.
+                // Otherwise it stays in the env on every later boot.
                 log::warn!("Dropping the fsck record for {partition}: {e}");
                 if let Err(e) = bl.clear_fsck_status(partition) {
                     log::warn!("Failed to clear fsck record for {partition} in boot env: {e}");
@@ -436,12 +432,14 @@ mod tests {
     }
 
     #[test]
-    fn write_fsck_log_makes_the_file_root_only() {
+    fn write_fsck_log_makes_the_dir_and_file_root_only() {
         use std::os::unix::fs::MetadataExt;
         let temp = TempDir::new().unwrap();
+        let log_dir = temp.path().join("fsck");
 
-        let path = write_fsck_log(temp.path(), PartitionName::Data, "errors corrected").unwrap();
+        let path = write_fsck_log(&log_dir, PartitionName::Data, "errors corrected").unwrap();
 
+        assert_eq!(fs::metadata(&log_dir).unwrap().mode() & 0o777, 0o700);
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
     }
 

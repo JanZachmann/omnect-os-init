@@ -115,11 +115,13 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let parent = temp.path().join("var/log");
         let dir = parent.join("fsck");
+        fs::create_dir_all(&parent).unwrap();
+        fs::set_permissions(&parent, Permissions::from_mode(0o755)).unwrap();
 
         create_root_only_dir(&dir).unwrap();
 
         assert_eq!(mode(&dir), ROOT_ONLY_DIR_MODE);
-        assert_ne!(mode(&parent), ROOT_ONLY_DIR_MODE);
+        assert_eq!(mode(&parent), 0o755);
     }
 
     #[test]

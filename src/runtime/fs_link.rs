@@ -16,8 +16,7 @@ const FS_LINK_CONFIG_PATH: &str = "etc/omnect/fs-link.json";
 /// Drop-in config directory; its `*.json` files are merged with the main config.
 const FS_LINK_CONFIG_PATH_D: &str = "etc/omnect/fs-link.d";
 
-/// One-time link list, removed after its links are created. One `<target> <link>`
-/// pair per line; a line starting with `#` is a comment.
+/// One-time link list, deleted after its links are created.
 const FS_LINK_LIST_PATH: &str = "etc/omnect/create-fs-links.txt";
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,7 +77,7 @@ fn parse_link_list(content: &str) -> Result<Vec<LinkEntry>> {
             match (fields.next(), fields.next()) {
                 (Some(target), Some(link)) => Ok(LinkEntry {
                     target: target.to_string(),
-                    // The list names the link as an absolute path on the device.
+                    // The list may name the link as an absolute path.
                     link: link.trim_start_matches('/').to_string(),
                 }),
                 _ => Err(InitramfsError::Io(std::io::Error::new(
@@ -161,8 +160,6 @@ fn validate_relative_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Create a single symbolic link
-///
 /// `entry.target` is used as given, so a link may point anywhere, e.g. to
 /// `/dev/null`. Only `entry.link` must stay inside `rootfs_dir`.
 fn create_link(rootfs_dir: &Path, entry: &LinkEntry) -> Result<()> {
