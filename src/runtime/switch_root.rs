@@ -139,7 +139,7 @@ pub fn switch_root(new_root: &Path, cmdline: &CmdlineConfig) -> Result<()> {
     // env_clear() ensures no initramfs environment variables leak into the
     // new init (systemd); it sets up its own environment independently.
     // fsck results and ODS runtime state are passed via files (/run, bootloader
-    // env, /data/var/log/fsck/) — not through the process environment.
+    // env, /data/log/fsck/) — not through the process environment.
     let err = Command::new(&init_full_path).env_clear().exec();
 
     // If we get here, exec failed

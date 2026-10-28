@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn a_root_only_dir_has_mode_700_and_its_parents_keep_theirs() {
         let temp = TempDir::new().unwrap();
-        let parent = temp.path().join("var/log");
+        let parent = temp.path().join("log");
         let dir = parent.join("fsck");
         fs::create_dir_all(&parent).unwrap();
         fs::set_permissions(&parent, Permissions::from_mode(0o755)).unwrap();

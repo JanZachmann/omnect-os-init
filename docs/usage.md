@@ -38,10 +38,7 @@ On every boot the init:
 A flash mode replaces steps 3 and 4. Mode 1 ends with a power off, modes 2 and
 3 with a reboot.
 
-With `persistent-var-log`, `/var/log` is `/mnt/data/var/log`. If
-`/mnt/data/log` exists (the log location of an older initramfs), the init moves
-its content to `/mnt/data/var/log`. An entry that exists in both places is
-moved as `<name>.old`.
+With `persistent-var-log`, `/var/log` is `/mnt/data/log`.
 
 With GRUB, the init finds its disk by the volume ID of the boot partition.
 Every disk written from the same image has the same volume ID. Do not attach
@@ -437,7 +434,7 @@ If a check was not clean, its result is kept until the
 The record is gzip-compressed and base64-encoded in all cases.
 
 Nothing is kept when the bootloader environment cannot be read. The full
-output is also written to `/mnt/data/var/log/fsck/<partition>.log` when the
+output is also written to `/mnt/data/log/fsck/<partition>.log` when the
 data partition is mounted and fsck printed output. Only root can read it: the
 directory has mode 0700, the files 0600.
 

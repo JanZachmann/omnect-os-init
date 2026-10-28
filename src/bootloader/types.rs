@@ -19,7 +19,7 @@ const BASE64_CMD: &str = "/bin/base64";
 /// Returns an empty string if either applet fails, so the record does not
 /// survive a reboot. This boot's copy stays
 /// in `OdsStatus`, because `apply_boot_env_decision` does not clear it, so the
-/// ODS JSON still carries it. `/data/var/log/fsck/<partition>.log` does not
+/// ODS JSON still carries it. `/data/log/fsck/<partition>.log` does not
 /// close the gap on the `FsckRequiresReboot` path, where the data partition is
 /// not mounted.
 pub fn encode_fsck_output(code: i32, output: &str) -> String {

@@ -39,11 +39,11 @@ pub(crate) mod paths {
     /// The data partition layout omits the "usr/" prefix.
     pub const DATA_LOCAL_DIR: &str = "local";
     pub const USR_LOCAL: &str = "usr/local";
+    /// Subdirectory on the data partition that is bind-mounted to /var/log.
+    #[cfg(feature = "persistent-var-log")]
+    pub const DATA_LOG_DIR: &str = "log";
     #[cfg(feature = "persistent-var-log")]
     pub const VAR_LOG: &str = "var/log";
-    /// Former location of the persistent /var/log on the data partition.
-    #[cfg(feature = "persistent-var-log")]
-    pub const DATA_LOG_OLD: &str = "log";
 }
 
 /// Mount point paths for partitions relative to rootfs
@@ -117,7 +117,7 @@ pub(crate) fn setup_etc_overlay_tracked(
 /// - Overlay for /home (rootfs/home lower, data/home/upper upper)
 /// - Bind mount: data/var/lib -> rootfs/var/lib
 /// - Bind mount: data/local -> rootfs/usr/local
-/// - Conditional: data/var/log -> rootfs/var/log (compile-time `persistent-var-log` feature)
+/// - Conditional: data/log -> rootfs/var/log (compile-time `persistent-var-log` feature)
 pub fn setup_data_overlay(rootfs_dir: &Path) -> Result<()> {
     setup_data_overlay_tracked(rootfs_dir, &mut Vec::new())
 }
@@ -151,63 +151,14 @@ pub(crate) fn setup_data_overlay_tracked(
 
     #[cfg(feature = "persistent-var-log")]
     {
-        migrate_var_log(&data_mount);
         bind_mount(
-            &data_mount.join(paths::VAR_LOG),
+            &data_mount.join(paths::DATA_LOG_DIR),
             &rootfs_dir.join(paths::VAR_LOG),
         )?;
         mounts.push(rootfs_dir.join(paths::VAR_LOG));
     }
 
     Ok(())
-}
-
-/// Move the logs from the former data partition location to `var/log`.
-///
-/// Best effort: a log that cannot be moved stays where it is and does not
-/// stop the boot.
-// TODO: remove me, as soon as the CR version boots with omnect-os-init
-#[cfg(feature = "persistent-var-log")]
-fn migrate_var_log(data_mount: &Path) {
-    const MIGRATED_LOG_SUFFIX: &str = ".old";
-
-    let old = data_mount.join(paths::DATA_LOG_OLD);
-    let new = data_mount.join(paths::VAR_LOG);
-    if !old.is_dir() {
-        return;
-    }
-
-    let entries = match ensure_dir(&new).and_then(|_| Ok(fs::read_dir(&old)?)) {
-        Ok(entries) => entries,
-        Err(e) => {
-            log::warn!("Cannot move the logs from {}: {e}", old.display());
-            return;
-        }
-    };
-    for entry in entries.flatten() {
-        let mut dst = new.join(entry.file_name());
-        if dst.symlink_metadata().is_ok() {
-            let mut name = entry.file_name();
-            name.push(MIGRATED_LOG_SUFFIX);
-            dst = new.join(name);
-        }
-        if dst.symlink_metadata().is_ok() {
-            log::warn!(
-                "Not moving {}: {} exists",
-                entry.path().display(),
-                dst.display()
-            );
-            continue;
-        }
-        if let Err(e) = fs::rename(entry.path(), &dst) {
-            log::warn!("Cannot move {}: {e}", entry.path().display());
-        }
-    }
-
-    match fs::remove_dir(&old) {
-        Ok(()) => log::info!("Moved the logs from {} to {}", old.display(), new.display()),
-        Err(e) => log::warn!("Cannot remove {}: {e}", old.display()),
-    }
 }
 
 /// Setup home directory overlay
@@ -354,79 +305,6 @@ pub fn setup_raw_rootfs_mount(rootfs_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use tempfile::TempDir;
-
-    #[cfg(feature = "persistent-var-log")]
-    #[test]
-    fn migrate_var_log_moves_old_logs() {
-        let data = TempDir::new().unwrap();
-        let old = data.path().join(paths::DATA_LOG_OLD);
-        let new = data.path().join(paths::VAR_LOG);
-        fs::create_dir_all(old.join("journal")).unwrap();
-        fs::write(old.join("journal/system.journal"), "j").unwrap();
-        fs::write(old.join("app.log"), "old").unwrap();
-        // The fsck results are written before the migration runs.
-        fs::create_dir_all(new.join("fsck")).unwrap();
-
-        migrate_var_log(data.path());
-
-        assert!(!old.exists());
-        assert_eq!(
-            fs::read_to_string(new.join("journal/system.journal")).unwrap(),
-            "j"
-        );
-        assert_eq!(fs::read_to_string(new.join("app.log")).unwrap(), "old");
-        assert!(new.join("fsck").is_dir());
-    }
-
-    #[cfg(feature = "persistent-var-log")]
-    #[test]
-    fn migrate_var_log_moves_a_conflicting_entry_to_old() {
-        let data = TempDir::new().unwrap();
-        let old = data.path().join(paths::DATA_LOG_OLD);
-        let new = data.path().join(paths::VAR_LOG);
-        fs::create_dir_all(old.join("journal")).unwrap();
-        fs::create_dir_all(new.join("journal")).unwrap();
-        fs::write(old.join("journal/system.journal"), "old").unwrap();
-
-        migrate_var_log(data.path());
-
-        assert!(!old.exists());
-        assert!(new.join("journal").is_dir());
-        assert_eq!(
-            fs::read_to_string(new.join("journal.old/system.journal")).unwrap(),
-            "old"
-        );
-    }
-
-    #[cfg(feature = "persistent-var-log")]
-    #[test]
-    fn migrate_var_log_keeps_an_entry_that_conflicts_twice() {
-        let data = TempDir::new().unwrap();
-        let old = data.path().join(paths::DATA_LOG_OLD);
-        let new = data.path().join(paths::VAR_LOG);
-        fs::create_dir_all(&old).unwrap();
-        fs::create_dir_all(&new).unwrap();
-        fs::write(old.join("app.log"), "old").unwrap();
-        fs::write(new.join("app.log"), "new").unwrap();
-        fs::write(new.join("app.log.old"), "older").unwrap();
-
-        migrate_var_log(data.path());
-
-        assert_eq!(fs::read_to_string(new.join("app.log")).unwrap(), "new");
-        assert_eq!(
-            fs::read_to_string(new.join("app.log.old")).unwrap(),
-            "older"
-        );
-        assert_eq!(fs::read_to_string(old.join("app.log")).unwrap(), "old");
-    }
-
-    #[cfg(feature = "persistent-var-log")]
-    #[test]
-    fn migrate_var_log_without_old_logs_does_nothing() {
-        let data = TempDir::new().unwrap();
-        migrate_var_log(data.path());
-        assert!(!data.path().join(paths::VAR_LOG).exists());
-    }
 
     #[test]
     fn test_ensure_dir_creates_directory() {
