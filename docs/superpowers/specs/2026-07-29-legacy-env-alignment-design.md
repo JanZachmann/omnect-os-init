@@ -2,8 +2,8 @@
 
 > **Correction (2026-10-27).** §8.1: a stored fsck record that does not unpack
 > or has no exit code line is now invalid, and `drain_fsck_env` clears it.
-> `unpack_fsck_text` and `parse_fsck_text` are the readers of the env value. §3.4: the init deletes the ODS update validation config on every
-> boot without `omnect_validate_update`. ODS leaves the file behind after a
+> `unpack_fsck_text` and `parse_fsck_text` are the readers of the env value.
+> §3.4: the init deletes the ODS update validation config on every boot without `omnect_validate_update`. ODS leaves the file behind after a
 > failed validation, and an ADU update, which does not write the file, would
 > read it in its own validation.
 
