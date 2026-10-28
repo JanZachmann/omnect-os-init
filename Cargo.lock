@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "omnect-os-init"
-version = "0.1.1"
+version = "0.1.0"
 dependencies = [
  "base64",
  "hex",

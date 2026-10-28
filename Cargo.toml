@@ -1,6 +1,6 @@
 [package]
 name = "omnect-os-init"
-version = "0.1.1"
+version = "0.1.0"
 edition = "2024"
 authors = ["omnect team"]
 description = "Rust-based init process for omnect-os initramfs"
