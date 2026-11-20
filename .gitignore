@@ -19,9 +19,7 @@
 # Debug files
 *.dSYM/
 
-.github/
-
-omnect-os-init_0.1.0.bb
+omnect-os-init_*.bb
 
 origin-rewrite-initramfs-plan.md
 
