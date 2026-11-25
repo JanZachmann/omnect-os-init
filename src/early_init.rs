@@ -3,10 +3,12 @@
 //! This module mounts essential filesystems (/dev, /proc, /sys, /run)
 //! that must be available before any other initialization can occur.
 
-use std::fs::{self, Permissions};
-use std::io;
-use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::{
+    fs::{self, Permissions},
+    io,
+    os::unix::fs::PermissionsExt,
+    path::Path,
+};
 
 use nix::mount::{MsFlags, mount};
 
