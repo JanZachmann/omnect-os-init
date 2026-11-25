@@ -115,6 +115,9 @@ pub enum EarlyInitError {
     #[error("Failed to mount {target}: {reason}")]
     MountFailed { target: String, reason: String },
 
+    #[error("Failed to create mount point {target}: {reason}")]
+    MountPointFailed { target: String, reason: String },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 }
